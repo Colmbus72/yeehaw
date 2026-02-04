@@ -1,0 +1,14 @@
+name: local
+host: localhost
+user: dev
+port: 22
+identity_file: ~/.ssh/id_rsa
+
+critters:
+  - nginx
+  - mysql
+
+livestock:
+  - name: demo-app
+    type: node
+    path: /var/www/demo

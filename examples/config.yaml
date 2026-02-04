@@ -1,0 +1,16 @@
+version: 1
+
+default_project: demo
+
+editor: nvim
+
+theme: dark
+show_activity: true
+
+claude:
+  model: claude-sonnet-4-20250514
+  auto_attach: true
+
+tmux:
+  session_prefix: "yh-"
+  default_shell: /bin/zsh

@@ -1,0 +1,8 @@
+{
+  "name": "yeehaw",
+  "description": "Yeehaw CLI plugin with skills for project setup and configuration",
+  "author": {
+    "name": "Yeehaw"
+  },
+  "hooks": "./hooks/hooks.json"
+}

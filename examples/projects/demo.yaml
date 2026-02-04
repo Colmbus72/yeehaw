@@ -1,0 +1,9 @@
+name: demo
+path: ~/Projects/demo
+
+repositories:
+  - url: git@github.com:example/demo.git
+    path: .
+
+barns:
+  - local
