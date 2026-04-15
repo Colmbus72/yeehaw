@@ -16,19 +16,30 @@ jobs:
           echo "✅ Working tree is clean"
 
       - name: Bump patch version in Cargo.toml
+        timeout-minutes: 5
         run: |
+          set -e
           CUR=$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"/\1/')
           MAJOR=$(echo "$CUR" | cut -d. -f1)
           MINOR=$(echo "$CUR" | cut -d. -f2)
           PATCH=$(echo "$CUR" | cut -d. -f3)
           NEW="$MAJOR.$MINOR.$((PATCH + 1))"
           echo "📦 Version: $CUR → $NEW"
-          sed -i '' "0,/^version = \"$CUR\"$/s//version = \"$NEW\"/" Cargo.toml
-          cargo check --quiet 2>&1 | tail -3   # regenerate Cargo.lock
+          # Plain substitution — there's only one top-level `^version = ` line in a
+          # package Cargo.toml; dep versions are indented or nested in tables.
+          # Avoids BSD sed's 0,/regex/ quirk (silently no-ops on macOS).
+          sed -i '' "s/^version = \"$CUR\"$/version = \"$NEW\"/" Cargo.toml
+          if ! grep -q "^version = \"$NEW\"$" Cargo.toml; then
+            echo "❌ Version bump did not apply (expected Cargo.toml to now contain version = \"$NEW\")"
+            exit 1
+          fi
+          cargo check --quiet   # regenerate Cargo.lock; fail the step on any compile error
           echo "$NEW" > .yeehaw-publish-version
 
       - name: Build macOS (aarch64 + x86_64)
+        timeout-minutes: 30
         run: |
+          set -e
           VERSION=$(cat .yeehaw-publish-version)
           rm -rf packaging/dist
           mkdir -p packaging/dist
@@ -39,6 +50,7 @@ jobs:
           done
 
       - name: Sign and notarize macOS binaries
+        timeout-minutes: 20
         run: |
           SIGN_ID=$(security find-identity -v -p codesigning | grep 'Developer ID Application' | head -1 | awk -F'"' '{print $2}')
           if [ -z "$SIGN_ID" ]; then
@@ -100,6 +112,7 @@ jobs:
           echo "🏷  Tagged v$VERSION"
 
       - name: Create GitHub release and upload assets
+        timeout-minutes: 10
         run: |
           VERSION=$(cat .yeehaw-publish-version)
           cd packaging/dist
@@ -111,6 +124,7 @@ jobs:
           echo "🚀 Released v$VERSION on GitHub"
 
       - name: Update Homebrew tap
+        timeout-minutes: 5
         run: |
           VERSION=$(cat .yeehaw-publish-version)
           TAP_DIR="$HOME/.cache/yeehaw-publish/homebrew-tap"
