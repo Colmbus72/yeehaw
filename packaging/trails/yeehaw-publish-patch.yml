@@ -135,12 +135,12 @@ jobs:
           TAP_DIR="$HOME/.cache/yeehaw-publish/homebrew-tap"
           TAP_REPO="git@github.com:Colmbus72/homebrew-yeehaw.git"
 
+          # Nuke-and-reclone: simpler than reconciling origin/HEAD (which
+          # isn't set when the tap was originally cloned while empty, and
+          # doesn't get created by fetch). The tap is tiny; this is cheap.
+          rm -rf "$TAP_DIR"
           mkdir -p "$(dirname "$TAP_DIR")"
-          if [ -d "$TAP_DIR/.git" ]; then
-            (cd "$TAP_DIR" && git fetch origin && git reset --hard origin/HEAD)
-          else
-            git clone "$TAP_REPO" "$TAP_DIR"
-          fi
+          git clone "$TAP_REPO" "$TAP_DIR"
 
           SHA_ARM=$(grep 'aarch64-apple-darwin' packaging/dist/SHA256SUMS | awk '{print $1}')
           SHA_INTEL=$(grep 'x86_64-apple-darwin' packaging/dist/SHA256SUMS | awk '{print $1}')
