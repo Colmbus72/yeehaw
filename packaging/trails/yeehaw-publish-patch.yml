@@ -52,6 +52,7 @@ jobs:
       - name: Sign and notarize macOS binaries
         timeout-minutes: 20
         run: |
+          set -e
           SIGN_ID=$(security find-identity -v -p codesigning | grep 'Developer ID Application' | head -1 | awk -F'"' '{print $2}')
           if [ -z "$SIGN_ID" ]; then
             echo "❌ No 'Developer ID Application' cert found in keychain."
@@ -87,6 +88,7 @@ jobs:
 
       - name: Package tarballs
         run: |
+          set -e
           VERSION=$(cat .yeehaw-publish-version)
           cd packaging/dist
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
@@ -103,6 +105,7 @@ jobs:
 
       - name: Commit and tag release
         run: |
+          set -e
           VERSION=$(cat .yeehaw-publish-version)
           git add Cargo.toml Cargo.lock
           git commit -m "release: v$VERSION"
@@ -114,6 +117,7 @@ jobs:
       - name: Create GitHub release and upload assets
         timeout-minutes: 10
         run: |
+          set -e
           VERSION=$(cat .yeehaw-publish-version)
           cd packaging/dist
           gh release create "v$VERSION" \
@@ -126,6 +130,7 @@ jobs:
       - name: Update Homebrew tap
         timeout-minutes: 5
         run: |
+          set -e
           VERSION=$(cat .yeehaw-publish-version)
           TAP_DIR="$HOME/.cache/yeehaw-publish/homebrew-tap"
           TAP_REPO="git@github.com:Colmbus72/homebrew-yeehaw.git"
