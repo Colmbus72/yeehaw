@@ -1,0 +1,147 @@
+name: yeehaw-publish-patch
+on:
+  push:
+
+jobs:
+  publish:
+    runs-on: self-hosted
+    steps:
+      - name: Verify clean working tree
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "❌ Working directory is not clean. Commit or stash changes first."
+            git status --short
+            exit 1
+          fi
+          echo "✅ Working tree is clean"
+
+      - name: Bump patch version in Cargo.toml
+        run: |
+          CUR=$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"/\1/')
+          MAJOR=$(echo "$CUR" | cut -d. -f1)
+          MINOR=$(echo "$CUR" | cut -d. -f2)
+          PATCH=$(echo "$CUR" | cut -d. -f3)
+          NEW="$MAJOR.$MINOR.$((PATCH + 1))"
+          echo "📦 Version: $CUR → $NEW"
+          sed -i '' "0,/^version = \"$CUR\"$/s//version = \"$NEW\"/" Cargo.toml
+          cargo check --quiet 2>&1 | tail -3   # regenerate Cargo.lock
+          echo "$NEW" > .yeehaw-publish-version
+
+      - name: Build macOS (aarch64 + x86_64)
+        run: |
+          VERSION=$(cat .yeehaw-publish-version)
+          rm -rf packaging/dist
+          mkdir -p packaging/dist
+
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            echo "🔨 Building $target"
+            cargo build --release --target "$target"
+          done
+
+      - name: Sign and notarize macOS binaries
+        run: |
+          SIGN_ID=$(security find-identity -v -p codesigning | grep 'Developer ID Application' | head -1 | awk -F'"' '{print $2}')
+          if [ -z "$SIGN_ID" ]; then
+            echo "❌ No 'Developer ID Application' cert found in keychain."
+            echo "   Create one at https://developer.apple.com/account/resources/certificates/add"
+            exit 1
+          fi
+          echo "🔏 Signing with: $SIGN_ID"
+
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            BIN="target/$target/release/yeehaw"
+
+            codesign --force \
+              --options runtime \
+              --timestamp \
+              --sign "$SIGN_ID" \
+              "$BIN"
+
+            # notarytool wants a zip or pkg, not a bare Mach-O
+            ZIP="packaging/dist/yeehaw-$target-notarize.zip"
+            (cd "$(dirname "$BIN")" && zip -q "$OLDPWD/$ZIP" yeehaw)
+
+            echo "📮 Submitting $target for notarization..."
+            xcrun notarytool submit "$ZIP" \
+              --keychain-profile yeehaw-notary \
+              --wait
+
+            # Stapling a bare binary is not supported; the notarization ticket
+            # is associated with the binary's code-directory hash and checked
+            # online by Gatekeeper. That's fine for CLI binaries.
+            echo "✅ Notarized $target"
+            rm -f "$ZIP"
+          done
+
+      - name: Package tarballs
+        run: |
+          VERSION=$(cat .yeehaw-publish-version)
+          cd packaging/dist
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            DIR="yeehaw-$target"
+            mkdir -p "$DIR"
+            cp "../../target/$target/release/yeehaw" "$DIR/yeehaw"
+            cp ../../README.md "$DIR/README.md" 2>/dev/null || true
+            tar -cJf "$DIR.tar.xz" "$DIR"
+            rm -rf "$DIR"
+            echo "📦 Packaged $DIR.tar.xz"
+          done
+          shasum -a 256 *.tar.xz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Commit and tag release
+        run: |
+          VERSION=$(cat .yeehaw-publish-version)
+          git add Cargo.toml Cargo.lock
+          git commit -m "release: v$VERSION"
+          git tag "v$VERSION"
+          git push origin HEAD
+          git push origin "v$VERSION"
+          echo "🏷  Tagged v$VERSION"
+
+      - name: Create GitHub release and upload assets
+        run: |
+          VERSION=$(cat .yeehaw-publish-version)
+          cd packaging/dist
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --generate-notes \
+            *.tar.xz SHA256SUMS
+          echo "🚀 Released v$VERSION on GitHub"
+
+      - name: Update Homebrew tap
+        run: |
+          VERSION=$(cat .yeehaw-publish-version)
+          TAP_DIR="$HOME/.cache/yeehaw-publish/homebrew-tap"
+          TAP_REPO="git@github.com:Colmbus72/homebrew-yeehaw.git"
+
+          mkdir -p "$(dirname "$TAP_DIR")"
+          if [ -d "$TAP_DIR/.git" ]; then
+            (cd "$TAP_DIR" && git fetch origin && git reset --hard origin/HEAD)
+          else
+            git clone "$TAP_REPO" "$TAP_DIR"
+          fi
+
+          SHA_ARM=$(grep 'aarch64-apple-darwin' packaging/dist/SHA256SUMS | awk '{print $1}')
+          SHA_INTEL=$(grep 'x86_64-apple-darwin' packaging/dist/SHA256SUMS | awk '{print $1}')
+
+          mkdir -p "$TAP_DIR/Formula"
+          cp packaging/Formula/yeehaw.rb "$TAP_DIR/Formula/yeehaw.rb"
+          sed -i '' "s|{{VERSION}}|$VERSION|g" "$TAP_DIR/Formula/yeehaw.rb"
+          sed -i '' "s|{{SHA_AARCH64_APPLE_DARWIN}}|$SHA_ARM|g" "$TAP_DIR/Formula/yeehaw.rb"
+          sed -i '' "s|{{SHA_X86_64_APPLE_DARWIN}}|$SHA_INTEL|g" "$TAP_DIR/Formula/yeehaw.rb"
+
+          # Placeholders for Linux arches — left as-is until we ship Linux builds.
+          # brew on macOS won't evaluate the on_linux block, so this is harmless.
+
+          cd "$TAP_DIR"
+          git add Formula/yeehaw.rb
+          git commit -m "yeehaw $VERSION"
+          git push origin HEAD
+          echo "🍺 Published yeehaw $VERSION to Homebrew tap"
+
+      - name: Cleanup
+        run: |
+          rm -rf packaging/dist
+          rm -f .yeehaw-publish-version
+          echo "🧹 Cleaned up"

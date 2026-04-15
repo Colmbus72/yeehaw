@@ -2,6 +2,12 @@
 name = "yeehaw"
 version = "0.1.0"
 edition = "2021"
+description = "Yeehaw — terminal ranch management for projects, servers, and Claude sessions"
+license = "MIT"
+repository = "https://github.com/Colmbus72/yeehaw"
+homepage = "https://yeehaw.cool"
+keywords = ["cli", "tui", "devops", "project-management", "claude"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "yeehaw"
