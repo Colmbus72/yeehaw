@@ -83,10 +83,12 @@ impl TrailProvider for NativeProvider {
                     .map(|(k, v)| format!("export {}='{}'", k, v.replace('\'', "'\\''")))
                     .collect::<Vec<_>>()
                     .join("; ");
+                // Wrap the step body in a subshell so trailing newlines don't
+                // break the `2>&1` redirection, and its exit code propagates.
                 let full_command = if env_exports.is_empty() {
-                    format!("{} 2>&1", step.run)
+                    format!("( {}\n) 2>&1", step.run)
                 } else {
-                    format!("{}; {} 2>&1", env_exports, step.run)
+                    format!("{}; ( {}\n) 2>&1", env_exports, step.run)
                 };
 
                 // Build command — local or SSH
@@ -95,7 +97,19 @@ impl TrailProvider for NativeProvider {
                         .find(|(k, _)| k == "REPO_PATH")
                         .map(|(_, v)| v.as_str())
                         .unwrap_or(".");
-                    let safe_path = repo_path.replace('\'', "'\\''");
+                    // Expand leading `~` / `~/` to the user's home dir so
+                    // `cd` works under single quotes (which suppress tilde expansion).
+                    let expanded = if repo_path == "~" {
+                        std::env::var("HOME").unwrap_or_else(|_| repo_path.to_string())
+                    } else if let Some(rest) = repo_path.strip_prefix("~/") {
+                        match std::env::var("HOME") {
+                            Ok(home) => format!("{}/{}", home.trim_end_matches('/'), rest),
+                            Err(_) => repo_path.to_string(),
+                        }
+                    } else {
+                        repo_path.to_string()
+                    };
+                    let safe_path = expanded.replace('\'', "'\\''");
                     let local_cmd = format!("cd '{}' && {}", safe_path, full_command);
                     let mut c = Command::new("sh");
                     c.arg("-c").arg(&local_cmd);

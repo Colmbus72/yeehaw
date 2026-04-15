@@ -104,6 +104,7 @@ jobs:
           VERSION=$(cat .yeehaw-publish-version)
           cd packaging/dist
           gh release create "v$VERSION" \
+            --repo Colmbus72/yeehaw \
             --title "v$VERSION" \
             --generate-notes \
             *.tar.xz SHA256SUMS
