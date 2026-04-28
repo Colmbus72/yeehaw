@@ -1,6 +1,8 @@
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use crate::config;
 
@@ -91,6 +93,52 @@ pub fn install_skill() -> anyhow::Result<PathBuf> {
 /// Check if the skill file exists
 pub fn skill_installed() -> bool {
     config::yeehaw_dir().join("skills").join("yeehaw-project-setup.skill").exists()
+}
+
+/// Extract and cache the SKILL.md body from the embedded yeehaw-project-setup.skill archive.
+///
+/// The .skill file is a ZIP archive; we pull `yeehaw-project-setup/SKILL.md` out of it on
+/// first call and stash the result in a process-wide cache. Used by the MCP prompt handler
+/// to serve the skill content on demand.
+pub fn read_skill_markdown() -> anyhow::Result<&'static str> {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    if let Some(s) = CACHE.get() {
+        return Ok(s.as_str());
+    }
+    let cursor = std::io::Cursor::new(SKILL_BYTES);
+    let mut archive = zip::ZipArchive::new(cursor)?;
+    let mut file = archive.by_name("yeehaw-project-setup/SKILL.md")?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    // If another thread won the race, prefer their copy — both are identical anyway.
+    let _ = CACHE.set(content);
+    Ok(CACHE.get().expect("cache populated above").as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_markdown_extracts_from_embedded_archive() {
+        let md = read_skill_markdown().expect("should extract SKILL.md from embedded skill");
+        assert!(
+            md.contains("yeehaw-project-setup"),
+            "skill markdown should reference its own name in frontmatter",
+        );
+        assert!(
+            md.contains("# Yeehaw Project Setup"),
+            "skill markdown should contain the H1 title",
+        );
+    }
+
+    #[test]
+    fn skill_markdown_is_cached() {
+        let a = read_skill_markdown().unwrap();
+        let b = read_skill_markdown().unwrap();
+        // Same static slice on second call — pointer equality proves the cache hit.
+        assert!(std::ptr::eq(a.as_ptr(), b.as_ptr()));
+    }
 }
 
 /// Check if Claude hooks are already configured in ~/.claude/settings.json

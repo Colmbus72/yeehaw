@@ -1,17 +1,41 @@
 use anyhow::Result;
+use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
-use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt};
+use rmcp::service::RequestContext;
+use rmcp::{
+    prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router, ErrorData as McpError,
+    RoleServer, ServerHandler, ServiceExt,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::config;
 use crate::critters;
 use crate::crontab;
+use crate::hooks;
 use crate::ranchhand_k8s;
 use crate::ranchhand_terraform;
 use crate::types;
+
+// ============================================================================
+// MCP server-level instructions
+// ============================================================================
+//
+// This text is injected into Claude's system prompt every time a client connects to
+// the Yeehaw MCP server. Keep it tight: it pays per-token on every session.
+const YEEHAW_INSTRUCTIONS: &str = "Yeehaw is the user's ranch — the source of truth for their projects, infrastructure, and Claude sessions. Treat it as the main brain of this user's setup. Whenever the user references *their own* projects, servers, deployments, or running services, check Yeehaw before assuming context is missing.\n\n\
+Vocabulary maps to real things the user owns:\n\
+- Projects — codebases / products. Each has a wiki with long-term context (architecture, conventions, commands, gotchas, common tasks) — read it via get_wiki / get_wiki_section before asking the user to re-explain their codebase.\n\
+- Barns — servers / hosts. (\"the server\", \"production\", \"staging\" → look here.)\n\
+- Livestock — deployments / processes the user ships and runs on barns. (\"the API\", \"the app\", \"the worker\" → look here.)\n\
+- Critters — system-level processes that support livestock (MySQL, php-fpm, nginx, redis, etc.). (\"the database\", \"the web server\", \"the queue\" → look here.)\n\
+- Herds — groups of related livestock (a service tier, an environment).\n\
+- Ranch Hands — infrastructure automation runners (k8s, terraform); discover and sync resources from them.\n\
+- Worms — scheduled jobs / cron triggers.\n\
+- Trails — multi-step automations the user has saved.\n\n\
+Default to list_projects / get_project / list_barns / list_herds early in any task that touches the user's own systems. The yeehaw-project-setup prompt is available for configuring a new project's metadata and wiki.";
 
 // ============================================================================
 // Parameter structs
@@ -438,6 +462,7 @@ struct ReadTrailStepLogParams {
 #[derive(Clone)]
 pub struct YeehawServer {
     tool_router: ToolRouter<Self>,
+    prompt_router: PromptRouter<Self>,
 }
 
 fn ok_text(text: &str) -> Result<CallToolResult, McpError> {
@@ -474,6 +499,7 @@ impl YeehawServer {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            prompt_router: Self::prompt_router(),
         }
     }
 
@@ -1602,16 +1628,45 @@ impl YeehawServer {
 // ServerHandler
 // ============================================================================
 
+// ============================================================================
+// Prompts
+// ============================================================================
+
+#[prompt_router]
+impl YeehawServer {
+    /// Configure a Yeehaw project's metadata and wiki by exploring the codebase.
+    ///
+    /// Returns the bundled `yeehaw-project-setup` skill body as a user-role prompt
+    /// message — when invoked, the model receives the SKILL.md instructions as if
+    /// the user pasted them, and follows the workflow (codebase exploration, color
+    /// discovery, summary generation, wiki population).
+    #[prompt(
+        name = "yeehaw-project-setup",
+        description = "Configure a Yeehaw project with an auto-generated summary, brand color, and wiki sections. Use when the user has created a Yeehaw project and wants to populate its metadata and wiki from the codebase."
+    )]
+    async fn yeehaw_project_setup_prompt(&self) -> Vec<PromptMessage> {
+        let body = match hooks::read_skill_markdown() {
+            Ok(s) => s.to_string(),
+            Err(e) => format!(
+                "Failed to load yeehaw-project-setup skill from embedded archive: {e}"
+            ),
+        };
+        vec![PromptMessage::new_text(PromptMessageRole::User, body)]
+    }
+}
+
 #[tool_handler]
+#[prompt_handler]
 impl ServerHandler for YeehawServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::V_2024_11_05,
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
+                .enable_prompts()
                 .build(),
             server_info: Implementation::from_build_env(),
-            instructions: Some("Yeehaw - Terminal ranch management for projects, servers, and Claude sessions".into()),
+            instructions: Some(YEEHAW_INSTRUCTIONS.into()),
         }
     }
 }

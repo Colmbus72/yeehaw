@@ -46,6 +46,10 @@ figlet-rs = "0.1"
 notify = { version = "7", features = ["macos_kqueue"] }
 rmcp = { version = "0.15.0", features = ["server", "transport-io", "macros"] }
 schemars = "1"
+
+# ZIP archive reading (for extracting SKILL.md from the embedded yeehaw-project-setup.skill)
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 ureq = { version = "2", features = ["json"] }
 tungstenite = { version = "0.24", features = ["native-tls"] }
 native-tls = "0.2"
