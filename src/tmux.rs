@@ -289,10 +289,11 @@ pub fn capture_panes(pane_ids: &[String]) -> Vec<Vec<String>> {
             args.push(CAPTURE_SENTINEL.to_string());
             args.push(";".to_string());
         }
-        // No -e: plain text. Truncating escape-laden lines to a cell width risks
-        // cutting mid-sequence and bleeding styles across the grid.
+        // -e keeps SGR colour. capture-pane emits a rendered screen, so SGR is
+        // the only escape class present; the grid decodes it before truncating.
         args.push("capture-pane".to_string());
         args.push("-p".to_string());
+        args.push("-e".to_string());
         args.push("-t".to_string());
         args.push(pane.clone());
     }

@@ -90,20 +90,110 @@ pub fn grid_dims(n: usize, area: Rect) -> (usize, usize) {
     (cols, rows)
 }
 
-/// Truncate to `max_cols` terminal columns, counting display width rather than
-/// chars so wide glyphs (CJK, emoji, box drawing) cannot smear the cell border.
-pub fn truncate_to_width(s: &str, max_cols: usize) -> String {
-    let mut out = String::new();
+/// Apply one SGR parameter run (the numbers in `ESC [ ... m`) to a style.
+fn apply_sgr(style: Style, params: &[u8]) -> Style {
+    let mut style = style;
+    let mut i = 0;
+    while i < params.len() {
+        match params[i] {
+            0 => style = Style::default(),
+            1 => style = style.add_modifier(Modifier::BOLD),
+            2 => style = style.add_modifier(Modifier::DIM),
+            3 => style = style.add_modifier(Modifier::ITALIC),
+            4 => style = style.add_modifier(Modifier::UNDERLINED),
+            22 => style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            23 => style = style.remove_modifier(Modifier::ITALIC),
+            24 => style = style.remove_modifier(Modifier::UNDERLINED),
+            // Extended colour: 38/48 ; 5 ; n  or  38/48 ; 2 ; r ; g ; b
+            n @ (38 | 48) => {
+                let (color, consumed) = match params.get(i + 1) {
+                    Some(5) => (
+                        params.get(i + 2).map(|&c| Color::Indexed(c)),
+                        3,
+                    ),
+                    Some(2) => (
+                        match (params.get(i + 2), params.get(i + 3), params.get(i + 4)) {
+                            (Some(&r), Some(&g), Some(&b)) => Some(Color::Rgb(r, g, b)),
+                            _ => None,
+                        },
+                        5,
+                    ),
+                    _ => (None, 1),
+                };
+                if let Some(c) = color {
+                    style = if n == 38 { style.fg(c) } else { style.bg(c) };
+                }
+                i += consumed;
+                continue;
+            }
+            39 => style = style.fg(Color::Reset),
+            49 => style = style.bg(Color::Reset),
+            n @ 30..=37 => style = style.fg(Color::Indexed(n - 30)),
+            n @ 40..=47 => style = style.bg(Color::Indexed(n - 40)),
+            n @ 90..=97 => style = style.fg(Color::Indexed(n - 90 + 8)),
+            n @ 100..=107 => style = style.bg(Color::Indexed(n - 100 + 8)),
+            _ => {}
+        }
+        i += 1;
+    }
+    style
+}
+
+/// Parse a captured line containing ANSI escapes into styled spans, truncated to
+/// `max_cols` display columns.
+///
+/// Truncation happens on decoded text, so a cut can never land inside an escape
+/// sequence and leak styling into the rest of the grid.
+pub fn ansi_spans(s: &str, max_cols: usize, base: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut style = base;
+    let mut run = String::new();
     let mut used = 0usize;
-    for ch in s.chars() {
+
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            // Only CSI sequences carry styling; skip anything else entirely.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                let mut buf = String::new();
+                let mut final_byte = None;
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        final_byte = Some(c);
+                        break;
+                    }
+                    buf.push(c);
+                }
+                if final_byte == Some('m') {
+                    if !run.is_empty() {
+                        spans.push(Span::styled(std::mem::take(&mut run), style));
+                    }
+                    let params: Vec<u8> = buf
+                        .split(';')
+                        .map(|p| p.trim().parse::<u8>().unwrap_or(0))
+                        .collect();
+                    style = apply_sgr(style, &params);
+                }
+            } else {
+                // Non-CSI escape: drop the introducer and let the next char go.
+                chars.next();
+            }
+            continue;
+        }
+
         let w = ch.width().unwrap_or(0);
         if used + w > max_cols {
             break;
         }
         used += w;
-        out.push(ch);
+        run.push(ch);
     }
-    out
+
+    if !run.is_empty() {
+        spans.push(Span::styled(run, style));
+    }
+    spans
 }
 
 struct Star {
@@ -513,14 +603,10 @@ impl SessionGridView {
             .unwrap_or(0);
         let start = end.saturating_sub(h);
 
+        let base = Style::default().fg(Color::Rgb(170, 170, 170));
         let lines: Vec<Line> = screen[start..end]
             .iter()
-            .map(|l| {
-                Line::from(Span::styled(
-                    truncate_to_width(l, w),
-                    Style::default().fg(Color::Rgb(170, 170, 170)),
-                ))
-            })
+            .map(|l| Line::from(ansi_spans(l, w, base)))
             .collect();
 
         frame.render_widget(Paragraph::new(lines), text_area);
@@ -652,27 +738,98 @@ mod tests {
         }
     }
 
-    #[test]
-    fn truncate_counts_display_columns_not_chars() {
-        assert_eq!(truncate_to_width("hello world", 5), "hello");
-        assert_eq!(truncate_to_width("hi", 10), "hi");
-        assert_eq!(truncate_to_width("", 5), "");
+    fn plain(spans: &[Span]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
     #[test]
-    fn truncate_never_splits_a_wide_glyph() {
+    fn ansi_parser_strips_escapes_and_keeps_the_text() {
+        let s = "\u{1b}[38;5;65mhello\u{1b}[39m world";
+        let spans = ansi_spans(s, 80, Style::default());
+        assert_eq!(plain(&spans), "hello world");
+    }
+
+    #[test]
+    fn ansi_parser_applies_256_colour_and_bold() {
+        let s = "\u{1b}[1m\u{1b}[38;5;105mX";
+        let spans = ansi_spans(s, 80, Style::default());
+        let last = spans.last().expect("a span");
+        assert_eq!(last.style.fg, Some(Color::Indexed(105)));
+        assert!(last.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn ansi_parser_handles_truecolour() {
+        let s = "\u{1b}[38;2;10;20;30mX";
+        let spans = ansi_spans(s, 80, Style::default());
+        assert_eq!(spans.last().unwrap().style.fg, Some(Color::Rgb(10, 20, 30)));
+    }
+
+    #[test]
+    fn ansi_reset_returns_to_default() {
+        let s = "\u{1b}[38;5;9mred\u{1b}[0mplain";
+        let spans = ansi_spans(s, 80, Style::default());
+        assert_eq!(spans[0].style.fg, Some(Color::Indexed(9)));
+        assert_eq!(spans[1].style.fg, None);
+    }
+
+    #[test]
+    fn escape_sequences_do_not_consume_the_width_budget() {
+        // The escapes are invisible, so all six visible chars must survive.
+        let s = "\u{1b}[38;5;65mabc\u{1b}[39m\u{1b}[1mdef\u{1b}[0m";
+        assert_eq!(plain(&ansi_spans(s, 6, Style::default())), "abcdef");
+    }
+
+    #[test]
+    fn ansi_truncation_cuts_visible_text_not_escapes() {
+        let s = "\u{1b}[38;5;65mabcdefghij\u{1b}[39m";
+        assert_eq!(plain(&ansi_spans(s, 4, Style::default())), "abcd");
+    }
+
+    #[test]
+    fn ansi_parser_never_emits_raw_escape_bytes() {
+        // Whatever we fail to understand must still not reach the screen.
+        let nasty = "\u{1b}[38;5;65mok\u{1b}[2J\u{1b}[10;20Hmore\u{1b}]0;title\u{7}end";
+        let spans = ansi_spans(nasty, 80, Style::default());
+        let text = plain(&spans);
+        assert!(!text.contains('\u{1b}'), "escape leaked: {text:?}");
+    }
+
+    #[test]
+    fn ansi_parser_handles_wide_glyphs_under_truncation() {
+        let s = "\u{1b}[1m日本語\u{1b}[0m";
+        assert_eq!(plain(&ansi_spans(s, 5, Style::default())), "日本");
+    }
+
+    #[test]
+    fn bare_escape_m_is_treated_as_a_reset() {
+        let s = "\u{1b}[38;5;9mred\u{1b}[mplain";
+        let spans = ansi_spans(s, 80, Style::default());
+        assert_eq!(spans[1].style.fg, None);
+    }
+
+    #[test]
+    fn truncation_counts_display_columns_not_chars() {
+        let st = Style::default();
+        assert_eq!(plain(&ansi_spans("hello world", 5, st)), "hello");
+        assert_eq!(plain(&ansi_spans("hi", 10, st)), "hi");
+        assert_eq!(plain(&ansi_spans("", 5, st)), "");
+    }
+
+    #[test]
+    fn truncation_never_splits_a_wide_glyph() {
         // Each CJK char is two columns wide; an odd budget must not emit a half.
-        let s = "日本語";
-        assert_eq!(truncate_to_width(s, 4), "日本");
-        assert_eq!(truncate_to_width(s, 5), "日本");
-        assert_eq!(truncate_to_width(s, 6), "日本語");
-        assert_eq!(truncate_to_width(s, 1), "");
+        let st = Style::default();
+        assert_eq!(plain(&ansi_spans("日本語", 4, st)), "日本");
+        assert_eq!(plain(&ansi_spans("日本語", 5, st)), "日本");
+        assert_eq!(plain(&ansi_spans("日本語", 6, st)), "日本語");
+        assert_eq!(plain(&ansi_spans("日本語", 1, st)), "");
     }
 
     #[test]
-    fn truncate_handles_box_drawing_used_by_claude_output() {
-        let s = "──────────";
-        assert_eq!(truncate_to_width(s, 3).chars().count(), 3);
+    fn truncation_handles_box_drawing_used_by_claude_output() {
+        let spans = ansi_spans("──────────", 3, Style::default());
+        assert_eq!(plain(&spans).chars().count(), 3);
     }
 
     #[test]
