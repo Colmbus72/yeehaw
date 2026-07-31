@@ -16,6 +16,10 @@ pub struct TmuxWindow {
     pub pane_current_command: String,
     pub window_activity: u64,
     pub window_type: String,
+    /// Project this window was spawned from (`@yeehaw_project`). Empty if untagged.
+    pub project: String,
+    /// Barn this window runs on (`@yeehaw_barn`). Empty if untagged.
+    pub barn: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -197,12 +201,37 @@ pub fn ensure_correct_status_bar() {
     }
 }
 
+const WINDOW_LIST_FORMAT: &str = "#{window_index}\t#{window_name}\t#{window_active}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{window_activity}\t#{@yeehaw_type}\t#{@yeehaw_project}\t#{@yeehaw_barn}";
+
+/// Parse one `list-windows -F WINDOW_LIST_FORMAT` line.
+///
+/// Trailing user-option fields are empty strings when the option is unset, so
+/// windows created before tagging existed degrade to empty tags rather than
+/// failing to parse.
+fn parse_window_line(line: &str) -> Option<TmuxWindow> {
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() < 7 {
+        return None;
+    }
+    Some(TmuxWindow {
+        index: parts[0].parse().unwrap_or(0),
+        name: parts[1].to_string(),
+        active: parts[2] == "1",
+        pane_id: parts[3].to_string(),
+        pane_title: parts.get(4).unwrap_or(&"").to_string(),
+        pane_current_command: parts.get(5).unwrap_or(&"").to_string(),
+        window_activity: parts.get(6).and_then(|s| s.parse().ok()).unwrap_or(0),
+        window_type: parts.get(7).unwrap_or(&"").to_string(),
+        project: parts.get(8).unwrap_or(&"").to_string(),
+        barn: parts.get(9).unwrap_or(&"").to_string(),
+    })
+}
+
 pub fn list_yeehaw_windows() -> Vec<TmuxWindow> {
     let output = Command::new("tmux")
         .args([
             "list-windows", "-t", YEEHAW_SESSION,
-            "-F",
-            "#{window_index}\t#{window_name}\t#{window_active}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{window_activity}\t#{@yeehaw_type}",
+            "-F", WINDOW_LIST_FORMAT,
         ])
         .output();
 
@@ -215,23 +244,65 @@ pub fn list_yeehaw_windows() -> Vec<TmuxWindow> {
     stdout
         .lines()
         .filter(|l| !l.is_empty())
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() < 7 {
-                return None;
-            }
-            Some(TmuxWindow {
-                index: parts[0].parse().unwrap_or(0),
-                name: parts[1].to_string(),
-                active: parts[2] == "1",
-                pane_id: parts[3].to_string(),
-                pane_title: parts.get(4).unwrap_or(&"").to_string(),
-                pane_current_command: parts.get(5).unwrap_or(&"").to_string(),
-                window_activity: parts.get(6).and_then(|s| s.parse().ok()).unwrap_or(0),
-                window_type: parts.get(7).unwrap_or(&"").to_string(),
-            })
-        })
+        .filter_map(parse_window_line)
         .collect()
+}
+
+/// Sentinel printed between panes when capturing several in one tmux call.
+/// Uses control characters that cannot appear in rendered pane output.
+const CAPTURE_SENTINEL: &str = "\u{1}\u{2}YHGRID\u{2}\u{1}";
+
+/// Split the concatenated stdout of a batched capture back into per-pane screens.
+fn split_captures(raw: &str, count: usize) -> Vec<Vec<String>> {
+    let mut panes: Vec<Vec<String>> = raw
+        .split(CAPTURE_SENTINEL)
+        .map(|chunk| {
+            chunk
+                .trim_matches('\n')
+                .lines()
+                .map(|l| l.to_string())
+                .collect()
+        })
+        .collect();
+    // A pane that produced no output still owes us a slot.
+    panes.resize(count, Vec::new());
+    panes.truncate(count);
+    panes
+}
+
+/// Capture the visible screen of several panes in a single tmux invocation.
+///
+/// Read-only: this does not attach a client, so it cannot resize or otherwise
+/// disturb the panes being watched. One process spawn regardless of pane count.
+/// Returns one entry per requested pane, in order.
+pub fn capture_panes(pane_ids: &[String]) -> Vec<Vec<String>> {
+    if pane_ids.is_empty() {
+        return vec![];
+    }
+
+    let mut args: Vec<String> = Vec::with_capacity(pane_ids.len() * 8);
+    for (i, pane) in pane_ids.iter().enumerate() {
+        if i > 0 {
+            args.push(";".to_string());
+            args.push("display-message".to_string());
+            args.push("-p".to_string());
+            args.push(CAPTURE_SENTINEL.to_string());
+            args.push(";".to_string());
+        }
+        // No -e: plain text. Truncating escape-laden lines to a cell width risks
+        // cutting mid-sequence and bleeding styles across the grid.
+        args.push("capture-pane".to_string());
+        args.push("-p".to_string());
+        args.push("-t".to_string());
+        args.push(pane.clone());
+    }
+
+    let output = match Command::new("tmux").args(&args).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return vec![Vec::new(); pane_ids.len()],
+    };
+
+    split_captures(&String::from_utf8_lossy(&output.stdout), pane_ids.len())
 }
 
 pub fn switch_to_window(window_index: u32) {
@@ -494,9 +565,25 @@ pub fn set_window_type_pub(window_index: u32, window_type: &str) {
 }
 
 fn set_window_type(window_index: u32, window_type: &str) {
+    set_window_option(window_index, "@yeehaw_type", window_type);
+}
+
+/// Tag a window with the project and barn it belongs to, so the session grid can
+/// filter by scope without resorting to window-name prefix matching.
+///
+/// Pass an empty barn to default to the local barn.
+pub fn set_window_scope(window_index: u32, project: &str, barn: Option<&str>) {
+    if !project.is_empty() {
+        set_window_option(window_index, "@yeehaw_project", project);
+    }
+    let barn = barn.filter(|b| !b.is_empty()).unwrap_or(config::LOCAL_BARN_NAME);
+    set_window_option(window_index, "@yeehaw_barn", barn);
+}
+
+fn set_window_option(window_index: u32, option: &str, value: &str) {
     let target = format!("{}:{}", YEEHAW_SESSION, window_index);
     let _ = Command::new("tmux")
-        .args(["set-option", "-w", "-t", &target, "@yeehaw_type", window_type])
+        .args(["set-option", "-w", "-t", &target, option, value])
         .output();
 }
 
@@ -728,5 +815,103 @@ pub fn get_window_status(window: &TmuxWindow) -> WindowStatusInfo {
         text: format!("○ {}", text),
         status: SessionStatus::Idle,
         icon: "○".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(fields: &[&str]) -> String {
+        fields.join("\t")
+    }
+
+    #[test]
+    fn parses_a_fully_tagged_window() {
+        let w = parse_window_line(&line(&[
+            "4", "Guided Pages-claude", "1", "%18", "* building", "node", "1700",
+            "claude", "Guided Pages", "local",
+        ]))
+        .expect("should parse");
+
+        assert_eq!(w.index, 4);
+        assert_eq!(w.name, "Guided Pages-claude");
+        assert!(w.active);
+        assert_eq!(w.pane_id, "%18");
+        assert_eq!(w.window_type, "claude");
+        assert_eq!(w.project, "Guided Pages");
+        assert_eq!(w.barn, "local");
+    }
+
+    #[test]
+    fn untagged_window_degrades_to_empty_tags_rather_than_failing() {
+        // Windows created before scope tagging existed emit empty trailing fields.
+        let w = parse_window_line(&line(&[
+            "2", "old-window", "0", "%3", "title", "bash", "1700", "", "", "",
+        ]))
+        .expect("should still parse");
+
+        assert_eq!(w.window_type, "");
+        assert_eq!(w.project, "");
+        assert_eq!(w.barn, "");
+    }
+
+    #[test]
+    fn tolerates_lines_truncated_before_the_optional_tag_fields() {
+        let w = parse_window_line(&line(&[
+            "2", "old-window", "0", "%3", "title", "bash", "1700",
+        ]))
+        .expect("seven fields is enough");
+
+        assert_eq!(w.index, 2);
+        assert_eq!(w.window_type, "");
+        assert_eq!(w.project, "");
+    }
+
+    #[test]
+    fn rejects_lines_missing_required_fields() {
+        assert!(parse_window_line("4\tname\t1").is_none());
+        assert!(parse_window_line("").is_none());
+    }
+
+    #[test]
+    fn splits_a_batched_capture_into_one_screen_per_pane() {
+        let raw = format!(
+            "pane one line a\npane one line b\n{s}\npane two only line\n{s}\npane three",
+            s = CAPTURE_SENTINEL
+        );
+        let panes = split_captures(&raw, 3);
+
+        assert_eq!(panes.len(), 3);
+        assert_eq!(panes[0], vec!["pane one line a", "pane one line b"]);
+        assert_eq!(panes[1], vec!["pane two only line"]);
+        assert_eq!(panes[2], vec!["pane three"]);
+    }
+
+    #[test]
+    fn split_captures_preserves_slots_for_panes_that_produced_nothing() {
+        let raw = format!("{s}\nonly the middle pane spoke\n{s}", s = CAPTURE_SENTINEL);
+        let panes = split_captures(&raw, 3);
+
+        assert_eq!(panes.len(), 3);
+        assert!(panes[0].is_empty());
+        assert_eq!(panes[1], vec!["only the middle pane spoke"]);
+        assert!(panes[2].is_empty());
+    }
+
+    #[test]
+    fn split_captures_always_returns_exactly_the_requested_count() {
+        assert_eq!(split_captures("", 4).len(), 4);
+        assert_eq!(split_captures("just one pane", 1).len(), 1);
+    }
+
+    #[test]
+    fn sentinel_never_leaks_into_captured_output() {
+        let raw = format!("alpha\n{s}\nbeta", s = CAPTURE_SENTINEL);
+        for pane in split_captures(&raw, 2) {
+            for l in pane {
+                assert!(!l.contains(CAPTURE_SENTINEL), "sentinel leaked: {l:?}");
+            }
+        }
     }
 }

@@ -9,7 +9,7 @@ pub mod critter_detail;
 pub mod critter_logs;
 pub mod wiki_view;
 pub mod herd_detail;
-pub mod night_sky;
+pub mod session_grid;
 pub mod splash;
 pub mod issues_view;
 pub mod ranchhand_detail;

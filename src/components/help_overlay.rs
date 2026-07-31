@@ -102,7 +102,7 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
                     ("s", "SSH to barn / open shell"),
                     ("n", "Create new item"),
                     ("d", "Delete item"),
-                    ("v", "Night sky visualizer"),
+                    ("v", "Live session grid"),
                 ],
             });
             groups.push(HotkeyGroup {
@@ -124,7 +124,7 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
                     ("w", "Open wiki"),
                     ("i", "Open issues"),
                     ("e", "Edit project"),
-                    ("v", "Night sky visualizer"),
+                    ("v", "Live session grid"),
                 ],
             });
         }
@@ -134,7 +134,7 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
                 keys: vec![
                     ("s", "SSH to barn"),
                     ("e", "Edit barn"),
-                    ("v", "Night sky visualizer"),
+                    ("v", "Live session grid"),
                 ],
             });
         }

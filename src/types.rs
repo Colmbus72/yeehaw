@@ -381,7 +381,7 @@ pub enum AppView {
         source: String,
         source_barn: Option<Barn>,
     },
-    NightSky,
+    SessionGrid,
     Vault { source_pane: Option<String> },
 }
 

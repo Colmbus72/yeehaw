@@ -622,10 +622,12 @@ fn build_barn_items(barns: &[Barn]) -> Vec<ListItem> {
 
 fn build_session_items(session_windows: &[&TmuxWindow]) -> Vec<ListItem> {
     session_windows.iter().enumerate().map(|(i, w)| {
-        let (label, type_hint) = format_session_label(&w.name);
+        // Type comes from the @yeehaw_type tmux option, not the window name.
+        // The old name-sniffing decoder mislabelled anything it did not expect.
+        let label = w.name.clone();
         let status_info = tmux::get_window_status(w);
-        let meta_text = if !type_hint.is_empty() {
-            format!("{} · {}", type_hint, status_info.text)
+        let meta_text = if !w.window_type.is_empty() {
+            format!("{} · {}", w.window_type, status_info.text)
         } else {
             status_info.text
         };
@@ -660,30 +662,6 @@ fn build_worm_items(worms: &[Worm]) -> Vec<ListItem> {
             actions: vec![],
         }
     }).collect()
-}
-
-fn format_session_label(name: &str) -> (String, String) {
-    if let Some(rest) = name.strip_prefix("remote:") {
-        return (rest.to_string(), "remote".to_string());
-    }
-    if let Some(rest) = name.strip_prefix("worm:") {
-        return (rest.to_string(), "worm".to_string());
-    }
-    if let Some(rest) = name.strip_prefix("slack:") {
-        return (rest.to_string(), "slack".to_string());
-    }
-    if let Some(rest) = name.strip_prefix("barn-") {
-        return (rest.to_string(), "barn".to_string());
-    }
-    if let Some(rest) = name.strip_suffix("-claude") {
-        return (rest.to_string(), "claude".to_string());
-    }
-    if let Some(pos) = name.rfind('-') {
-        let project = &name[..pos];
-        let livestock = &name[pos+1..];
-        return (format!("{} · {}", project, livestock), "shell".to_string());
-    }
-    (name.to_string(), String::new())
 }
 
 fn format_run_age(iso_timestamp: &str) -> String {

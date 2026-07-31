@@ -26,7 +26,7 @@ use crate::views::critter_detail::CritterDetailView;
 use crate::views::critter_logs::CritterLogsView;
 use crate::views::wiki_view::WikiView;
 use crate::views::herd_detail::HerdDetailView;
-use crate::views::night_sky::NightSkyView;
+use crate::views::session_grid::{GridAction, GridScope, SessionGridView};
 use crate::views::issues_view::{IssuesView, IssuesAction};
 use crate::views::ranchhand_detail::{RanchHandDetailView, RanchHandAction};
 use crate::views::trail_view::{TrailView, TrailViewAction};
@@ -63,7 +63,7 @@ pub struct App {
     pub critter_logs_view: Option<CritterLogsView>,
     pub wiki_view: WikiView,
     pub herd_view: HerdDetailView,
-    pub night_sky_view: NightSkyView,
+    pub session_grid_view: SessionGridView,
     pub issues_view: IssuesView,
     pub ranchhand_view: RanchHandDetailView,
     pub vault_view: VaultView,
@@ -128,7 +128,7 @@ impl App {
             critter_logs_view: None,
             wiki_view: WikiView::new(),
             herd_view: HerdDetailView::new(),
-            night_sky_view: NightSkyView::new(None),
+            session_grid_view: SessionGridView::new(GridScope::All),
             issues_view: IssuesView::new(),
             ranchhand_view: RanchHandDetailView::new(),
             vault_view: VaultView::new(),
@@ -164,6 +164,16 @@ impl App {
 
     pub fn refresh_windows(&mut self) {
         self.windows = tmux::list_yeehaw_windows();
+    }
+
+    /// Open the live session grid, scoped to wherever `v` was pressed.
+    pub fn open_session_grid(&mut self, scope: GridScope) {
+        self.previous_view = Some(self.view.clone());
+        self.session_grid_view = SessionGridView::new(scope);
+        // Populate immediately so the first frame is not blank.
+        let windows = self.windows.clone();
+        self.session_grid_view.tick(&windows);
+        self.navigate(AppView::SessionGrid);
     }
 
     pub fn show_claude_splash(&mut self, window_index: u32, system_prompt: String, tools: Vec<String>) {
@@ -274,7 +284,7 @@ impl App {
                 };
                 self.navigate(view);
             }
-            AppView::NightSky => {
+            AppView::SessionGrid => {
                 if let Some(prev) = self.previous_view.take() {
                     self.navigate(prev);
                 } else {
@@ -498,9 +508,7 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                                     app.should_quit = true;
                                 }
                                 KeyCode::Char('v') => {
-                                    app.previous_view = Some(app.view.clone());
-                                    app.night_sky_view = NightSkyView::new(None);
-                                    app.navigate(AppView::NightSky);
+                                    app.open_session_grid(GridScope::All);
                                     continue;
                                 }
                                 _ => {}
@@ -513,11 +521,10 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                             match key.code {
                                 KeyCode::Esc => { app.go_back(); continue; }
                                 KeyCode::Char('v') => {
-                                    app.previous_view = Some(app.view.clone());
                                     if let AppView::Project { ref project } = app.view {
-                                        app.night_sky_view = NightSkyView::new(Some(&project.name));
+                                        let scope = GridScope::Project(project.name.clone());
+                                        app.open_session_grid(scope);
                                     }
-                                    app.navigate(AppView::NightSky);
                                     continue;
                                 }
                                 _ => {}
@@ -530,11 +537,10 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                             match key.code {
                                 KeyCode::Esc => { app.go_back(); continue; }
                                 KeyCode::Char('v') => {
-                                    app.previous_view = Some(app.view.clone());
                                     if let AppView::Barn { ref barn } = app.view {
-                                        app.night_sky_view = NightSkyView::new(Some(&barn.name));
+                                        let scope = GridScope::Barn(barn.name.clone());
+                                        app.open_session_grid(scope);
                                     }
-                                    app.navigate(AppView::NightSky);
                                     continue;
                                 }
                                 _ => {}
@@ -580,8 +586,8 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                         }
                         handle_herd_detail_input(&mut app, key.code);
                     }
-                    AppView::NightSky => {
-                        handle_night_sky_input(&mut app, key.code);
+                    AppView::SessionGrid => {
+                        handle_session_grid_input(&mut app, key.code);
                     }
                     AppView::Issues { ref project } => {
                         let project = project.clone();
@@ -592,6 +598,7 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                                 let window_name = format!("{}-issue-claude", project.name);
                                 match tmux::create_claude_window_with_context(&working_dir, &window_name, &ctx) {
                                     Ok(idx) => {
+                                        tmux::set_window_scope(idx, &project.name, None);
                                         let tools: Vec<String> = tmux::YEEHAW_MCP_TOOLS.iter()
                                             .map(|t| t.strip_prefix("mcp__yeehaw__").unwrap_or(t).to_string())
                                             .collect();
@@ -622,10 +629,11 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                 }
             }
         } else {
-            // Tick: refresh windows periodically, animate night sky
+            // Tick: refresh windows periodically, stream the session grid
             app.refresh_windows();
-            if matches!(app.view, AppView::NightSky) {
-                app.night_sky_view.tick();
+            if matches!(app.view, AppView::SessionGrid) {
+                let windows = app.windows.clone();
+                app.session_grid_view.tick(&windows);
             }
 
             // Vault idle timeout
@@ -767,6 +775,7 @@ fn handle_global_dashboard_input(app: &mut App, key: KeyCode) {
                 let ctx = context::build_project_context(project);
                 match tmux::create_claude_window_with_context(&working_dir, &window_name, &ctx) {
                     Ok(idx) => {
+                        tmux::set_window_scope(idx, &project.name, None);
                         let tools: Vec<String> = tmux::YEEHAW_MCP_TOOLS.iter()
                             .map(|t| t.strip_prefix("mcp__yeehaw__").unwrap_or(t).to_string())
                             .collect();
@@ -782,12 +791,14 @@ fn handle_global_dashboard_input(app: &mut App, key: KeyCode) {
                     let home = dirs::home_dir().unwrap_or_default();
                     let window_name = format!("barn-{}", barn.name);
                     if let Ok(idx) = tmux::create_shell_window(home.to_str().unwrap_or("~"), &window_name) {
+                        tmux::set_window_scope(idx, "", Some(&barn.name));
                         tmux::switch_to_window(idx);
                     }
                 } else if let (Some(host), Some(user), Some(port), Some(key)) =
                     (&barn.host, &barn.user, barn.port, &barn.identity_file) {
                     let window_name = format!("barn-{}", barn.name);
                     if let Ok(idx) = tmux::create_ssh_window(&window_name, host, user, port, key, "~") {
+                        tmux::set_window_scope(idx, "", Some(&barn.name));
                         tmux::switch_to_window(idx);
                     }
                 }
@@ -920,6 +931,7 @@ fn handle_project_context_input(app: &mut App, key: KeyCode) {
                     let ctx = context::build_livestock_context(&project, &ls.name);
                     match tmux::create_claude_window_with_context(&working_dir, &window_name, &ctx) {
                         Ok(idx) => {
+                            tmux::set_window_scope(idx, &project.name, ls.barn.as_deref());
                             let tools: Vec<String> = tmux::YEEHAW_MCP_TOOLS.iter()
                                 .map(|t| t.strip_prefix("mcp__yeehaw__").unwrap_or(t).to_string())
                                 .collect();
@@ -938,6 +950,7 @@ fn handle_project_context_input(app: &mut App, key: KeyCode) {
                             if let (Some(host), Some(user), Some(port), Some(key)) =
                                 (&barn.host, &barn.user, barn.port, &barn.identity_file) {
                                 if let Ok(idx) = tmux::create_ssh_window(&window_name, host, user, port, key, &ls.path) {
+                                    tmux::set_window_scope(idx, &project.name, ls.barn.as_deref());
                                     tmux::switch_to_window(idx);
                                 }
                             }
@@ -946,6 +959,7 @@ fn handle_project_context_input(app: &mut App, key: KeyCode) {
                     }
                     let working_dir = expand_path(&ls.path);
                     if let Ok(idx) = tmux::create_shell_window(&working_dir, &window_name) {
+                        tmux::set_window_scope(idx, &project.name, ls.barn.as_deref());
                         tmux::switch_to_window(idx);
                     }
                 }
@@ -1106,12 +1120,14 @@ fn handle_barn_context_input(app: &mut App, key: KeyCode) {
                     let home = dirs::home_dir().unwrap_or_default();
                     let window_name = format!("barn-{}", barn.name);
                     if let Ok(idx) = tmux::create_shell_window(home.to_str().unwrap_or("~"), &window_name) {
+                        tmux::set_window_scope(idx, "", Some(&barn.name));
                         tmux::switch_to_window(idx);
                     }
                 } else if let (Some(host), Some(user), Some(port), Some(key_file)) =
                     (&barn.host, &barn.user, barn.port, &barn.identity_file) {
                     let window_name = format!("barn-{}", barn.name);
                     if let Ok(idx) = tmux::create_ssh_window(&window_name, host, user, port, key_file, "~") {
+                        tmux::set_window_scope(idx, "", Some(&barn.name));
                         tmux::switch_to_window(idx);
                     }
                 }
@@ -1257,6 +1273,7 @@ fn handle_livestock_detail_input(app: &mut App, key: KeyCode) {
                 let ctx = context::build_livestock_context(&project, &livestock.name);
                 match tmux::create_claude_window_with_context(&working_dir, &window_name, &ctx) {
                     Ok(idx) => {
+                        tmux::set_window_scope(idx, &project.name, livestock.barn.as_deref());
                         let tools: Vec<String> = tmux::YEEHAW_MCP_TOOLS.iter()
                             .map(|t| t.strip_prefix("mcp__yeehaw__").unwrap_or(t).to_string())
                             .collect();
@@ -1275,6 +1292,7 @@ fn handle_livestock_detail_input(app: &mut App, key: KeyCode) {
                         if let (Some(host), Some(user), Some(port), Some(key)) =
                             (&barn.host, &barn.user, barn.port, &barn.identity_file) {
                             if let Ok(idx) = tmux::create_ssh_window(&window_name, host, user, port, key, &livestock.path) {
+                                tmux::set_window_scope(idx, &project.name, livestock.barn.as_deref());
                                 tmux::switch_to_window(idx);
                             }
                         }
@@ -1283,6 +1301,7 @@ fn handle_livestock_detail_input(app: &mut App, key: KeyCode) {
                 }
                 let working_dir = expand_path(&livestock.path);
                 if let Ok(idx) = tmux::create_shell_window(&working_dir, &window_name) {
+                    tmux::set_window_scope(idx, &project.name, livestock.barn.as_deref());
                     tmux::switch_to_window(idx);
                 }
             }
@@ -1472,9 +1491,16 @@ fn handle_herd_detail_input(app: &mut App, key: KeyCode) {
     }
 }
 
-fn handle_night_sky_input(app: &mut App, key: KeyCode) {
-    if app.night_sky_view.handle_input(key) {
-        app.go_back();
+fn handle_session_grid_input(app: &mut App, key: KeyCode) {
+    let windows = app.windows.clone();
+    match app.session_grid_view.handle_input(key, &windows) {
+        GridAction::Back => app.go_back(),
+        GridAction::Jump(window_index) => {
+            // Stay on the grid rather than going back, so Ctrl+Y from the
+            // session lands straight back here instead of the dashboard.
+            tmux::switch_to_window(window_index);
+        }
+        GridAction::None => {}
     }
 }
 
@@ -1870,8 +1896,9 @@ fn render_view(frame: &mut Frame, app: &mut App, area: Rect) {
             let herd = herd.clone();
             app.herd_view.render(frame, area, &project, &herd, &app.barns);
         }
-        AppView::NightSky => {
-            app.night_sky_view.render(frame, area);
+        AppView::SessionGrid => {
+            let windows = app.windows.clone();
+            app.session_grid_view.render(frame, area, &windows);
         }
         AppView::Issues { project } => {
             let project = project.clone();
@@ -2005,10 +2032,11 @@ fn get_bottom_bar_items(view: &AppView) -> Vec<(&'static str, &'static str)> {
             ("d", "remove"),
             ("Esc", "back"),
         ],
-        AppView::NightSky => vec![
-            ("r", "randomize"),
-            ("Space", "pause"),
-            ("Esc", "exit"),
+        AppView::SessionGrid => vec![
+            ("1-9", "jump"),
+            ("c", "claude only"),
+            ("f", "filter"),
+            ("Esc", "back"),
         ],
         AppView::Trail { .. } => vec![
             ("r", "run"),
