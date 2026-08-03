@@ -131,9 +131,33 @@ pub struct Probe {
     pub session_live: bool,
 }
 
-const PROBE_CMD: &str = "command -v tmux >/dev/null && echo tmux:ok; \
+/// The pre-flight the barn runs. Two properties matter, and both were bugs.
+///
+/// **It always exits 0.** The findings travel on stdout as flags; the exit
+/// status is reserved for whether we reached a shell at all. Without the
+/// trailing `exit 0` the status is `tmux has-session`'s, which is 1 whenever no
+/// yeehaw session is running — the normal state of a barn nobody has attached to
+/// yet. `run` turned that into `Err`, `connect.rs` rendered "unreachable", and
+/// `2>/dev/null` left `failure_message` with nothing to say, so the *first*
+/// connect to every barn failed with no explanation. It also contradicted
+/// `connect::blocker`, which deliberately treats a missing session as not a
+/// blocker because remote yeehaw creates its own on launch. Discarding the
+/// status costs nothing: ssh reports its own failures — unreachable, auth,
+/// host-key — as 255, and a barn with no `bash` still comes back as 127 from
+/// the remote shell, both of which `run` still sees.
+///
+/// **It runs under `bash -lc`, exactly like [`crate::connect`]'s attach.** sshd
+/// runs a non-login, non-interactive shell whose PATH has neither Homebrew nor
+/// `~/.local/bin`, so probing the raw shell reported "tmux is not installed" for
+/// barns where tmux and yeehaw both exist and attaching works fine.
+///
+/// The inner script holds no `$` and no double quotes, so it nests inside
+/// `bash -lc "..."` as one argv element with no further escaping.
+const PROBE_CMD: &str = "bash -lc \"\
+                         command -v tmux >/dev/null && echo tmux:ok; \
                          command -v yeehaw >/dev/null && echo yeehaw:ok; \
-                         tmux has-session -t yeehaw 2>/dev/null && echo session:live";
+                         tmux has-session -t yeehaw 2>/dev/null && echo session:live; \
+                         exit 0\"";
 
 /// Parse probe output. Matches whole lines only — barns print MOTDs, and a
 /// substring match would read "yeehaw is great" as a positive flag.
@@ -344,5 +368,166 @@ mod tests {
         let p = parse_probe("Welcome to Ubuntu\nyeehaw is great\ntmux:ok\n");
         assert!(p.has_tmux);
         assert!(!p.has_yeehaw, "'yeehaw is great' is not the yeehaw:ok flag");
+    }
+
+    // === PROBE_CMD through a real shell ====================================
+    //
+    // PROBE_CMD is a shell script we never parse ourselves — sshd hands it to
+    // the barn's shell. Both bugs it has had were in how a real shell ran it,
+    // not in how it reads, so these tests run the actual constant through an
+    // actual `sh` rather than comparing it to a hand-written expectation that
+    // could be wrong in the same way the constant is. Same approach as
+    // `tmux::tests::assert_sh_roundtrip` and the mcp_server injection tests.
+
+    /// The PATH sshd gives a non-login shell: no Homebrew, no `~/.local/bin`.
+    /// Observed on a real barn as
+    /// `/bin:/usr/bin:/usr/ucb:/usr/local/bin`, where `tmux` lives in
+    /// `/opt/homebrew/bin` and `yeehaw` in `~/.local/bin`.
+    const NON_LOGIN_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+    /// Run `script` through a real `sh`, the way sshd hands a remote command to
+    /// the barn's shell. `path` replaces PATH outright when given. `/bin/sh` is
+    /// spelled absolutely so a replaced PATH cannot change which shell runs.
+    fn sh_probe(script: &str, path: Option<&str>) -> (Option<i32>, String) {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", script]);
+        if let Some(p) = path {
+            cmd.env("PATH", p);
+        }
+        let out = cmd.output().expect("sh should be runnable");
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    /// Install `script` as an executable named `name` in `dir`, and return `dir`
+    /// as a PATH value.
+    fn stub_bin(dir: &std::path::Path, name: &str, script: &str) -> String {
+        let bin = dir.join(name);
+        std::fs::write(&bin, script).expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        dir.display().to_string()
+    }
+
+    /// `PROBE_CMD` with the probed session renamed to one that cannot exist, so
+    /// the "no session running" branch is exercised on any machine — including a
+    /// dev box that is running yeehaw in tmux right now.
+    fn probe_cmd_with_no_live_session() -> String {
+        let absent = format!("yeehaw-absent-{}", std::process::id());
+        let swapped = PROBE_CMD.replace("-t yeehaw ", &format!("-t {} ", absent));
+        assert_ne!(
+            swapped, PROBE_CMD,
+            "PROBE_CMD no longer contains '-t yeehaw '; this test has gone vacuous"
+        );
+        swapped
+    }
+
+    #[test]
+    fn probe_exits_zero_when_no_session_is_running() {
+        // THE regression test for bug A. The old PROBE_CMD ended in
+        // `tmux has-session`, so its status was 1 whenever no yeehaw session
+        // existed. `run` turns non-zero into Err and connect.rs renders
+        // "unreachable — ssh to '<barn>' failed", which made the FIRST connect to
+        // every barn fail: no session yet is the normal initial state, and
+        // connect::blocker deliberately does not treat it as a blocker.
+        let (code, stdout) = sh_probe(&probe_cmd_with_no_live_session(), None);
+        assert_eq!(code, Some(0), "probe must exit 0; stdout was {stdout:?}");
+        assert!(
+            !parse_probe(&stdout).session_live,
+            "a session that cannot exist must not report session:live: {stdout:?}"
+        );
+    }
+
+    #[test]
+    fn probe_exits_zero_when_the_barn_has_nothing_installed() {
+        // Bug A's worst case: tmux missing, yeehaw missing, and `tmux has-session`
+        // therefore failing with 127. The status must still be 0 — "this barn has
+        // nothing on it" is a finding for stdout, not a connection failure. A
+        // stand-in login shell that runs the script under an empty PATH makes the
+        // case reachable regardless of what this machine has installed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Accepts `-lc <script>` and runs the script with PATH still empty.
+        let path = stub_bin(dir.path(), "bash", "#!/bin/sh\nexec /bin/sh -c \"$2\"\n");
+
+        let (code, stdout) = sh_probe(PROBE_CMD, Some(&path));
+        assert_eq!(code, Some(0), "probe must exit 0; stdout was {stdout:?}");
+
+        let p = parse_probe(&stdout);
+        assert_eq!(p, Probe::default(), "nothing is installed, so no flags: {stdout:?}");
+    }
+
+    #[test]
+    fn probe_runs_under_a_login_shell_as_a_single_argument() {
+        // Bug B. A `bash` that prints its argv proves both halves at once: the
+        // `-l` really reaches the shell, and the whole inner script arrives as
+        // ONE argument instead of being split by the outer shell that sshd uses
+        // to run the remote command.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = stub_bin(
+            dir.path(),
+            "bash",
+            "#!/bin/sh\nfor a in \"$@\"; do printf 'ARG[%s]\\n' \"$a\"; done\n",
+        );
+
+        let (_, stdout) = sh_probe(PROBE_CMD, Some(&path));
+        let args: Vec<&str> = stdout
+            .lines()
+            .filter_map(|l| l.strip_prefix("ARG[")?.strip_suffix(']'))
+            .collect();
+
+        assert_eq!(args.len(), 2, "expected `bash -lc <script>`, got {args:?}");
+        assert_eq!(
+            args[0], "-lc",
+            "the probe must use a login shell, the same as connect's attach"
+        );
+        for fragment in ["command -v tmux", "command -v yeehaw", "has-session", "exit 0"] {
+            assert!(
+                args[1].contains(fragment),
+                "the script reached bash mangled — {fragment:?} missing from {:?}",
+                args[1]
+            );
+        }
+    }
+
+    #[test]
+    fn probe_finds_tools_a_non_login_shell_would_miss() {
+        // Bug B end to end, from sshd's actual PATH. Ground truth is what the
+        // login shell can reach starting from that same PATH, computed without
+        // going through PROBE_CMD. On a machine whose profile adds Homebrew or
+        // ~/.local/bin, dropping the `bash -lc` makes this fail: the probe would
+        // report "not installed" for tools that are installed, and connect.rs
+        // would refuse to attach to a barn that attaches fine.
+        let (code, stdout) = sh_probe(&probe_cmd_with_no_live_session(), Some(NON_LOGIN_PATH));
+        assert_eq!(code, Some(0), "probe must exit 0; stdout was {stdout:?}");
+        let p = parse_probe(&stdout);
+
+        for (tool, found) in [("tmux", p.has_tmux), ("yeehaw", p.has_yeehaw)] {
+            let script = format!("bash -lc \"command -v {tool} >/dev/null && echo yes; exit 0\"");
+            let (_, truth) = sh_probe(&script, Some(NON_LOGIN_PATH));
+            let truth = truth.contains("yes");
+            assert_eq!(
+                found, truth,
+                "the login shell {} reach {tool} but the probe {} it",
+                if truth { "can" } else { "cannot" },
+                if found { "found" } else { "did not find" }
+            );
+        }
+
+        assert!(!p.session_live, "the substituted session cannot exist: {stdout:?}");
+    }
+
+    #[test]
+    fn the_real_probe_command_runs_clean_on_this_machine() {
+        // No substitutions, no stubs: the exact constant `probe` ships, through a
+        // real shell. Whatever this machine has installed, the status is 0 and
+        // the only lines that parse as flags are flags we asked for.
+        let (code, stdout) = sh_probe(PROBE_CMD, None);
+        assert_eq!(code, Some(0), "probe must exit 0; stdout was {stdout:?}");
+        assert!(
+            !stdout.contains("command not found"),
+            "the probe leaked shell errors onto stdout: {stdout:?}"
+        );
     }
 }
