@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -46,6 +47,13 @@ pub struct App {
     pub barns: Vec<Barn>,
     pub worms: Vec<Worm>,
     pub windows: Vec<tmux::TmuxWindow>,
+    /// tmux session names of barns we currently hold a local session onto.
+    /// Bare names as `list-sessions` reports them, so membership is tested with
+    /// [`tmux::barn_session_name`] — never `barn_session_target`, whose `=`
+    /// prefix is for `-t` arguments only and would never match here.
+    /// Refreshed by `refresh_windows` on the idle tick, so no render path has to
+    /// shell out to tmux to know this.
+    pub connected_barns: HashSet<String>,
     pub should_quit: bool,
     pub error: Option<String>,
     pub show_help: bool,
@@ -105,6 +113,7 @@ impl App {
         let barns = config::load_barns();
         let worms = config::load_worms();
         let windows = tmux::list_yeehaw_windows();
+        let connected_barns = tmux::connected_barn_sessions(&tmux::list_session_names());
 
         Self {
             view: AppView::Global,
@@ -113,6 +122,7 @@ impl App {
             barns,
             worms,
             windows,
+            connected_barns,
             should_quit: false,
             error: None,
             show_help: false,
@@ -164,6 +174,9 @@ impl App {
 
     pub fn refresh_windows(&mut self) {
         self.windows = tmux::list_yeehaw_windows();
+        // Hoisted here rather than into the render path: this runs on the 250ms
+        // idle tick, render runs every frame and must stay free of subprocesses.
+        self.connected_barns = tmux::connected_barn_sessions(&tmux::list_session_names());
     }
 
     /// Open the live session grid, scoped to wherever `v` was pressed.
@@ -433,6 +446,13 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             let dialog = app.confirm_dialog.take().unwrap();
                             handle_confirm_action(&mut app, dialog.on_confirm);
+                            // The `continue` below skips the loop's own
+                            // should_quit check, so a confirmed quit has to
+                            // leave here. Outside tmux — a dev run — the
+                            // kill-session is a no-op and this is the only exit.
+                            if app.should_quit {
+                                break;
+                            }
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                             app.confirm_dialog = None;
@@ -497,6 +517,29 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                 // Global keybinds based on current view
                 match &app.view {
                     AppView::Global => {
+                        // Ctrl-D: disconnect the selected barn. Handled here and
+                        // not in `handle_input` because that takes a bare
+                        // `KeyCode` and never sees the modifier. `d` alone is
+                        // already delete-barn, so disconnect must not share it.
+                        if !in_input_mode
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('d')
+                        {
+                            let name = app
+                                .global_dashboard
+                                .focused_barn_index()
+                                .and_then(|idx| app.barns.get(idx))
+                                .map(|barn| barn.name.clone());
+                            if let Some(name) = name {
+                                tmux::disconnect_barn(&name);
+                                // Clear the connected dot now instead of
+                                // waiting on the 250ms idle tick. Skipped when
+                                // nothing was disconnected so a stray C-d on
+                                // another panel spawns no subprocesses.
+                                app.refresh_windows();
+                            }
+                            continue;
+                        }
                         if !in_input_mode {
                             match key.code {
                                 KeyCode::Char('q') => {
@@ -504,8 +547,34 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                                     continue;
                                 }
                                 KeyCode::Char('Q') => {
-                                    tmux::kill_yeehaw_session();
-                                    app.should_quit = true;
+                                    // Barn sessions are siblings of the yeehaw
+                                    // session, so killing yeehaw alone strands
+                                    // every one of them: still running, no
+                                    // dashboard left to reach them from. Read
+                                    // the live set rather than trusting the
+                                    // idle tick — a barn connected in the last
+                                    // 250ms must not be quietly orphaned.
+                                    app.connected_barns = tmux::connected_barn_sessions(
+                                        &tmux::list_session_names(),
+                                    );
+                                    // The prompt is driven by the session count,
+                                    // not the name list: a barn deleted while
+                                    // connected leaves a session nothing can
+                                    // name, and quitting past it silently is
+                                    // the orphan this prompt exists to stop.
+                                    let open = connected_barn_names(&app.barns, &app.connected_barns);
+                                    if app.connected_barns.is_empty() {
+                                        tmux::kill_yeehaw_session();
+                                        app.should_quit = true;
+                                    } else {
+                                        app.confirm_dialog = Some(
+                                            ConfirmDialog::quit_with_barn_sessions(
+                                                &open,
+                                                app.connected_barns.len(),
+                                            ),
+                                        );
+                                        continue;
+                                    }
                                 }
                                 KeyCode::Char('v') => {
                                     app.open_session_grid(GridScope::All);
@@ -533,6 +602,18 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                         handle_project_context_input(&mut app, key.code);
                     }
                     AppView::Barn { .. } => {
+                        // Ctrl-D: disconnect this barn. Same reasoning as the
+                        // global arm; here the barn is already in hand.
+                        if !in_input_mode
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('d')
+                        {
+                            if let AppView::Barn { ref barn } = app.view {
+                                tmux::disconnect_barn(&barn.name);
+                            }
+                            app.refresh_windows();
+                            continue;
+                        }
                         if !app.barn_view.is_editing() {
                             match key.code {
                                 KeyCode::Esc => { app.go_back(); continue; }
@@ -786,7 +867,8 @@ fn handle_global_dashboard_input(app: &mut App, key: KeyCode) {
             }
         }
         DashboardAction::SshToBarn(barn_idx) => {
-            if let Some(barn) = app.barns.get(barn_idx) {
+            if let Some(barn) = app.barns.get(barn_idx).cloned() {
+                let barn = &barn;
                 if config::is_local_barn(barn) {
                     let home = dirs::home_dir().unwrap_or_default();
                     let window_name = format!("barn-{}", barn.name);
@@ -794,14 +876,23 @@ fn handle_global_dashboard_input(app: &mut App, key: KeyCode) {
                         tmux::set_window_scope(idx, "", Some(&barn.name));
                         tmux::switch_to_window(idx);
                     }
-                } else if let (Some(host), Some(user), Some(port), Some(key)) =
-                    (&barn.host, &barn.user, barn.port, &barn.identity_file) {
+                } else {
                     let window_name = format!("barn-{}", barn.name);
-                    if let Ok(idx) = tmux::create_ssh_window(&window_name, host, user, port, key, "~") {
-                        tmux::set_window_scope(idx, "", Some(&barn.name));
-                        tmux::switch_to_window(idx);
+                    match tmux::create_ssh_window(&window_name, barn, "~") {
+                        Ok(idx) => {
+                            tmux::set_window_scope(idx, "", Some(&barn.name));
+                            tmux::switch_to_window(idx);
+                        }
+                        Err(e) => app.error = Some(format!("SSH failed: {}", e)),
                     }
                 }
+            }
+        }
+        DashboardAction::ConnectBarn(barn_idx) => {
+            // `.cloned()`: `connect_barn` writes `app.error`, so the borrow of
+            // `app.barns` must not still be live.
+            if let Some(barn) = app.barns.get(barn_idx).cloned() {
+                connect_barn(app, &barn);
             }
         }
         DashboardAction::CreateProject(name, path) => {
@@ -943,16 +1034,18 @@ fn handle_project_context_input(app: &mut App, key: KeyCode) {
             }
             ProjectAction::OpenShell(ls_idx) => {
                 if let Some(ls) = project.livestock.get(ls_idx) {
-                    let barn = ls.barn.as_ref().and_then(|bn| app.barns.iter().find(|b| b.name == *bn));
+                    let barn = ls.barn.as_ref()
+                        .and_then(|bn| app.barns.iter().find(|b| b.name == *bn))
+                        .cloned();
                     let window_name = format!("{}-{}", project.name, ls.name);
                     if let Some(barn) = barn {
-                        if !config::is_local_barn(barn) {
-                            if let (Some(host), Some(user), Some(port), Some(key)) =
-                                (&barn.host, &barn.user, barn.port, &barn.identity_file) {
-                                if let Ok(idx) = tmux::create_ssh_window(&window_name, host, user, port, key, &ls.path) {
+                        if !config::is_local_barn(&barn) {
+                            match tmux::create_ssh_window(&window_name, &barn, &ls.path) {
+                                Ok(idx) => {
                                     tmux::set_window_scope(idx, &project.name, ls.barn.as_deref());
                                     tmux::switch_to_window(idx);
                                 }
+                                Err(e) => app.error = Some(format!("SSH failed: {}", e)),
                             }
                             return;
                         }
@@ -1062,6 +1155,28 @@ fn handle_project_context_input(app: &mut App, key: KeyCode) {
     }
 }
 
+/// Shared by the `c` binding on the dashboard's barns panel and on the barn
+/// view. Rejects exactly the barns `connect::run` rejects, using its wording
+/// verbatim — the same barn must not produce two different messages depending
+/// on which side noticed. `connect::run` re-checks both: it is the entry point
+/// for `yeehaw connect` from a shell, where the TUI never ran.
+fn connect_barn(app: &mut App, barn: &Barn) {
+    if config::is_local_barn(barn) {
+        app.error = Some(format!(
+            "'{}' is the local barn — not connectable, just run yeehaw",
+            barn.name
+        ));
+    } else if barn.connectable == Some(false) {
+        app.error = Some(format!("barn '{}' is not connectable over SSH", barn.name));
+    } else if let Err(e) = tmux::connect_to_barn(barn) {
+        // `{:#}`, not `{}`: connect failures are context chains ("failed to write
+        // ~/.yeehaw/tmux.conf: permission denied"), and plain Display shows only
+        // the outermost layer. The layer that says what actually went wrong is
+        // underneath, and this banner is the only place the user ever sees it.
+        app.error = Some(format!("Connect failed: {:#}", e));
+    }
+}
+
 fn handle_barn_context_input(app: &mut App, key: KeyCode) {
     if let AppView::Barn { ref barn } = app.view {
         let barn = barn.clone();
@@ -1123,14 +1238,19 @@ fn handle_barn_context_input(app: &mut App, key: KeyCode) {
                         tmux::set_window_scope(idx, "", Some(&barn.name));
                         tmux::switch_to_window(idx);
                     }
-                } else if let (Some(host), Some(user), Some(port), Some(key_file)) =
-                    (&barn.host, &barn.user, barn.port, &barn.identity_file) {
+                } else {
                     let window_name = format!("barn-{}", barn.name);
-                    if let Ok(idx) = tmux::create_ssh_window(&window_name, host, user, port, key_file, "~") {
-                        tmux::set_window_scope(idx, "", Some(&barn.name));
-                        tmux::switch_to_window(idx);
+                    match tmux::create_ssh_window(&window_name, &barn, "~") {
+                        Ok(idx) => {
+                            tmux::set_window_scope(idx, "", Some(&barn.name));
+                            tmux::switch_to_window(idx);
+                        }
+                        Err(e) => app.error = Some(format!("SSH failed: {}", e)),
                     }
                 }
+            }
+            BarnAction::ConnectBarn => {
+                connect_barn(app, &barn);
             }
             BarnAction::UpdateBarn(updated) => {
                 match config::save_barn(&updated) {
@@ -1285,16 +1405,16 @@ fn handle_livestock_detail_input(app: &mut App, key: KeyCode) {
             LivestockAction::OpenShell => {
                 let barn = source_barn.as_ref().or_else(|| {
                     livestock.barn.as_ref().and_then(|bn| app.barns.iter().find(|b| b.name == *bn))
-                });
+                }).cloned();
                 let window_name = format!("{}-{}", project.name, livestock.name);
                 if let Some(barn) = barn {
-                    if !config::is_local_barn(barn) {
-                        if let (Some(host), Some(user), Some(port), Some(key)) =
-                            (&barn.host, &barn.user, barn.port, &barn.identity_file) {
-                            if let Ok(idx) = tmux::create_ssh_window(&window_name, host, user, port, key, &livestock.path) {
+                    if !config::is_local_barn(&barn) {
+                        match tmux::create_ssh_window(&window_name, &barn, &livestock.path) {
+                            Ok(idx) => {
                                 tmux::set_window_scope(idx, &project.name, livestock.barn.as_deref());
                                 tmux::switch_to_window(idx);
                             }
+                            Err(e) => app.error = Some(format!("SSH failed: {}", e)),
                         }
                         return;
                     }
@@ -1658,6 +1778,26 @@ fn save_vault_to_disk(app: &mut App) {
     }
 }
 
+/// Names of the barns we currently hold a local session onto, in dashboard
+/// order — what the quit dialog lists.
+///
+/// The mapping only runs forward: `barn_session_name(barn)` is looked up in the
+/// set of live session names. It cannot run backward. A session name is a lossy
+/// slug (`camera pi` and `camera-pi` share one) plus an FNV hash of the
+/// original, so nothing recovers a barn name from `yh-barn-camera-pi-1a2b3c4d`.
+///
+/// A live session whose barn has since been deleted from the ranch therefore
+/// has no name to show and is left out of the list. It is still closed:
+/// [`tmux::kill_all_barn_sessions`] works off tmux's own session list, not off
+/// this one.
+fn connected_barn_names(barns: &[Barn], connected: &HashSet<String>) -> Vec<String> {
+    barns
+        .iter()
+        .filter(|b| connected.contains(&tmux::barn_session_name(&b.name)))
+        .map(|b| b.name.clone())
+        .collect()
+}
+
 fn handle_confirm_action(app: &mut App, action: ConfirmAction) {
     match action {
         ConfirmAction::DeleteProject(name) => {
@@ -1687,6 +1827,15 @@ fn handle_confirm_action(app: &mut App, action: ConfirmAction) {
                     app.error = Some(format!("Failed to delete barn: {}", e));
                 }
             }
+        }
+        ConfirmAction::QuitClosingBarnSessions => {
+            // Barns first: kill_yeehaw_session takes down the session this
+            // process runs in, so anything after it may never execute.
+            // kill_all_barn_sessions re-reads tmux, so a barn connected between
+            // the prompt and the `y` is closed too, listed or not.
+            tmux::kill_all_barn_sessions();
+            tmux::kill_yeehaw_session();
+            app.should_quit = true;
         }
         ConfirmAction::DeleteWorm(name) => {
             match config::delete_worm(&name) {
@@ -1718,6 +1867,7 @@ pub enum DashboardAction {
     SelectWindow(usize),
     NewClaude(usize),
     SshToBarn(usize),
+    ConnectBarn(usize),
     CreateProject(String, String),
     CreateBarn(String, String, String, u16, Option<String>),
     CreateWorm(String, String, String),
@@ -1747,6 +1897,7 @@ pub enum BarnAction {
     SelectCritter(usize),
     CreateCritter(String, String), // name, service
     SshToBarn,
+    ConnectBarn,
     UpdateBarn(Barn),
 }
 
@@ -1834,7 +1985,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
 fn render_view(frame: &mut Frame, app: &mut App, area: Rect) {
     match &app.view {
         AppView::Global => {
-            app.global_dashboard.render(frame, area, &app.projects, &app.barns, &app.worms, &app.windows);
+            app.global_dashboard.render(frame, area, &app.projects, &app.barns, &app.worms, &app.windows, &app.connected_barns);
         }
         AppView::Project { project } => {
             let project = project.clone();
@@ -2234,4 +2385,131 @@ fn expand_path(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn barn(name: &str) -> Barn {
+        Barn {
+            name: name.into(),
+            host: Some("172.233.141.59".into()),
+            user: Some("forge".into()),
+            port: None,
+            identity_file: None,
+            critters: vec![],
+            source: None,
+            connection_type: None,
+            connection_config: None,
+            connectable: None,
+        }
+    }
+
+    /// The set is built the way the app builds it: from what `list-sessions`
+    /// prints, filtered by `connected_barn_sessions`.
+    fn connected(session_names: &[String]) -> HashSet<String> {
+        tmux::connected_barn_sessions(session_names)
+    }
+
+    #[test]
+    fn quit_lists_only_the_barns_with_an_open_session() {
+        let barns = [barn("guided"), barn("camera pi"), barn("BIG UPS")];
+        let set = connected(&[
+            "yeehaw".into(),
+            tmux::barn_session_name("guided"),
+            tmux::barn_session_name("BIG UPS"),
+        ]);
+
+        assert_eq!(connected_barn_names(&barns, &set), vec!["guided", "BIG UPS"]);
+    }
+
+    #[test]
+    fn quit_lists_nothing_when_no_barn_is_connected() {
+        let barns = [barn("guided"), barn("camera pi")];
+
+        assert!(connected_barn_names(&barns, &connected(&["yeehaw".into()])).is_empty());
+        assert!(connected_barn_names(&barns, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn quit_lists_the_barn_name_not_the_session_name() {
+        // The dialog is read by a person: "camera pi", not
+        // "yh-barn-camera-pi-6f2a10bd".
+        let barns = [barn("camera pi")];
+        let set = connected(&[tmux::barn_session_name("camera pi")]);
+
+        assert_eq!(connected_barn_names(&barns, &set), vec!["camera pi"]);
+    }
+
+    #[test]
+    fn a_connected_barn_never_lends_its_dot_to_a_name_that_merely_starts_the_same() {
+        // Session lookup is exact-membership, not prefix. Were it prefix-based,
+        // connecting to `guided` would list `guided-2` as open and quitting
+        // would report closing a production host nobody touched.
+        let barns = [barn("guided"), barn("guided-2")];
+        let set = connected(&[tmux::barn_session_name("guided-2")]);
+
+        assert_eq!(connected_barn_names(&barns, &set), vec!["guided-2"]);
+    }
+
+    #[test]
+    fn barns_that_slugify_alike_are_told_apart() {
+        // `camera pi` and `camera-pi` share a slug and differ only in the hash.
+        let barns = [barn("camera pi"), barn("camera-pi")];
+        let set = connected(&[tmux::barn_session_name("camera-pi")]);
+
+        assert_eq!(connected_barn_names(&barns, &set), vec!["camera-pi"]);
+    }
+
+    #[test]
+    fn a_session_for_a_deleted_barn_is_unnameable_but_still_gets_closed() {
+        // No barn record, so nothing to print — the list is what the dialog can
+        // name, not what the kill covers. tmux's own session list drives the
+        // kill, and it still holds this session.
+        let barns = [barn("guided")];
+        let sessions = vec![
+            tmux::barn_session_name("guided"),
+            tmux::barn_session_name("deleted last week"),
+        ];
+        let set = connected(&sessions);
+
+        assert_eq!(connected_barn_names(&barns, &set), vec!["guided"]);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn the_quit_dialog_names_every_barn_the_lookup_found() {
+        let barns = [barn("guided"), barn("camera pi")];
+        let set = connected(&[
+            tmux::barn_session_name("guided"),
+            tmux::barn_session_name("camera pi"),
+        ]);
+
+        let open = connected_barn_names(&barns, &set);
+        let dialog = ConfirmDialog::quit_with_barn_sessions(&open, set.len());
+
+        assert!(dialog.message.contains("guided"), "{}", dialog.message);
+        assert!(dialog.message.contains("camera pi"), "{}", dialog.message);
+        assert!(matches!(dialog.on_confirm, ConfirmAction::QuitClosingBarnSessions));
+    }
+
+    #[test]
+    fn the_quit_dialog_counts_a_session_it_cannot_name() {
+        // Barn deleted from the ranch while connected: one session to close,
+        // one name to print. The header counts sessions, so the prompt never
+        // promises fewer closures than it performs.
+        let barns = [barn("guided")];
+        let set = connected(&[
+            tmux::barn_session_name("guided"),
+            tmux::barn_session_name("deleted last week"),
+        ]);
+
+        let open = connected_barn_names(&barns, &set);
+        let dialog = ConfirmDialog::quit_with_barn_sessions(&open, set.len());
+
+        assert!(dialog.message.contains("Close 2 barn connections"), "{}", dialog.message);
+        assert!(dialog.message.contains("guided"), "{}", dialog.message);
+        assert!(dialog.message.contains("and 1 more"), "{}", dialog.message);
+    }
 }

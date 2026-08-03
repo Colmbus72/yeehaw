@@ -1,6 +1,7 @@
 use std::process::Command;
 
 use crate::config;
+use crate::ssh;
 use crate::tmux::shell_escape;
 use crate::types::Barn;
 
@@ -78,23 +79,6 @@ fn get_supervisor_program_name(service: &str) -> &str {
     service.strip_prefix("supervisor:").unwrap_or(service)
 }
 
-fn build_ssh_args(barn: &Barn) -> Option<Vec<String>> {
-    let host = barn.host.as_ref()?;
-    let user = barn.user.as_ref()?;
-    let port = barn.port?;
-    let key = barn.identity_file.as_ref()?;
-
-    Some(vec![
-        "ssh".to_string(),
-        "-p".to_string(), port.to_string(),
-        "-i".to_string(), key.clone(),
-        "-o".to_string(), "BatchMode=yes".to_string(),
-        "-o".to_string(), "ConnectTimeout=10".to_string(),
-        "-o".to_string(), "StrictHostKeyChecking=no".to_string(),
-        format!("{}@{}", user, host),
-    ])
-}
-
 fn run_command(barn: &Barn, cmd: &str) -> Option<String> {
     if config::is_local_barn(barn) {
         Command::new("sh")
@@ -104,14 +88,10 @@ fn run_command(barn: &Barn, cmd: &str) -> Option<String> {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
     } else {
-        let args = build_ssh_args(barn)?;
-        Command::new(&args[0])
-            .args(&args[1..])
-            .arg(cmd)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        // BatchMode: discovery runs unattended, so it must fail rather than
+        // block on a password prompt. A barn with no identity_file is still
+        // attempted — ssh-agent and ~/.ssh/config are valid ways to authenticate.
+        ssh::run(barn, cmd, ssh::Opts { batch: true, ..Default::default() }).ok()
     }
 }
 

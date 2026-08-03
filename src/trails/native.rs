@@ -115,22 +115,23 @@ impl TrailProvider for NativeProvider {
                     c.arg("-c").arg(&local_cmd);
                     c
                 } else {
-                    let host = barn.host.as_deref().unwrap_or(&barn.name);
-                    let user = barn.user.as_deref().unwrap_or("root");
-                    let port = barn.port.unwrap_or(22);
-
-                    let mut c = Command::new("ssh");
-                    c.arg("-p").arg(port.to_string());
-
-                    if let Some(ref key) = barn.identity_file {
-                        c.arg("-i").arg(key);
+                    // BatchMode: a trail runs unattended, so it must fail rather
+                    // than block forever on a password prompt no one will answer.
+                    match crate::ssh::command(
+                        &barn,
+                        &full_command,
+                        crate::ssh::Opts { batch: true, ..Default::default() },
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = tx.blocking_send(StepUpdate {
+                                step_index: i,
+                                status: StepStatus::Failed { exit_code: -1 },
+                                output_line: Some(format!("SSH error: {}", e)),
+                            });
+                            break;
+                        }
                     }
-
-                    c.arg("-o").arg("StrictHostKeyChecking=accept-new");
-                    c.arg("-o").arg("ConnectTimeout=10");
-                    c.arg(format!("{}@{}", user, host));
-                    c.arg(&full_command);
-                    c
                 };
 
                 cmd.stdout(Stdio::piped());

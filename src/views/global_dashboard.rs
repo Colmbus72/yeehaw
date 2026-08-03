@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
@@ -86,6 +88,20 @@ impl GlobalDashboard {
 
     pub fn is_input_mode(&self) -> bool {
         self.input_mode != InputMode::Normal
+    }
+
+    /// Index of the selected barn, but only when the barns panel has focus.
+    ///
+    /// `handle_input` takes a bare `KeyCode`, so modifier chords such as `C-d`
+    /// have to be handled in `app.rs` where the full `KeyEvent` survives. This
+    /// exposes the one thing that handler needs — deliberately narrower than
+    /// making `focused_panel`/`barns_state` public or reworking the
+    /// `handle_input` signature across every view.
+    pub fn focused_barn_index(&self) -> Option<usize> {
+        match self.focused_panel {
+            FocusedPanel::Barns => Some(self.barns_state.selected),
+            _ => None,
+        }
     }
 
     fn reset_forms(&mut self) {
@@ -220,6 +236,7 @@ impl GlobalDashboard {
                     KeyCode::Char('G') => self.barns_state.select_last(barns.len()),
                     KeyCode::Enter => return DashboardAction::SelectBarn(self.barns_state.selected),
                     KeyCode::Char('s') => return DashboardAction::SshToBarn(self.barns_state.selected),
+                    KeyCode::Char('c') => return DashboardAction::ConnectBarn(self.barns_state.selected),
                     KeyCode::Char('d') => return DashboardAction::RequestDeleteBarn(self.barns_state.selected),
                     _ => {}
                 }
@@ -339,6 +356,7 @@ impl GlobalDashboard {
         barns: &[Barn],
         worms: &[Worm],
         windows: &[TmuxWindow],
+        connected_barns: &HashSet<String>,
     ) {
         let session_windows: Vec<_> = windows.iter().filter(|w| w.index > 0).collect();
 
@@ -417,7 +435,7 @@ impl GlobalDashboard {
             hints: Some("[n] new  [d] delete"),
         };
         let barns_inner = barns_panel.render(frame, left_panels[1]);
-        let barn_items = build_barn_items(barns);
+        let barn_items = build_barn_items(barns, connected_barns);
         list::render_list(
             frame, barns_inner, &barn_items,
             &mut self.barns_state,
@@ -602,18 +620,33 @@ fn build_project_items(projects: &[Project], windows: &[TmuxWindow]) -> Vec<List
     }).collect()
 }
 
-fn build_barn_items(barns: &[Barn]) -> Vec<ListItem> {
+/// `connected` holds bare tmux session names, so membership is tested with
+/// [`tmux::barn_session_name`]. `barn_session_target` is for `-t` arguments only
+/// — its `=` prefix is not part of any name tmux reports, so looking one up here
+/// would never match and the indicator would never appear.
+///
+/// No tmux call happens in here: the set is refreshed on the app's idle tick.
+fn build_barn_items(barns: &[Barn], connected: &HashSet<String>) -> Vec<ListItem> {
     barns.iter().map(|b| {
-        let meta = if config::is_local_barn(b) {
+        let is_connected = connected.contains(&tmux::barn_session_name(&b.name));
+        let base_meta = if config::is_local_barn(b) {
             Some("this machine".to_string())
         } else {
             b.user.as_ref().zip(b.host.as_ref())
                 .map(|(u, h)| format!("{}@{}", u, h))
         };
+        let meta = match (base_meta, is_connected) {
+            (Some(m), true) => Some(format!("{} · connected", m)),
+            (None, true) => Some("connected".to_string()),
+            (m, false) => m,
+        };
         ListItem {
             id: b.name.clone(),
             label: if config::is_local_barn(b) { "local".to_string() } else { b.name.clone() },
-            status: Some(ItemStatus::Active),
+            // The green dot is the connection: it used to be Active for every
+            // barn, which said nothing. Every other panel here already reads its
+            // dot as live state (a project with sessions, an enabled worm).
+            status: Some(if is_connected { ItemStatus::Active } else { ItemStatus::Inactive }),
             meta,
             actions: vec![RowAction { key: "s".to_string(), label: "shell".to_string() }],
         }
@@ -677,4 +710,143 @@ fn format_run_age(iso_timestamp: &str) -> String {
         return format!("{}d ago", days);
     }
     "unknown".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn barn(name: &str) -> Barn {
+        Barn {
+            name: name.into(),
+            host: Some("172.233.141.59".into()),
+            user: Some("forge".into()),
+            port: None,
+            identity_file: None,
+            critters: vec![],
+            source: None,
+            connection_type: None,
+            connection_config: None,
+            connectable: None,
+        }
+    }
+
+    /// The set is built the way the app builds it: from what `list-sessions`
+    /// actually prints, filtered by `connected_barn_sessions`.
+    fn connected(session_names: &[String]) -> HashSet<String> {
+        tmux::connected_barn_sessions(session_names)
+    }
+
+    #[test]
+    fn a_connected_barn_gets_the_green_dot_and_the_word_connected() {
+        let barns = [barn("guided")];
+        let set = connected(&[tmux::barn_session_name("guided")]);
+
+        let items = build_barn_items(&barns, &set);
+
+        assert_eq!(items[0].status, Some(ItemStatus::Active));
+        assert!(items[0].meta.as_deref().unwrap().contains("connected"));
+    }
+
+    #[test]
+    fn a_barn_with_no_session_is_not_marked_connected() {
+        let barns = [barn("guided")];
+
+        let items = build_barn_items(&barns, &HashSet::new());
+
+        assert_eq!(items[0].status, Some(ItemStatus::Inactive));
+        assert!(!items[0].meta.as_deref().unwrap().contains("connected"));
+    }
+
+    /// The lookup must use `barn_session_name`, not `barn_session_target`. The
+    /// `=` prefix is for `-t` arguments; no name tmux reports carries it, so a
+    /// target-keyed lookup would silently never match.
+    #[test]
+    fn the_indicator_matches_names_as_tmux_reports_them_not_targets() {
+        let barns = [barn("guided")];
+        // Exactly what `tmux list-sessions -F '#{session_name}'` prints, plus
+        // unrelated sessions that must not confuse the filter.
+        let sessions = [
+            "yeehaw".to_string(),
+            tmux::barn_session_name("guided"),
+            "scratch".to_string(),
+        ];
+
+        let items = build_barn_items(&barns, &connected(&sessions));
+
+        assert_eq!(items[0].status, Some(ItemStatus::Active));
+        assert!(!tmux::barn_session_target("guided").is_empty());
+        assert!(!connected(&sessions).contains(&tmux::barn_session_target("guided")));
+    }
+
+    /// `guided` must not light up because `guided-2` is connected — the two are
+    /// different hosts, and the hash suffix is what keeps their sessions apart.
+    #[test]
+    fn a_barn_is_not_marked_connected_by_another_barns_session() {
+        let barns = [barn("guided"), barn("guided-2")];
+        let set = connected(&[tmux::barn_session_name("guided-2")]);
+
+        let items = build_barn_items(&barns, &set);
+
+        assert_eq!(items[0].status, Some(ItemStatus::Inactive));
+        assert_eq!(items[1].status, Some(ItemStatus::Active));
+    }
+
+    /// The local barn is never connectable, so it never carries the indicator
+    /// even though its row still shows "this machine".
+    #[test]
+    fn the_local_barn_keeps_its_meta_and_never_shows_connected() {
+        let barns = [config::local_barn()];
+
+        let items = build_barn_items(&barns, &HashSet::new());
+
+        assert_eq!(items[0].label, "local");
+        assert_eq!(items[0].meta.as_deref(), Some("this machine"));
+        assert_eq!(items[0].status, Some(ItemStatus::Inactive));
+    }
+
+    /// `C-d` is dispatched from `app.rs`, which can only see the barns panel
+    /// through this accessor. Every other panel must report nothing, or `C-d`
+    /// anywhere on the dashboard would tear down whichever barn row happened to
+    /// be selected underneath.
+    #[test]
+    fn the_focused_barn_index_is_none_unless_the_barns_panel_has_focus() {
+        let mut dash = GlobalDashboard::new();
+        let barns = [barn("guided"), barn("guided-2")];
+
+        // Focus starts on Projects.
+        assert_eq!(dash.focused_barn_index(), None);
+
+        // Tab cycles Projects -> Sessions -> Barns.
+        dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[]);
+        assert_eq!(dash.focused_barn_index(), None);
+        dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[]);
+        assert_eq!(dash.focused_barn_index(), Some(0));
+
+        // It tracks the selection, not just the panel.
+        dash.handle_input(KeyCode::Char('j'), &[], &barns, &[], &[]);
+        assert_eq!(dash.focused_barn_index(), Some(1));
+
+        // Worms is next: focus leaves the panel and so does the index.
+        dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[]);
+        assert_eq!(dash.focused_barn_index(), None);
+    }
+
+    /// The `C-d` guard in `app.rs` is `!in_input_mode`, which for this view is
+    /// `is_input_mode()`. Opening the new-barn wizard from the barns panel must
+    /// set it — otherwise `C-d` typed into the name field would disconnect the
+    /// barn still selected behind the form.
+    #[test]
+    fn the_new_barn_wizard_puts_the_dashboard_in_input_mode() {
+        let mut dash = GlobalDashboard::new();
+        let barns = [barn("guided")];
+
+        dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[]);
+        dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[]);
+        assert_eq!(dash.focused_barn_index(), Some(0));
+        assert!(!dash.is_input_mode());
+
+        dash.handle_input(KeyCode::Char('n'), &[], &barns, &[], &[]);
+        assert!(dash.is_input_mode());
+    }
 }

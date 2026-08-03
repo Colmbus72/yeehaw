@@ -1,9 +1,9 @@
 mod app;
 mod config;
+mod connect;
 mod context;
 mod critters;
 mod crontab;
-mod detection;
 mod editor;
 mod git;
 mod hooks;
@@ -13,6 +13,7 @@ mod ranchhand_k8s;
 mod ranchhand_terraform;
 mod signals;
 mod slack;
+mod ssh;
 mod trails;
 mod tmux;
 mod types;
@@ -50,6 +51,15 @@ fn main() -> Result<()> {
     }
 
     if tmux::is_inside_yeehaw_session() {
+        // Re-source ~/.yeehaw/tmux.conf on every TUI start. tmux keybindings and
+        // key tables live in the running server's memory, and the config is
+        // otherwise only sourced when the yeehaw session is first *created* — so
+        // upgrading yeehaw in place leaves a server bound to whatever the previous
+        // version installed, missing anything new (the `yeehaw-remote` table among
+        // them). Idempotent: everything in the config is a `set -g` or a
+        // `bind-key`, both last-write-wins, and session-local options are
+        // untouched. Best-effort here; `connect_to_barn` re-sources and checks.
+        tmux::refresh_tmux_config();
         return run_tui();
     }
 
@@ -88,6 +98,21 @@ fn handle_subcommands(args: &[String]) -> bool {
         }
         Some("skills") => {
             handle_skills_subcommand(args);
+            true
+        }
+        Some("connect") => {
+            match args.get(2) {
+                Some(name) => {
+                    if let Err(e) = connect::run(name) {
+                        eprintln!("\x1b[31mError:\x1b[0m {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                None => {
+                    eprintln!("Usage: yeehaw connect <barn>");
+                    std::process::exit(1);
+                }
+            }
             true
         }
         _ => false,
@@ -345,10 +370,7 @@ fn handle_trail_poll(livestock_name: &str, trail_name: &str) {
         trail_name,
         repo_url,
         branch,
-        barn.host.as_deref().unwrap_or(&barn.name),
-        barn.user.as_deref().unwrap_or("root"),
-        barn.port.unwrap_or(22),
-        barn.identity_file.as_deref().unwrap_or(""),
+        &barn,
     ) {
         Ok(true) => println!("New commits detected, trail triggered"),
         Ok(false) => println!("No new commits"),

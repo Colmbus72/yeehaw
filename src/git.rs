@@ -47,45 +47,22 @@ pub fn detect_git_info(path: &str) -> GitInfo {
     GitInfo { is_git_repo: true, remote_url, branch }
 }
 
-fn has_valid_ssh_config(barn: &Barn) -> bool {
-    barn.host.is_some() && barn.user.is_some() && barn.port.is_some() && barn.identity_file.is_some()
-}
-
 /// Detect git info on a remote server via SSH
 pub fn detect_remote_git_info(path: &str, barn: &Barn) -> GitInfo {
-    if !has_valid_ssh_config(barn) {
-        return GitInfo { is_git_repo: false, remote_url: None, branch: None };
-    }
-
-    let host = barn.host.as_deref().unwrap();
-    let user = barn.user.as_deref().unwrap();
-    let port = barn.port.unwrap().to_string();
-    let key = barn.identity_file.as_deref().unwrap();
-
     let remote_cmd = format!(
         "cd {} && git config --get remote.origin.url 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null",
         crate::tmux::shell_escape(path)
     );
 
-    let result = Command::new("ssh")
-        .args([
-            "-p", &port,
-            "-i", key,
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=5",
-            &format!("{}@{}", user, host),
-            &remote_cmd,
-        ])
-        .output();
-
-    match result {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+    // BatchMode: detection is a background convenience, so it must fail rather
+    // than block on an auth prompt.
+    match crate::ssh::run(barn, &remote_cmd, crate::ssh::Opts { batch: true, ..Default::default() }) {
+        Ok(stdout) => {
             let lines: Vec<&str> = stdout.trim().lines().collect();
             let remote_url = lines.first().map(|s| s.to_string()).filter(|s| !s.is_empty());
             let branch = lines.get(1).map(|s| s.to_string()).filter(|s| !s.is_empty());
             GitInfo { is_git_repo: true, remote_url, branch }
         }
-        _ => GitInfo { is_git_repo: false, remote_url: None, branch: None },
+        Err(_) => GitInfo { is_git_repo: false, remote_url: None, branch: None },
     }
 }

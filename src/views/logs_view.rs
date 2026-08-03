@@ -4,6 +4,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::components::header;
 use crate::config;
+use crate::ssh;
 use crate::types::*;
 
 pub struct LogsView {
@@ -84,10 +85,6 @@ impl LogsView {
     }
 
     fn load_remote_logs(&mut self, barn: &Barn, log_path: &str) {
-        let host = barn.host.as_deref().unwrap_or("?");
-        let user = barn.user.as_deref().unwrap_or("root");
-        let port = barn.port.unwrap_or(22);
-
         // Use find for directory paths, tail for file paths
         let remote_cmd = if log_path.ends_with('/') {
             format!(
@@ -98,32 +95,19 @@ impl LogsView {
             format!("tail -n 200 {}", log_path)
         };
 
-        let mut cmd = std::process::Command::new("ssh");
-        cmd.arg("-o").arg("StrictHostKeyChecking=no")
-            .arg("-o").arg("ConnectTimeout=10")
-            .arg("-p").arg(port.to_string());
-
-        if let Some(ref key) = barn.identity_file {
-            cmd.arg("-i").arg(key);
-        }
-
-        cmd.arg(format!("{}@{}", user, host))
-            .arg(&remote_cmd);
-
-        match cmd.output() {
-            Ok(output) => {
-                if output.status.success() {
-                    let content = String::from_utf8_lossy(&output.stdout);
-                    self.lines = content.lines().map(|l| l.to_string()).collect();
-                    let visible = 20usize;
-                    self.scroll_offset = self.lines.len().saturating_sub(visible);
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    self.error = Some(format!("SSH error: {}", stderr.trim()));
-                }
+        // BatchMode: this runs on the TUI thread, so it must fail rather than
+        // block on a password prompt no one can see.
+        // allow_failure: `tail` on a log file that has not been created yet
+        // exits non-zero. The local branch reads stdout and ignores the status,
+        // so this keeps both showing an empty pane rather than an error.
+        match ssh::run(barn, &remote_cmd, ssh::Opts { batch: true, allow_failure: true, ..Default::default() }) {
+            Ok(content) => {
+                self.lines = content.lines().map(|l| l.to_string()).collect();
+                let visible = 20usize;
+                self.scroll_offset = self.lines.len().saturating_sub(visible);
             }
             Err(e) => {
-                self.error = Some(format!("Failed to run SSH: {}", e));
+                self.error = Some(format!("SSH error: {}", e));
             }
         }
     }

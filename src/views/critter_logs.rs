@@ -6,6 +6,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::components::header;
 use crate::config;
+use crate::ssh;
 use crate::types::*;
 
 pub struct CritterLogsView {
@@ -73,9 +74,6 @@ impl CritterLogsView {
     }
 
     fn load_remote_logs(&mut self, barn: &Barn, critter: &Critter) {
-        let host = barn.host.as_deref().unwrap_or("?");
-        let user = barn.user.as_deref().unwrap_or("root");
-        let port = barn.port.unwrap_or(22);
         let use_journald = critter.use_journald.unwrap_or(true);
 
         let remote_cmd = if use_journald {
@@ -87,30 +85,19 @@ impl CritterLogsView {
             return;
         };
 
-        let mut cmd = Command::new("ssh");
-        cmd.arg("-o").arg("StrictHostKeyChecking=no")
-            .arg("-p").arg(port.to_string());
-
-        if let Some(ref key) = barn.identity_file {
-            cmd.arg("-i").arg(key);
-        }
-
-        cmd.arg(format!("{}@{}", user, host)).arg(&remote_cmd);
-
-        match cmd.output() {
-            Ok(output) => {
-                if output.status.success() {
-                    let content = String::from_utf8_lossy(&output.stdout);
-                    self.lines = content.lines().map(|l| l.to_string()).collect();
-                    let visible = 20usize;
-                    self.scroll_offset = self.lines.len().saturating_sub(visible);
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    self.error = Some(format!("SSH error: {}", stderr.trim()));
-                }
+        // BatchMode: this runs on the TUI thread, so it must fail rather than
+        // block on a password prompt no one can see.
+        // allow_failure: `journalctl` for a unit with no entries and `tail` on a
+        // not-yet-created log both exit non-zero. The local branch ignores the
+        // exit status, so this keeps both rendering an empty pane.
+        match ssh::run(barn, &remote_cmd, ssh::Opts { batch: true, allow_failure: true, ..Default::default() }) {
+            Ok(content) => {
+                self.lines = content.lines().map(|l| l.to_string()).collect();
+                let visible = 20usize;
+                self.scroll_offset = self.lines.len().saturating_sub(visible);
             }
             Err(e) => {
-                self.error = Some(format!("Failed to run SSH: {}", e));
+                self.error = Some(format!("SSH error: {}", e));
             }
         }
     }

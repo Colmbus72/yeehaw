@@ -626,28 +626,9 @@ impl YeehawServer {
         let barn = livestock.barn.as_ref().and_then(|bn| find_barn(bn));
 
         let output = if let Some(barn) = barn.filter(|b| !config::is_local_barn(b)) {
-            if let (Some(host), Some(user), Some(port), Some(key)) = (&barn.host, &barn.user, barn.port, &barn.identity_file) {
-                let cmd = if full_path.ends_with('/') {
-                    match &p.pattern {
-                        Some(pat) => format!(
-                            "find {} -name '*.log' -type f 2>/dev/null | xargs tail -n {} 2>/dev/null | grep -i '{}'",
-                            full_path, lines, pat
-                        ),
-                        None => format!(
-                            "find {} -name '*.log' -type f 2>/dev/null | xargs tail -n {} 2>/dev/null",
-                            full_path, lines
-                        ),
-                    }
-                } else {
-                    match &p.pattern {
-                        Some(pat) => format!("tail -n {} {} | grep -i '{}'", lines, full_path, pat),
-                        None => format!("tail -n {} {}", lines, full_path),
-                    }
-                };
-                read_remote_output(host, user, port, key, &cmd)
-            } else {
-                return err_text("Barn SSH config incomplete");
-            }
+            // No stat available over ssh, so the trailing slash is the only signal.
+            let cmd = build_log_command(&full_path, lines, p.pattern.as_deref(), full_path.ends_with('/'));
+            read_remote_output(&barn, &cmd)
         } else {
             read_local_logs(&full_path, lines, p.pattern.as_deref())
         };
@@ -901,16 +882,17 @@ impl YeehawServer {
         let use_journald = critter.use_journald.unwrap_or(true);
 
         let cmd = if use_journald {
-            let base = format!("journalctl -u {} -n {} --no-pager", critter.service, lines);
-            match &p.pattern {
-                Some(pat) => format!("{} | grep -i '{}'", base, pat),
-                None => base,
-            }
+            // A systemd unit name is never home-relative, so a leading `~/` in it
+            // should stay literal: single_quote, not shell_escape.
+            let base = format!(
+                "journalctl -u {} -n {} --no-pager",
+                crate::tmux::single_quote(&critter.service),
+                lines
+            );
+            append_grep(base, p.pattern.as_deref())
         } else if let Some(log_path) = &critter.log_path {
-            match &p.pattern {
-                Some(pat) => format!("tail -n {} {} | grep -i '{}'", lines, log_path, pat),
-                None => format!("tail -n {} {}", lines, log_path),
-            }
+            // A critter log_path has always been read as a single file; keep that.
+            build_log_command(log_path, lines, p.pattern.as_deref(), false)
         } else {
             return err_text("No log source configured");
         };
@@ -920,10 +902,8 @@ impl YeehawServer {
                 .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                 .unwrap_or_else(|e| format!("Failed: {}", e));
             ok_text(&output)
-        } else if let (Some(host), Some(user), Some(port), Some(key)) = (&barn.host, &barn.user, barn.port, &barn.identity_file) {
-            ok_text(&read_remote_output(host, user, port, key, &cmd))
         } else {
-            err_text("Barn SSH config incomplete")
+            ok_text(&read_remote_output(&barn, &cmd))
         }
     }
 
@@ -1675,40 +1655,65 @@ impl ServerHandler for YeehawServer {
 // Helpers
 // ============================================================================
 
-fn read_local_logs(path: &str, lines: u32, pattern: Option<&str>) -> String {
-    let cmd = if path.ends_with('/') || std::path::Path::new(path).is_dir() {
-        match pattern {
-            Some(pat) => format!(
-                "find {} -name '*.log' -type f 2>/dev/null | xargs tail -n {} 2>/dev/null | grep -i '{}'",
-                path, lines, pat
-            ),
-            None => format!(
-                "find {} -name '*.log' -type f 2>/dev/null | xargs tail -n {} 2>/dev/null",
-                path, lines
-            ),
-        }
+/// Append `| grep -i <pattern>` to a log-reading pipeline, safely.
+///
+/// The pattern comes straight off an MCP tool parameter, so it is attacker text:
+/// whichever agent is driving this server chooses it. It is quoted with
+/// `single_quote` rather than `shell_escape` on purpose — a grep pattern that
+/// begins with `~/` must match the literal characters `~/`, not expand to the
+/// home directory the way a path would.
+///
+/// The `--` stops grep from reading a pattern like `-r` as an option; quoting
+/// alone makes the value one word but says nothing about how grep parses it.
+fn append_grep(base: String, pattern: Option<&str>) -> String {
+    match pattern {
+        Some(pat) => format!("{} | grep -i -- {}", base, crate::tmux::single_quote(pat)),
+        None => base,
+    }
+}
+
+/// Build the shell pipeline that reads the last `lines` lines of logs at `path`,
+/// optionally filtered by `pattern`.
+///
+/// Shared by the local (`sh -c`) and remote (ssh) readers so both get identical
+/// quoting. `path` goes through `shell_escape`, which keeps a leading `~/`
+/// working as a home-relative path — livestock and critter paths are routinely
+/// written that way — while making every other byte inert. `lines` is a `u32`,
+/// so it can only ever render as digits and needs no escaping.
+///
+/// `treat_as_dir` is the caller's decision, not something inferred here: the
+/// local reader can stat the path, the remote one only has the trailing slash.
+fn build_log_command(path: &str, lines: u32, pattern: Option<&str>, treat_as_dir: bool) -> String {
+    let path = crate::tmux::shell_escape(path);
+    let base = if treat_as_dir {
+        format!(
+            "find {} -name '*.log' -type f 2>/dev/null | xargs tail -n {} 2>/dev/null",
+            path, lines
+        )
     } else {
-        match pattern {
-            Some(pat) => format!("tail -n {} {} | grep -i '{}'", lines, path, pat),
-            None => format!("tail -n {} {}", lines, path),
-        }
+        format!("tail -n {} {}", lines, path)
     };
+    append_grep(base, pattern)
+}
+
+fn read_local_logs(path: &str, lines: u32, pattern: Option<&str>) -> String {
+    let treat_as_dir = path.ends_with('/') || std::path::Path::new(path).is_dir();
+    let cmd = build_log_command(path, lines, pattern, treat_as_dir);
     std::process::Command::new("sh").args(["-c", &cmd]).output()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_else(|e| format!("Failed: {}", e))
 }
 
-fn read_remote_output(host: &str, user: &str, port: u16, identity_file: &str, cmd: &str) -> String {
-    std::process::Command::new("ssh")
-        .args(["-p", &port.to_string(), "-i", identity_file,
-               "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-               &format!("{}@{}", user, host), cmd])
-        .output()
-        .map(|o| {
-            if o.status.success() { String::from_utf8_lossy(&o.stdout).to_string() }
-            else { format!("SSH failed: {}", String::from_utf8_lossy(&o.stderr)) }
-        })
-        .unwrap_or_else(|e| format!("SSH failed: {}", e))
+fn read_remote_output(barn: &types::Barn, cmd: &str) -> String {
+    // BatchMode: the MCP server has no terminal, so an auth prompt would hang it.
+    // allow_failure: every caller is a log read whose pipeline can end in `grep`,
+    // which exits 1 on no matches. read_local_logs above ignores the exit status
+    // entirely, so without this the same empty search renders "" locally and
+    // "SSH failed" remotely.
+    match crate::ssh::run(barn, cmd, crate::ssh::Opts { batch: true, allow_failure: true, ..Default::default() }) {
+        Ok(stdout) => stdout,
+        Err(e) => format!("SSH failed: {}", e),
+    }
 }
 
 // ============================================================================
@@ -1721,4 +1726,235 @@ pub async fn run() -> Result<()> {
     let service = server.serve(transport).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // === log command construction ==========================================
+    //
+    // These commands are handed to `sh -c` locally and to a login shell on the
+    // barn over ssh, and every value in them but `lines` is attacker-chosen (an
+    // MCP tool parameter) or config-chosen. So the tests run the real command
+    // through a real `sh` and assert the payload did not execute, rather than
+    // comparing the string to a hand-written expectation that could be wrong in
+    // the same way the code is.
+
+    /// Every one of these runs `id` if any interpolation escapes its quoting.
+    /// `';id;'` is the payload that was verified to fire before this fix.
+    const INJECTIONS: &[&str] = &[
+        "';id;'",
+        "'; id; '",
+        "$(id)",
+        "`id`",
+        "x' ; id ; #",
+        "'|id|'",
+        "'\nid\n'",
+        "'; id > /dev/stderr; '",
+    ];
+
+    /// Run `script` through a real `sh`, returning stdout and stderr together so
+    /// a payload cannot hide by writing to the stream we forgot to look at.
+    fn sh_capture(script: &str, home: Option<&Path>, path_prefix: Option<&Path>) -> String {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", script]);
+        if let Some(h) = home {
+            cmd.env("HOME", h);
+        }
+        if let Some(p) = path_prefix {
+            let existing = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{}:{}", p.display(), existing));
+        }
+        let out = cmd.output().expect("sh should be runnable");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
+    /// `id` prints `uid=NNN(name)`. Its absence is the proof nothing executed.
+    fn assert_did_not_execute(output: &str, script: &str) {
+        assert!(
+            !output.contains("uid="),
+            "injected command ran.\n  script: {script}\n  output: {output}"
+        );
+    }
+
+    /// A temp dir holding one log file, returned as (dir, absolute log path).
+    fn log_fixture(contents: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("app.log");
+        std::fs::write(&log, contents).expect("write log");
+        let path = log.to_string_lossy().to_string();
+        (dir, path)
+    }
+
+    #[test]
+    fn the_pre_fix_command_shape_really_did_execute_the_payload() {
+        // A canary for every assert_did_not_execute above. Those tests only mean
+        // something if this harness can actually observe an injection, so this
+        // rebuilds the exact pre-fix `format!` — hand-written '{}' around the
+        // pattern — and asserts the payload DOES fire. If this ever stops
+        // reporting uid=, the other tests have gone vacuous and must be re-armed.
+        let (_dir, path) = log_fixture("alpha\n");
+        let script = format!("tail -n {} {} | grep -i '{}'", 100, path, "';id;'");
+        let out = sh_capture(&script, None, None);
+        assert!(
+            out.contains("uid="),
+            "the injection detector no longer detects the original bug: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_hostile_grep_pattern_cannot_run_a_command() {
+        let (_dir, path) = log_fixture("alpha\nbeta\n");
+        for payload in INJECTIONS {
+            let script = build_log_command(&path, 100, Some(payload), false);
+            assert_did_not_execute(&sh_capture(&script, None, None), &script);
+        }
+    }
+
+    #[test]
+    fn a_hostile_grep_pattern_cannot_run_a_command_in_the_directory_branch() {
+        // The `find | xargs tail | grep` shape is a separate format! site and was
+        // separately vulnerable.
+        let (dir, _path) = log_fixture("alpha\nbeta\n");
+        let dir_path = format!("{}/", dir.path().display());
+        for payload in INJECTIONS {
+            let script = build_log_command(&dir_path, 100, Some(payload), true);
+            assert_did_not_execute(&sh_capture(&script, None, None), &script);
+        }
+    }
+
+    #[test]
+    fn a_hostile_log_path_cannot_run_a_command() {
+        // log_path / path come from project + barn config, which sync and
+        // discovery tools can write. Escape them like any other untrusted value.
+        let (dir, _) = log_fixture("alpha\n");
+        for suffix in [";id;", "$(id)", "`id`", " ; id ; ", "'; id; '"] {
+            let hostile = format!("{}/app.log{}", dir.path().display(), suffix);
+            for treat_as_dir in [false, true] {
+                let script = build_log_command(&hostile, 100, None, treat_as_dir);
+                assert_did_not_execute(&sh_capture(&script, None, None), &script);
+                let script = build_log_command(&hostile, 100, Some("alpha"), treat_as_dir);
+                assert_did_not_execute(&sh_capture(&script, None, None), &script);
+            }
+        }
+    }
+
+    #[test]
+    fn a_hostile_journald_service_name_cannot_run_a_command() {
+        // Stand in a fake `journalctl` on PATH that just echoes its arguments, so
+        // the real read_critter_logs pipeline can run on a machine without systemd.
+        let bin = tempfile::tempdir().expect("tempdir");
+        let stub = bin.path().join("journalctl");
+        std::fs::write(&stub, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        for payload in INJECTIONS {
+            // Same shape as the use_journald branch of read_critter_logs.
+            let script = format!(
+                "journalctl -u {} -n {} --no-pager",
+                crate::tmux::single_quote(payload),
+                100
+            );
+            let out = sh_capture(&script, None, Some(bin.path()));
+            assert_did_not_execute(&out, &script);
+            assert!(
+                out.contains(*payload) || out.contains(payload.trim()),
+                "the unit name should reach journalctl verbatim.\n  script: {script}\n  output: {out}"
+            );
+
+            // And with a grep appended, which is the other half of that branch.
+            let script = append_grep(script, Some(payload));
+            assert_did_not_execute(&sh_capture(&script, None, Some(bin.path())), &script);
+        }
+    }
+
+    #[test]
+    fn a_hostile_pattern_and_path_together_cannot_run_a_command() {
+        let (dir, _) = log_fixture("alpha\n");
+        let hostile_path = format!("{}/app.log';id;'", dir.path().display());
+        let script = build_log_command(&hostile_path, 100, Some("';id;'"), false);
+        assert_did_not_execute(&sh_capture(&script, None, None), &script);
+    }
+
+    #[test]
+    fn an_ordinary_pattern_still_filters() {
+        // Escaping is worthless if it broke the feature it protects.
+        let (_dir, path) = log_fixture("alpha one\nbeta two\nALPHA three\n");
+        let script = build_log_command(&path, 100, Some("alpha"), false);
+        let out = sh_capture(&script, None, None);
+        assert!(out.contains("alpha one"), "expected the match, got {out:?}");
+        assert!(out.contains("ALPHA three"), "-i should still fold case, got {out:?}");
+        assert!(!out.contains("beta two"), "non-matching line leaked: {out:?}");
+    }
+
+    #[test]
+    fn a_pattern_that_looks_like_a_flag_is_searched_for_not_obeyed() {
+        // Without the `--`, `grep -i '-v'` inverts the match and returns the very
+        // lines the caller asked to exclude.
+        let (_dir, path) = log_fixture("alpha\nbeta -v gamma\n");
+        let script = build_log_command(&path, 100, Some("-v"), false);
+        let out = sh_capture(&script, None, None);
+        assert!(out.contains("beta -v gamma"), "expected the literal match, got {out:?}");
+        assert!(!out.contains("alpha"), "grep treated the pattern as -v: {out:?}");
+    }
+
+    #[test]
+    fn a_pattern_starting_with_a_tilde_stays_literal() {
+        // This is why the pattern uses single_quote and not shell_escape:
+        // shell_escape would turn `~/app` into "$HOME"'/app' and search for the
+        // expanded home directory instead of the two characters the caller typed.
+        let (_dir, path) = log_fixture("config lives in ~/app/here\nunrelated\n");
+        let script = build_log_command(&path, 100, Some("~/app"), false);
+        let out = sh_capture(&script, Some(Path::new("/home/nobody")), None);
+        assert!(out.contains("~/app/here"), "tilde pattern did not match literally: {out:?}");
+    }
+
+    #[test]
+    fn a_path_starting_with_a_tilde_still_resolves_to_home() {
+        // The mirror image: paths *should* expand, and livestock paths are
+        // routinely stored as ~/sites/app.
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::write(home.path().join("app.log"), "hello-from-home\n").expect("write log");
+        let script = build_log_command("~/app.log", 100, None, false);
+        assert!(
+            script.contains("\"$HOME\""),
+            "a leading tilde should become $HOME, got {script:?}"
+        );
+        let out = sh_capture(&script, Some(home.path()), None);
+        assert!(out.contains("hello-from-home"), "tilde path did not resolve: {out:?}");
+    }
+
+    #[test]
+    fn read_local_logs_itself_rejects_the_verified_payload() {
+        // End to end through the real helper, with the exact payload that was
+        // observed executing before this fix.
+        let (_dir, path) = log_fixture("alpha\n");
+        let out = read_local_logs(&path, 100, Some("';id;'"));
+        assert!(!out.contains("uid="), "injected command ran: {out:?}");
+    }
+
+    #[test]
+    fn every_interpolated_value_becomes_exactly_one_shell_word() {
+        // A value that splits into two words is an argument-injection bug even
+        // when it is not a command-injection bug.
+        for value in ["a b", "';id;'", "$(id)", "", "*", "~/x y"] {
+            let script = format!(
+                "set -- {} {}; printf %s $#",
+                crate::tmux::single_quote(value),
+                crate::tmux::shell_escape(value)
+            );
+            assert_eq!(sh_capture(&script, Some(Path::new("/home/nobody")), None), "2",
+                "{value:?} did not stay one word per escaper");
+        }
+    }
 }

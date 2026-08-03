@@ -99,10 +99,7 @@ pub fn run_slack_claude(
         .output()
         .context("Failed to create slack claude window")?;
 
-    let idx: u32 = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(0);
+    let idx = tmux::parse_new_window_index(&output, "slack")?;
 
     tmux::set_window_type_pub(idx, "slack");
     Ok(idx)
@@ -157,10 +154,7 @@ pub fn run_slack_claude_resume(
         .output()
         .context("Failed to create slack claude resume window")?;
 
-    let idx: u32 = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(0);
+    let idx = tmux::parse_new_window_index(&output, "slack resume")?;
 
     tmux::set_window_type_pub(idx, "slack");
     Ok(idx)

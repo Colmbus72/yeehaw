@@ -11,7 +11,10 @@ struct HotkeyGroup {
 pub fn render_help_overlay(frame: &mut Frame, area: Rect, scope: &str) {
     // Calculate centered overlay dimensions
     let overlay_width = 50u16.min(area.width.saturating_sub(4));
-    let overlay_height = 22u16.min(area.height.saturating_sub(4));
+    // 26 rows leaves 22 usable after the border (1 each side) and vertical
+    // padding (1 each side). The global scope is the tallest at 22 lines:
+    // 3 groups (header + keys + blank) plus the footer.
+    let overlay_height = 26u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
     let y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
 
@@ -98,7 +101,8 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
             groups.push(HotkeyGroup {
                 title: "Actions",
                 keys: vec![
-                    ("c", "Open Claude"),
+                    ("c", "Open Claude / connect to barn"),
+                    ("Ctrl+D", "Disconnect from barn"),
                     ("s", "SSH to barn / open shell"),
                     ("n", "Create new item"),
                     ("d", "Delete item"),
@@ -132,6 +136,8 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
             groups.push(HotkeyGroup {
                 title: "Actions",
                 keys: vec![
+                    ("c", "Connect to barn"),
+                    ("Ctrl+D", "Disconnect from barn"),
                     ("s", "SSH to barn"),
                     ("e", "Edit barn"),
                     ("v", "Live session grid"),

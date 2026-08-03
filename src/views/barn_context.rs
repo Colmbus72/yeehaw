@@ -185,6 +185,11 @@ impl BarnContextView {
             return BarnAction::SshToBarn;
         }
 
+        // Page-level: 'c' to connect to the barn's remote yeehaw
+        if key == KeyCode::Char('c') {
+            return BarnAction::ConnectBarn;
+        }
+
         // Page-level: 'e' to edit barn (only for remote barns)
         if key == KeyCode::Char('e') {
             if !config::is_local_barn(barn) {

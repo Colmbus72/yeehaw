@@ -1,5 +1,7 @@
 use anyhow::Result;
 use crate::config;
+use crate::ssh;
+use crate::types::Barn;
 
 /// Check if the remote branch has new commits. Returns true if a trail should trigger.
 /// Called by the poll worm's exec command: `yeehaw trail poll {livestock} {trail}`
@@ -8,27 +10,17 @@ pub fn check_and_trigger(
     trail_name: &str,
     repo_url: &str,
     branch: &str,
-    barn_host: &str,
-    barn_user: &str,
-    barn_port: u16,
-    barn_identity_file: &str,
+    barn: &Barn,
 ) -> Result<bool> {
-    // Run git ls-remote on the barn via SSH
-    let output = std::process::Command::new("ssh")
-        .arg("-p").arg(barn_port.to_string())
-        .arg("-i").arg(barn_identity_file)
-        .arg("-o").arg("StrictHostKeyChecking=accept-new")
-        .arg("-o").arg("ConnectTimeout=10")
-        .arg("-o").arg("BatchMode=yes")
-        .arg(format!("{}@{}", barn_user, barn_host))
-        .arg(format!("git ls-remote {} refs/heads/{}", repo_url, branch))
-        .output()?;
+    // Run git ls-remote on the barn via SSH. BatchMode: this runs from a cron
+    // worm, so it must fail rather than block on a password prompt.
+    let stdout = ssh::run(
+        barn,
+        &format!("git ls-remote {} refs/heads/{}", repo_url, branch),
+        ssh::Opts { batch: true, ..Default::default() },
+    )
+    .map_err(|e| anyhow::anyhow!("git ls-remote failed: {}", e))?;
 
-    if !output.status.success() {
-        anyhow::bail!("git ls-remote failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let remote_sha = stdout.split_whitespace().next()
         .unwrap_or("")
         .to_string();
