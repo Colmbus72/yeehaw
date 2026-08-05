@@ -11,6 +11,7 @@ mod issues;
 mod mcp_server;
 mod ranchhand_k8s;
 mod ranchhand_terraform;
+mod remote_grid;
 mod signals;
 mod slack;
 mod ssh;

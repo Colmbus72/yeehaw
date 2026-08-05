@@ -309,14 +309,23 @@ pub fn ensure_correct_status_bar() {
     }
 }
 
-const WINDOW_LIST_FORMAT: &str = "#{window_index}\t#{window_name}\t#{window_active}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{window_activity}\t#{@yeehaw_type}\t#{@yeehaw_project}\t#{@yeehaw_barn}";
+/// The `list-windows -F` format both the local grid and the remote frame
+/// protocol use. `crate::remote_grid` embeds this verbatim in the script it runs
+/// on the barn so both sides share [`parse_window_line`]; one extra field here
+/// shifts every remote field silently, which
+/// `remote_grid::tests::the_remote_window_format_is_byte_identical_to_the_local_one`
+/// catches.
+pub(crate) const WINDOW_LIST_FORMAT: &str = "#{window_index}\t#{window_name}\t#{window_active}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{window_activity}\t#{@yeehaw_type}\t#{@yeehaw_project}\t#{@yeehaw_barn}";
 
 /// Parse one `list-windows -F WINDOW_LIST_FORMAT` line.
 ///
 /// Trailing user-option fields are empty strings when the option is unset, so
 /// windows created before tagging existed degrade to empty tags rather than
 /// failing to parse.
-fn parse_window_line(line: &str) -> Option<TmuxWindow> {
+/// Shared with `crate::remote_grid`, which parses the same format coming back
+/// over ssh. Returning `None` for a line that is not in the format is what keeps
+/// a barn's login banner out of the window list.
+pub(crate) fn parse_window_line(line: &str) -> Option<TmuxWindow> {
     let parts: Vec<&str> = line.split('\t').collect();
     if parts.len() < 7 {
         return None;

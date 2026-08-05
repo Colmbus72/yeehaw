@@ -13,6 +13,7 @@ use crate::config;
 use crate::context;
 use crate::crontab;
 use crate::editor;
+use crate::remote_grid::{self, RemoteEvent, RemoteStream, RemoteStreams};
 use crate::tmux;
 use crate::types::*;
 use crate::watcher::{self, WatchEvent};
@@ -27,7 +28,7 @@ use crate::views::critter_detail::CritterDetailView;
 use crate::views::critter_logs::CritterLogsView;
 use crate::views::wiki_view::WikiView;
 use crate::views::herd_detail::HerdDetailView;
-use crate::views::session_grid::{GridAction, GridScope, SessionGridView};
+use crate::views::session_grid::{GridAction, GridScope, Origin, SessionGridView};
 use crate::views::issues_view::{IssuesView, IssuesAction};
 use crate::views::ranchhand_detail::{RanchHandDetailView, RanchHandAction};
 use crate::views::trail_view::{TrailView, TrailViewAction};
@@ -54,6 +55,13 @@ pub struct App {
     /// Refreshed by `refresh_windows` on the idle tick, so no render path has to
     /// shell out to tmux to know this.
     pub connected_barns: HashSet<String>,
+    /// Live frame streams from connected barns, one ssh channel each.
+    ///
+    /// Owned for the whole life of the process but only ever *populated* while
+    /// [`AppView::SessionGrid`] is on screen — see [`streams_wanted`]. Every
+    /// route off the grid runs through [`App::navigate`], which is what closes
+    /// them.
+    pub remote_grid: RemoteStreams,
     pub should_quit: bool,
     pub error: Option<String>,
     pub show_help: bool,
@@ -123,6 +131,7 @@ impl App {
             worms,
             windows,
             connected_barns,
+            remote_grid: RemoteStreams::new(),
             should_quit: false,
             error: None,
             show_help: false,
@@ -187,6 +196,16 @@ impl App {
         let windows = self.windows.clone();
         self.session_grid_view.tick(&windows);
         self.navigate(AppView::SessionGrid);
+        // Open the ssh channels now rather than waiting on the first idle tick,
+        // so a barn is already logging in while the local cells paint. After
+        // `navigate`, not before: the view is what decides whether a stream may
+        // exist at all.
+        tick_remote_streams(
+            &mut self.remote_grid,
+            &self.view,
+            &self.barns,
+            &self.connected_barns,
+        );
     }
 
     pub fn show_claude_splash(&mut self, window_index: u32, system_prompt: String, tools: Vec<String>) {
@@ -207,6 +226,10 @@ impl App {
 
     /// Navigate to a new view
     pub fn navigate(&mut self, view: AppView) {
+        // The one place `self.view` is ever assigned, so the one place that can
+        // see every route off the session grid — `go_back`, the vault trigger
+        // file, a worm trigger. See [`sync_streams_for_view`].
+        sync_streams_for_view(&mut self.remote_grid, &self.view, &view);
         match &view {
             AppView::Global => {
                 tmux::update_status_bar(None);
@@ -314,6 +337,134 @@ impl App {
             }
         }
     }
+}
+
+// ============================================================================
+// Remote stream lifecycle
+// ============================================================================
+
+/// Whether the remote frame streams should be running while `view` is on screen.
+///
+/// Exactly one view wants them, and that is the entire cost argument for the
+/// feature: a stream is a live ssh channel to a barn, emitting a rendered frame
+/// every second. A dashboard parked anywhere else with streams open is paying
+/// that for a grid nobody is looking at.
+///
+/// Written as an exhaustive `match` rather than `matches!`, deliberately. A new
+/// `AppView` variant then fails to compile here instead of silently inheriting
+/// whichever answer a `_` arm happened to give.
+pub(crate) fn streams_wanted(view: &AppView) -> bool {
+    match view {
+        AppView::SessionGrid => true,
+        AppView::Global
+        | AppView::Project { .. }
+        | AppView::Barn { .. }
+        | AppView::Wiki { .. }
+        | AppView::Issues { .. }
+        | AppView::Livestock { .. }
+        | AppView::Logs { .. }
+        | AppView::Critter { .. }
+        | AppView::CritterLogs { .. }
+        | AppView::Herd { .. }
+        | AppView::RanchHand { .. }
+        | AppView::Worm { .. }
+        | AppView::WormRunLog { .. }
+        | AppView::Trail { .. }
+        | AppView::Vault { .. } => false,
+    }
+}
+
+/// Bring the streams in line with a view change.
+///
+/// Called from [`App::navigate`], which is the **only** place `App.view` is
+/// ever assigned — and that is why the hook lives there rather than in
+/// [`App::go_back`]. `go_back` is one of three routes off the grid:
+///
+/// - `Esc`/`v` on the grid → `go_back`.
+/// - The vault trigger file, read straight from the main loop, navigates to
+///   `Vault` from whatever view is up.
+/// - A worm or poll trigger from the file watcher navigates to `Trail` the
+///   same way.
+///
+/// Neither of the last two goes near `go_back`, and either one would otherwise
+/// leave an ssh channel per connected barn open behind a view that is not the
+/// grid.
+///
+/// Grid → grid changes nothing: tearing the streams down and reopening them
+/// while the grid is still on screen would cost a handshake per barn and blank
+/// every remote cell until the next frame landed.
+pub(crate) fn sync_streams_for_view(streams: &mut RemoteStreams, from: &AppView, to: &AppView) {
+    if streams_wanted(from) && !streams_wanted(to) {
+        streams.shutdown();
+    }
+}
+
+/// The idle tick's remote-grid work: match the running streams to the barns
+/// that are connected *right now*, then take whatever frames arrived.
+///
+/// `reconcile` runs here and not only on open, so connecting to a barn from
+/// another window while the grid is up brings its sessions in without
+/// reopening. It is idempotent — a live stream is left alone — which it has to
+/// be at four ticks a second.
+///
+/// Being in `connected` means a `yh-barn-*` tmux session exists, never that ssh
+/// works: `tmux::connect_to_barn` creates that session before any ssh succeeds
+/// and `connect::run` renders "unreachable" without exiting, so a barn parked
+/// on its own error screen is in the set looking exactly like a healthy one.
+/// The registry's anti-respawn guard is what makes that survivable; nothing
+/// here may work around it.
+fn tick_remote_streams(
+    streams: &mut RemoteStreams,
+    view: &AppView,
+    barns: &[Barn],
+    connected: &HashSet<String>,
+) {
+    tick_remote_streams_with(streams, view, barns, connected, RemoteStream::spawn)
+}
+
+/// [`tick_remote_streams`] with the spawn injected — the same seam
+/// `RemoteStreams::reconcile_with` opens one level down.
+///
+/// The guard is here rather than at the call site so that "no stream exists off
+/// the grid" is a property of this function, testable against a recording
+/// spawner that reports the *attempt*. "Did not spawn" and "spawned and threw
+/// it away" look identical from outside, and the difference between them is an
+/// ssh handshake per barn per tick.
+pub(crate) fn tick_remote_streams_with<F>(
+    streams: &mut RemoteStreams,
+    view: &AppView,
+    barns: &[Barn],
+    connected: &HashSet<String>,
+    spawn: F,
+) where
+    F: Fn(&Barn, std::sync::mpsc::Sender<RemoteEvent>) -> Result<RemoteStream>,
+{
+    if !streams_wanted(view) {
+        return;
+    }
+    streams.reconcile_with(barns, connected, spawn);
+    streams.drain();
+}
+
+/// The quit teardown, in the one order that is safe.
+///
+/// **Streams first.** Each one reads its barn's tmux over an ssh channel that
+/// the barn's own connection is multiplexing, so killing the `yh-barn-*`
+/// sessions first pulls the transport out from under a reader mid-frame.
+/// `shutdown` is a kill and a reap per stream, synchronously, so by the time
+/// `kill_barn_sessions` runs there is nothing left reading through anything.
+///
+/// **yeehaw's own session last.** It takes down the session this process is
+/// running in, so anything after it may never execute — which is also why
+/// `should_quit` is the caller's to set.
+fn quit_teardown(
+    streams: &mut RemoteStreams,
+    kill_barn_sessions: impl FnOnce(),
+    kill_yeehaw_session: impl FnOnce(),
+) {
+    streams.shutdown();
+    kill_barn_sessions();
+    kill_yeehaw_session();
 }
 
 // ============================================================================
@@ -509,6 +660,15 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
 
                     // Ctrl-R: restart
                     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+                        // Reachable from the grid, and `respawn-window -k`
+                        // replaces this process rather than returning, so no
+                        // `Drop` runs. Measured on tmux 3.6a: the kill does
+                        // reach the pane's whole process group, so the ssh
+                        // children die with us either way — but leaning on
+                        // that is leaning on tmux internals for a teardown,
+                        // and the design is explicit that the backstop is
+                        // never the primary. Kill and reap here, now.
+                        app.remote_grid.shutdown();
                         tmux::restart_yeehaw();
                         continue;
                     }
@@ -564,7 +724,15 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                                     // the orphan this prompt exists to stop.
                                     let open = connected_barn_names(&app.barns, &app.connected_barns);
                                     if app.connected_barns.is_empty() {
-                                        tmux::kill_yeehaw_session();
+                                        // Nothing to close in the middle step —
+                                        // no barn sessions, so no streams
+                                        // either — but the order lives in one
+                                        // place and this path keeps to it.
+                                        quit_teardown(
+                                            &mut app.remote_grid,
+                                            || {},
+                                            tmux::kill_yeehaw_session,
+                                        );
                                         app.should_quit = true;
                                     } else {
                                         app.confirm_dialog = Some(
@@ -712,6 +880,16 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         } else {
             // Tick: refresh windows periodically, stream the session grid
             app.refresh_windows();
+            // Guarded inside on the view, so this is a no-op off the grid. It
+            // runs before the local tick because both paint the same frame and
+            // the remote half is the one with a network behind it — `drain` is
+            // non-blocking, `reconcile` only acts when the connected set moved.
+            tick_remote_streams(
+                &mut app.remote_grid,
+                &app.view,
+                &app.barns,
+                &app.connected_barns,
+            );
             if matches!(app.view, AppView::SessionGrid) {
                 let windows = app.windows.clone();
                 app.session_grid_view.tick(&windows);
@@ -1613,14 +1791,104 @@ fn handle_herd_detail_input(app: &mut App, key: KeyCode) {
 
 fn handle_session_grid_input(app: &mut App, key: KeyCode) {
     let windows = app.windows.clone();
-    match app.session_grid_view.handle_input(key, &windows) {
+    // The frames go in so a number key over a barn's cell resolves to that
+    // barn's session rather than falling off the end of the local list.
+    let action = app
+        .session_grid_view
+        .handle_input(key, &windows, app.remote_grid.frames());
+    match action {
         GridAction::Back => app.go_back(),
-        GridAction::Jump(window_index) => {
+        GridAction::Jump { origin, window_index } => {
             // Stay on the grid rather than going back, so Ctrl+Y from the
-            // session lands straight back here instead of the dashboard.
-            tmux::switch_to_window(window_index);
+            // session lands straight back here instead of the dashboard. `C-q`
+            // out of a barn is `switch-client -t =yeehaw`, which lands here too.
+            jump_to_cell(
+                app,
+                origin,
+                window_index,
+                tmux::switch_to_window,
+                remote_grid::select_window,
+                tmux::connect_to_barn,
+            );
         }
         GridAction::None => {}
+    }
+}
+
+/// Land the user on the session behind a number key.
+///
+/// `Local` is the `select-window` it always was.
+///
+/// `Barn` selects the window **on the barn first**, then switches into that
+/// barn's local session. The other order attaches to whatever window the barn
+/// happened to have selected and only then corrects it, so the user watches the
+/// wrong session for the length of an ssh round trip. There is no attach race
+/// to worry about in exchange: the grid only shows barns already in
+/// `connected_barns`, so the `yh-barn-*` session and its ssh attach both exist
+/// before any of this is reachable.
+///
+/// The remote half is a **blocking** ssh exec, ~70–180 ms over a warm
+/// `ControlMaster`. That is affordable because it is user-initiated, on a
+/// keypress. It must never end up on the 250 ms idle tick. Note the warm
+/// figure is the good case only — see [`remote_grid::select_window`] for what a
+/// jump to a barn whose master has died costs.
+///
+/// **A stale barn is jumped to without the select.** That good case does not
+/// apply to a barn whose stream just died: `ConnectTimeout` is 10 s, ssh has no
+/// way to report progress from behind a full-screen TUI, and a stale cell is by
+/// definition the cell whose channel has already failed. Ten seconds of frozen
+/// terminal on a keypress is not a trade worth landing on the right *window*
+/// for, so the jump drops the select and keeps the part that cannot block:
+/// `connect` is local tmux work, and it lands the user in the barn's session —
+/// live if it recovered, on `yeehaw connect`'s own "unreachable" screen, retry
+/// prompt and all, if it did not. The user was told: the cell says STALE.
+///
+/// Rejected, for the record: doing the select on a background thread and
+/// switching immediately. It would correct the window ~10 s after arrival in
+/// the case that matters, which is a session changing under the user long after
+/// they stopped expecting it.
+///
+/// Both effects are injected for the same reason [`quit_teardown`]'s are: one
+/// reaches the network and the other creates a tmux session, and the order
+/// between them is the property worth guarding.
+fn jump_to_cell(
+    app: &mut App,
+    origin: Origin,
+    window_index: u32,
+    switch_local: impl FnOnce(u32),
+    select_remote: impl FnOnce(&Barn, u32) -> Result<()>,
+    connect: impl FnOnce(&Barn) -> Result<()>,
+) {
+    let name = match origin {
+        Origin::Local => {
+            switch_local(window_index);
+            return;
+        }
+        Origin::Barn(name) => name,
+    };
+
+    // A cell can outlive its barn's config entry: the grid holds the last frame
+    // from a barn deleted from the ranch a moment ago, still numbered. Connect
+    // to *something* rather than nothing and the number under the user's finger
+    // has just sent them to a different host.
+    let Some(barn) = app.barns.iter().find(|b| b.name == name).cloned() else {
+        app.error = Some(format!("barn '{}' is no longer on the ranch", name));
+        return;
+    };
+
+    // Read here rather than passed in from `handle_session_grid_input`: it is
+    // the same map the cell was drawn from, so the badge the user pressed and
+    // the route taken cannot disagree about which barns are stale.
+    if !app.remote_grid.stale().contains(name.as_str()) {
+        if let Err(e) = select_remote(&barn, window_index) {
+            app.error = Some(format!("Jump failed: {:#}", e));
+            return;
+        }
+    }
+    // `{:#}`, like `connect_barn`: these are context chains and plain Display
+    // shows only the outermost layer, never the one that says what went wrong.
+    if let Err(e) = connect(&barn) {
+        app.error = Some(format!("Connect failed: {:#}", e));
     }
 }
 
@@ -1829,12 +2097,15 @@ fn handle_confirm_action(app: &mut App, action: ConfirmAction) {
             }
         }
         ConfirmAction::QuitClosingBarnSessions => {
-            // Barns first: kill_yeehaw_session takes down the session this
-            // process runs in, so anything after it may never execute.
-            // kill_all_barn_sessions re-reads tmux, so a barn connected between
-            // the prompt and the `y` is closed too, listed or not.
-            tmux::kill_all_barn_sessions();
-            tmux::kill_yeehaw_session();
+            // Streams, then barns, then yeehaw — see `quit_teardown` for why
+            // that order is the only safe one. kill_all_barn_sessions re-reads
+            // tmux, so a barn connected between the prompt and the `y` is
+            // closed too, listed or not.
+            quit_teardown(
+                &mut app.remote_grid,
+                tmux::kill_all_barn_sessions,
+                tmux::kill_yeehaw_session,
+            );
             app.should_quit = true;
         }
         ConfirmAction::DeleteWorm(name) => {
@@ -1964,6 +2235,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
             AppView::Worm { .. } => "worm",
             AppView::Livestock { .. } => "livestock",
             AppView::Vault { .. } => "vault",
+            // The grid answers a set of keys no other view does and none of the
+            // generic navigation ones. Falling through to "general" here left
+            // `l` — and `?` itself — named nowhere in the program.
+            AppView::SessionGrid => "sessiongrid",
             _ => "general",
         };
         help_overlay::render_help_overlay(frame, area, scope);
@@ -2049,7 +2324,16 @@ fn render_view(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         AppView::SessionGrid => {
             let windows = app.windows.clone();
-            app.session_grid_view.render(frame, area, &windows);
+            // Whatever the streams last delivered. Empty off the grid and empty
+            // with no barns connected, which is the overwhelmingly common case —
+            // nothing here shells out or blocks.
+            //
+            // `stale` alongside it, because a barn's cells outlive its stream:
+            // the last frame stays on the grid, dimmed and badged, rather than
+            // vanishing and renumbering everything after it.
+            let stale = app.remote_grid.stale();
+            app.session_grid_view
+                .render(frame, area, &windows, app.remote_grid.frames(), &stale);
         }
         AppView::Issues { project } => {
             let project = project.clone();
@@ -2186,8 +2470,10 @@ fn get_bottom_bar_items(view: &AppView) -> Vec<(&'static str, &'static str)> {
         AppView::SessionGrid => vec![
             ("1-9", "jump"),
             ("c", "claude only"),
+            ("l", "local only"),
             ("f", "filter"),
             ("Esc", "back"),
+            ("?", "help"),
         ],
         AppView::Trail { .. } => vec![
             ("r", "run"),
@@ -2390,6 +2676,16 @@ fn expand_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Real streams over local children — no ssh, no barn, no network. The
+    // process-group discipline comes from `remote_grid`'s own helpers rather
+    // than being rebuilt here: a stream child's forked subshells hold the same
+    // pipe and survive a kill aimed at the child alone, which is how RG-2 left
+    // `capture-pane` loops running on this machine twice.
+    use crate::remote_grid::tests::{
+        child_pid, failed_barns, guard_all, mark_failed, named_barn, process_state,
+        recording_spawner, sessions_for, silent,
+    };
+    use std::cell::RefCell;
 
     fn barn(name: &str) -> Barn {
         Barn {
@@ -2511,5 +2807,600 @@ mod tests {
         assert!(dialog.message.contains("Close 2 barn connections"), "{}", dialog.message);
         assert!(dialog.message.contains("guided"), "{}", dialog.message);
         assert!(dialog.message.contains("and 1 more"), "{}", dialog.message);
+    }
+
+    // === remote stream lifecycle ==========================================
+    //
+    // The streams are ssh channels, so the cost argument for the whole feature
+    // is that they exist while the session grid is on screen and at no other
+    // moment. These drive that through the real registry with real children,
+    // and never through a terminal.
+
+    /// Build a fixture from JSON so a five-field view payload does not need a
+    /// twenty-line literal. Every one of these types is `Deserialize`.
+    fn fixture<T: serde::de::DeserializeOwned>(json: &str) -> T {
+        serde_json::from_str(json).expect("fixture should deserialize")
+    }
+
+    /// Every view the grid is actually left *for*.
+    ///
+    /// `go_back` is only one of the three routes. The vault trigger file and a
+    /// worm/poll trigger both navigate straight out of `SessionGrid` from the
+    /// main loop without going anywhere near `go_back`, so `Vault` and `Trail`
+    /// are in this list on purpose and not for symmetry.
+    fn views_off_the_grid() -> Vec<AppView> {
+        let project: Project = fixture(r#"{"name":"proj","path":"/tmp/proj"}"#);
+        vec![
+            // `go_back` with no previous view.
+            AppView::Global,
+            // `go_back` to wherever `v` was pressed.
+            AppView::Project { project: project.clone() },
+            AppView::Barn { barn: barn("guided") },
+            // The vault trigger file, from the main loop.
+            AppView::Vault { source_pane: None },
+            // A worm or poll trigger, from the file watcher.
+            AppView::Trail {
+                project,
+                livestock: fixture(r#"{"name":"api","path":"/srv/api"}"#),
+                trail: fixture(r#"{"name":"deploy","jobs":{}}"#),
+                source: "project".to_string(),
+                source_barn: None,
+            },
+        ]
+    }
+
+    /// A registry with a live stream per named barn, plus the group guards that
+    /// take the children with them however the test ends.
+    fn streaming(
+        barns: &[Barn],
+        log: &RefCell<Vec<String>>,
+    ) -> (RemoteStreams, Vec<crate::remote_grid::tests::GroupGuard>) {
+        let names: Vec<&str> = barns.iter().map(|b| b.name.as_str()).collect();
+        let mut streams = RemoteStreams::new();
+        streams.reconcile_with(barns, &sessions_for(&names), recording_spawner(log, silent));
+        let guards = guard_all(&streams);
+        for name in &names {
+            assert!(
+                child_pid(&streams, name).is_some(),
+                "control: '{name}' has to be streaming before the test starts"
+            );
+        }
+        (streams, guards)
+    }
+
+    #[test]
+    fn only_the_session_grid_wants_streams() {
+        assert!(streams_wanted(&AppView::SessionGrid));
+        for view in views_off_the_grid() {
+            assert!(!streams_wanted(&view), "{view:?} wants ssh channels open");
+        }
+    }
+
+    #[test]
+    fn leaving_the_grid_shuts_every_stream_down() {
+        // Whichever view the grid is left for, and however it is left. Every
+        // one of these routes runs through `navigate`, so this is the decision
+        // `navigate` makes, driven against real children.
+        for to in views_off_the_grid() {
+            let barns = [named_barn("guided"), named_barn("smash-mac")];
+            let log = RefCell::new(Vec::new());
+            let (mut streams, _guards) = streaming(&barns, &log);
+            let pids: Vec<i32> = barns
+                .iter()
+                .map(|b| child_pid(&streams, &b.name).expect("streaming"))
+                .collect();
+
+            sync_streams_for_view(&mut streams, &AppView::SessionGrid, &to);
+
+            for (b, pid) in barns.iter().zip(&pids) {
+                assert!(
+                    child_pid(&streams, &b.name).is_none(),
+                    "leaving the grid for {to:?} kept '{}' streaming",
+                    b.name
+                );
+                // Killed *and* reaped, synchronously. A `Z` here is a defunct
+                // ssh per barn per grid open for the rest of the TUI's life.
+                assert_eq!(
+                    process_state(*pid),
+                    None,
+                    "'{}' outlived the grid as {:?} on the way to {to:?}",
+                    b.name,
+                    process_state(*pid)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn navigating_off_the_grid_shuts_the_streams_down_through_the_real_app() {
+        // The seam above is only worth anything if `navigate` calls it, and
+        // `navigate` is the one place `App.view` is ever assigned — which is
+        // what makes it cover the two routes that never touch `go_back`.
+        //
+        // `Wiki` as the destination because `navigate`'s own match has no arm
+        // for it, so this test changes nothing about the tmux session it is
+        // running inside.
+        let barns = [named_barn("guided")];
+        let log = RefCell::new(Vec::new());
+        let (streams, _guards) = streaming(&barns, &log);
+        let pid = child_pid(&streams, "guided").expect("streaming");
+
+        let mut app = App::new();
+        app.remote_grid = streams;
+        app.view = AppView::SessionGrid;
+
+        app.navigate(AppView::Wiki { project: fixture(r#"{"name":"proj","path":"/tmp/proj"}"#) });
+
+        assert!(child_pid(&app.remote_grid, "guided").is_none(), "the stream survived navigate");
+        assert_eq!(process_state(pid), None, "the child survived navigate");
+    }
+
+    #[test]
+    fn moving_around_inside_the_grid_leaves_the_streams_alone() {
+        // Guards the shape of the condition. "Shut down whenever the view
+        // changes" and "shut down unless we are arriving at the grid" both
+        // pass the test above and both tear the streams down under the user
+        // while the grid is still on screen.
+        let barns = [named_barn("guided")];
+        let log = RefCell::new(Vec::new());
+        let (mut streams, _guards) = streaming(&barns, &log);
+        let pid = child_pid(&streams, "guided").expect("streaming");
+
+        sync_streams_for_view(&mut streams, &AppView::SessionGrid, &AppView::SessionGrid);
+        assert_eq!(child_pid(&streams, "guided"), Some(pid), "a stream was replaced mid-grid");
+
+        // And arriving at the grid must not clear what is already running.
+        sync_streams_for_view(&mut streams, &AppView::Global, &AppView::SessionGrid);
+        assert_eq!(child_pid(&streams, "guided"), Some(pid), "opening the grid killed its streams");
+
+        streams.shutdown();
+    }
+
+    #[test]
+    fn quitting_shuts_streams_down_before_killing_barn_sessions() {
+        // Reversed, the streams race the very sessions they read through.
+        let barns = [named_barn("guided")];
+        let log = RefCell::new(Vec::new());
+        let (mut streams, _guards) = streaming(&barns, &log);
+        let pid = child_pid(&streams, "guided").expect("streaming");
+        assert!(
+            process_state(pid).is_some(),
+            "control: the child is alive right up to the quit"
+        );
+
+        let order = RefCell::new(Vec::new());
+        quit_teardown(
+            &mut streams,
+            || {
+                // The whole test. By the time the barn sessions go, nothing is
+                // reading through one.
+                assert_eq!(
+                    process_state(pid),
+                    None,
+                    "a barn session was killed while a stream was still reading through it"
+                );
+                order.borrow_mut().push("barn sessions");
+            },
+            || order.borrow_mut().push("yeehaw session"),
+        );
+
+        assert_eq!(
+            *order.borrow(),
+            ["barn sessions", "yeehaw session"],
+            "yeehaw's own session has to go last — it takes this process with it"
+        );
+        assert!(child_pid(&streams, "guided").is_none(), "the quit left a stream behind");
+    }
+
+    #[test]
+    fn no_streams_are_spawned_while_the_grid_is_closed() {
+        // The entire cost argument. A stream is a live ssh channel per barn, so
+        // a closed dashboard that keeps ticking must not open one — and the log
+        // records the *attempt*, because "did not spawn" and "spawned and threw
+        // it away" are indistinguishable from the outside.
+        let barns = [named_barn("guided"), named_barn("smash-mac")];
+        let connected = sessions_for(&["guided", "smash-mac"]);
+
+        for view in views_off_the_grid() {
+            let log = RefCell::new(Vec::new());
+            let mut streams = RemoteStreams::new();
+            for _tick in 0..8 {
+                tick_remote_streams_with(
+                    &mut streams,
+                    &view,
+                    &barns,
+                    &connected,
+                    recording_spawner(&log, silent),
+                );
+            }
+            let _guards = guard_all(&streams);
+            assert!(
+                log.borrow().is_empty(),
+                "two seconds of ticks on {view:?} opened {:?}",
+                log.borrow()
+            );
+            streams.shutdown();
+        }
+
+        // Control: the same barns and the same ticks on the grid itself. Without
+        // it, a tick that did nothing anywhere would pass.
+        let log = RefCell::new(Vec::new());
+        let mut streams = RemoteStreams::new();
+        tick_remote_streams_with(
+            &mut streams,
+            &AppView::SessionGrid,
+            &barns,
+            &connected,
+            recording_spawner(&log, silent),
+        );
+        let _guards = guard_all(&streams);
+        assert_eq!(log.borrow().len(), 2, "the grid itself spawned nothing");
+        streams.shutdown();
+    }
+
+    #[test]
+    fn opening_the_grid_reconciles_without_waiting_for_the_first_tick() {
+        // Otherwise every remote cell is a quarter second late for nothing, and
+        // the slow part — ssh connecting and `bash -l` sourcing a profile — has
+        // not even begun.
+        //
+        // The barn has no host, so the real `RemoteStream::spawn` cannot build
+        // an ssh argv and records the failure instead of starting anything.
+        // That runs the real `open_session_grid`, real spawn included, with
+        // nothing on the network and no child anywhere.
+        let mut app = App::new();
+        app.windows = vec![];
+        app.barns = vec![Barn { host: None, ..named_barn("ghost") }];
+        app.connected_barns = sessions_for(&["ghost"]);
+
+        app.open_session_grid(GridScope::All);
+
+        assert!(matches!(app.view, AppView::SessionGrid), "the grid did not open");
+        assert_eq!(
+            failed_barns(&app.remote_grid),
+            ["ghost"],
+            "opening the grid never reconciled, so every remote cell waits a tick it need not"
+        );
+    }
+
+    #[test]
+    fn a_barn_connected_while_the_grid_is_open_gains_a_stream_without_reopening() {
+        // Why reconcile is on the tick and not only on open. `connect_to_barn`
+        // from another window is a session appearing in `connected_barns` on a
+        // later tick, with nothing reopening the grid.
+        let barns = [named_barn("guided"), named_barn("smash-mac")];
+        let log = RefCell::new(Vec::new());
+        let mut streams = RemoteStreams::new();
+
+        tick_remote_streams_with(
+            &mut streams,
+            &AppView::SessionGrid,
+            &barns,
+            &sessions_for(&["guided"]),
+            recording_spawner(&log, silent),
+        );
+        let mut guards = guard_all(&streams);
+        assert_eq!(*log.borrow(), ["guided"], "control: one barn connected, one stream");
+
+        tick_remote_streams_with(
+            &mut streams,
+            &AppView::SessionGrid,
+            &barns,
+            &sessions_for(&["guided", "smash-mac"]),
+            recording_spawner(&log, silent),
+        );
+        guards.extend(guard_all(&streams));
+
+        assert_eq!(
+            *log.borrow(),
+            ["guided", "smash-mac"],
+            "a barn connected from elsewhere never reached the open grid"
+        );
+        assert!(child_pid(&streams, "guided").is_some(), "the first stream was disturbed");
+
+        streams.shutdown();
+    }
+
+    // === the jump ==========================================================
+    //
+    // Both halves of a jump leave the process — one ssh exec and one tmux
+    // session — so both are injected, exactly as `quit_teardown`'s are. Nothing
+    // here spawns anything: `tmux::switch_to_window` against this machine would
+    // move the window of the yeehaw session the developer is sitting in.
+
+    /// Run a jump with every effect recorded instead of performed, and hand
+    /// back what it did, in order.
+    fn jump_log(
+        app: &mut App,
+        origin: Origin,
+        window_index: u32,
+        select: Result<()>,
+        connect: Result<()>,
+    ) -> Vec<String> {
+        let log = RefCell::new(Vec::new());
+        jump_to_cell(
+            app,
+            origin,
+            window_index,
+            |i| log.borrow_mut().push(format!("switch {i}")),
+            |b, i| {
+                log.borrow_mut().push(format!("select {} {i}", b.name));
+                select
+            },
+            |b| {
+                log.borrow_mut().push(format!("connect {}", b.name));
+                connect
+            },
+        );
+        log.into_inner()
+    }
+
+    /// An app whose ranch holds exactly `names`, and nothing else that matters.
+    fn ranch(names: &[&str]) -> App {
+        let mut app = App::new();
+        app.barns = names.iter().map(|n| barn(n)).collect();
+        app.error = None;
+        app
+    }
+
+    #[test]
+    fn a_jump_to_a_barn_selects_on_the_barn_before_switching_locally() {
+        // The order *is* the design. Switching first attaches to whatever window
+        // the barn had selected and corrects it an ssh round trip later, so the
+        // user watches the wrong session for 70-180ms every single jump.
+        let mut app = ranch(&["guided"]);
+        let log = jump_log(&mut app, Origin::Barn("guided".into()), 4, Ok(()), Ok(()));
+
+        assert_eq!(log, ["select guided 4", "connect guided"]);
+        assert_eq!(app.error, None);
+    }
+
+    #[test]
+    fn a_local_jump_switches_locally_and_never_reaches_a_barn() {
+        // The unchanged path, asserted with a barn on the ranch so a jump that
+        // wandered into the remote branch has somewhere to wander to.
+        let mut app = ranch(&["guided"]);
+        let log = jump_log(&mut app, Origin::Local, 7, Ok(()), Ok(()));
+
+        assert_eq!(log, ["switch 7"], "a local jump went over the network");
+        assert_eq!(app.error, None);
+    }
+
+    #[test]
+    fn a_jump_to_a_barn_that_vanished_reports_an_error_rather_than_connecting() {
+        // A frame outlives the config entry it came from: delete a barn while
+        // its cells are on screen and the numbers stay drawn. Connecting to
+        // *something* here means the number under the user's finger silently
+        // became a different host.
+        let mut app = ranch(&["guided"]);
+        let log = jump_log(&mut app, Origin::Barn("ghost".into()), 4, Ok(()), Ok(()));
+
+        assert!(log.is_empty(), "a vanished barn still reached the world: {log:?}");
+        let msg = app.error.expect("a jump to a barn that is gone must say so");
+        assert!(msg.contains("ghost"), "the error does not name the barn: {msg}");
+        assert!(
+            !msg.contains("guided"),
+            "the error names a barn the user did not press: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_failed_remote_select_reports_the_error_and_does_not_connect() {
+        // Connecting anyway lands the user on whatever the barn had selected —
+        // the flash of the wrong session this ordering exists to prevent, made
+        // permanent and silent.
+        let mut app = ranch(&["guided"]);
+        let log = jump_log(
+            &mut app,
+            Origin::Barn("guided".into()),
+            4,
+            Err(anyhow::anyhow!("can't find window: 4")),
+            Ok(()),
+        );
+
+        assert_eq!(log, ["select guided 4"], "it connected anyway: {log:?}");
+        let msg = app.error.expect("a failed remote select must say so");
+        assert!(msg.contains("can't find window: 4"), "{msg}");
+    }
+
+    #[test]
+    fn a_failed_connect_after_a_good_select_surfaces_the_whole_context_chain() {
+        // `{:#}`, the same as `connect_barn`. Plain Display prints only the
+        // outermost layer, and the layer that says what actually went wrong is
+        // underneath it — this banner is the only place the user ever sees it.
+        let mut app = ranch(&["guided"]);
+        let cause = anyhow::anyhow!("permission denied")
+            .context("failed to write ~/.yeehaw/tmux.conf");
+        let log = jump_log(&mut app, Origin::Barn("guided".into()), 4, Ok(()), Err(cause));
+
+        assert_eq!(log, ["select guided 4", "connect guided"]);
+        let msg = app.error.expect("a failed connect must say so");
+        assert!(msg.contains("permission denied"), "the cause was swallowed: {msg}");
+    }
+
+    #[test]
+    fn the_grid_is_drawn_with_the_registry_s_stale_barns_not_an_empty_set() {
+        // The one seam between the registry that knows a stream died and the
+        // view that draws it. Everything either side of this call is covered —
+        // `stale()` by the registry's tests, the badge and the header note by
+        // the view's — and an `&HashSet::new()` here would leave both sets of
+        // tests green while the running TUI never dimmed a single cell.
+        let mut app = ranch(&["guided"]);
+        app.view = AppView::SessionGrid;
+        mark_failed(&mut app.remote_grid, "guided", "the stream to 'guided' ended");
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+            .expect("test terminal");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_view(f, &mut app, area);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let header: String = (0..120u16)
+            .map(|x| buf.cell((x, 0)).map(|c| c.symbol().to_string()).unwrap_or_default())
+            .collect();
+        assert!(
+            header.contains("stale: guided"),
+            "the view was drawn as if every barn were live: {header:?}"
+        );
+    }
+
+    #[test]
+    fn a_jump_to_a_stale_barn_skips_the_blocking_remote_select() {
+        // The whole reason a stale cell keeps its number, and the one thing that
+        // makes keeping it affordable. `select_remote` is a blocking ssh exec:
+        // ~70-180ms over a warm ControlMaster, but ssh's full ConnectTimeout —
+        // ten seconds, TUI frozen, no spinner, no escape — when the master is
+        // gone. A barn is marked stale precisely because its channel died, so
+        // this is the one cell on the grid where that cost is not the exception.
+        //
+        // Skipping it lands the user in the barn's own session instead, which is
+        // local tmux work and returns at once: live if the barn recovered, on
+        // `yeehaw connect`'s "unreachable" screen if it did not. That screen is
+        // where a dead barn is *supposed* to be reported, and it can retry.
+        let mut app = ranch(&["guided"]);
+        mark_failed(&mut app.remote_grid, "guided", "the stream to 'guided' ended");
+
+        let log = jump_log(&mut app, Origin::Barn("guided".into()), 4, Ok(()), Ok(()));
+
+        assert_eq!(
+            log,
+            ["connect guided"],
+            "a jump to a stale barn went over the network anyway: {log:?}"
+        );
+        assert_eq!(app.error, None, "a stale jump reported a failure that did not happen");
+    }
+
+    #[test]
+    fn a_stale_jump_is_not_the_silent_no_op_it_would_be_easiest_to_ship() {
+        // The alternative — ignore the key — leaves a cell wearing a number that
+        // does nothing, which is the failure that pulled the remote jump forward
+        // a task. A stale number still takes you to that barn; only the remote
+        // select is dropped.
+        let mut app = ranch(&["guided"]);
+        mark_failed(&mut app.remote_grid, "guided", "the stream to 'guided' ended");
+
+        let log = jump_log(&mut app, Origin::Barn("guided".into()), 4, Ok(()), Ok(()));
+        assert!(!log.is_empty(), "the number on a stale cell did nothing at all");
+
+        // And a failure to reach the barn is still reported, rather than the
+        // jump quietly deciding a stale barn cannot fail.
+        let mut app = ranch(&["guided"]);
+        mark_failed(&mut app.remote_grid, "guided", "the stream to 'guided' ended");
+        let log = jump_log(
+            &mut app,
+            Origin::Barn("guided".into()),
+            4,
+            Ok(()),
+            Err(anyhow::anyhow!("no route to host")),
+        );
+        assert_eq!(log, ["connect guided"]);
+        let msg = app.error.expect("a failed connect must still say so");
+        assert!(msg.contains("no route to host"), "{msg}");
+    }
+
+    #[test]
+    fn only_the_stale_barn_loses_its_remote_select() {
+        // Staleness is per barn, like everything else about the merge. One dead
+        // barn must not cost the healthy one beside it the window it was aimed
+        // at.
+        let mut app = ranch(&["guided", "smash-mac"]);
+        mark_failed(&mut app.remote_grid, "guided", "the stream to 'guided' ended");
+
+        let log = jump_log(&mut app, Origin::Barn("smash-mac".into()), 2, Ok(()), Ok(()));
+        assert_eq!(
+            log,
+            ["select smash-mac 2", "connect smash-mac"],
+            "a live barn lost its remote select to its neighbour dying: {log:?}"
+        );
+    }
+
+    #[test]
+    fn a_local_jump_is_untouched_by_a_stale_barn() {
+        let mut app = ranch(&["guided"]);
+        mark_failed(&mut app.remote_grid, "guided", "the stream to 'guided' ended");
+
+        let log = jump_log(&mut app, Origin::Local, 7, Ok(()), Ok(()));
+        assert_eq!(log, ["switch 7"]);
+    }
+
+    #[test]
+    fn a_jump_finds_its_barn_by_exact_name_not_by_prefix() {
+        // `guided` and `guided-2` are different production hosts, and the same
+        // hazard the `=` in every tmux target guards. A `starts_with` here sends
+        // the user to whichever one the config listed first.
+        let mut app = ranch(&["guided-2", "guided"]);
+        let log = jump_log(&mut app, Origin::Barn("guided".into()), 1, Ok(()), Ok(()));
+
+        assert_eq!(log, ["select guided 1", "connect guided"]);
+    }
+
+    // === help on the grid ==================================================
+
+    /// Draw the whole app — overlay, bottom bar and all — and read the screen
+    /// back as one string.
+    fn whole_screen(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
+            .expect("test terminal");
+        terminal.draw(|f| draw(f, app)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .map(|c| c.symbol().to_string())
+                            .unwrap_or_default()
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn help_on_the_grid_is_the_grids_own_help_and_not_the_generic_one() {
+        // `?` opens the overlay from the grid — it is not an input-mode view —
+        // and the grid used to fall through this match to "general", which lists
+        // `Esc` under a navigation block none of whose keys the grid answers.
+        //
+        // Driven through `draw` rather than by calling the scope match directly,
+        // because a scope name is worth nothing until it reaches the overlay:
+        // "vault" is already mapped here and has no section on the other side.
+        let mut app = ranch(&["guided"]);
+        app.view = AppView::SessionGrid;
+        app.show_help = true;
+
+        let screen = whole_screen(&mut app, 120, 40);
+        assert!(
+            screen.contains("Local sessions only"),
+            "`l` is bound on the grid and the grid's help never mentions it:\n{screen}"
+        );
+        assert!(
+            screen.contains("Jump to that session"),
+            "the grid's help is not the grid's:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Go to bottom"),
+            "the grid was handed the generic navigation block, whose keys it ignores:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_grids_bottom_bar_names_the_source_filter_and_the_help_key() {
+        // The other place a key goes to be discovered, and the one a user sees
+        // without pressing anything. `l` and `?` were both live on the grid and
+        // named in neither this bar nor the overlay.
+        let mut app = ranch(&[]);
+        app.view = AppView::SessionGrid;
+
+        let screen = whole_screen(&mut app, 120, 40);
+        let bar = screen.lines().last().unwrap_or_default().to_string();
+        assert!(bar.contains("local"), "the bottom bar hides `l`: {bar:?}");
+        assert!(bar.contains("help"), "the bottom bar hides `?`: {bar:?}");
+        assert!(bar.contains("jump"), "the bottom bar lost `1-9`: {bar:?}");
     }
 }
