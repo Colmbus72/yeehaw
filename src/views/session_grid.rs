@@ -1010,8 +1010,12 @@ impl SessionGridView {
         // the only part that gives: at MIN_CELL_W there is barely room for the
         // chip, the name and the badge, and the badge is the part a WAITING
         // session cannot lose.
-        let label = match &cell.origin {
-            Origin::Local => format!(" {} ", win.name),
+        // Split rather than concatenated, because the barn name is styled
+        // separately from the window name: it carries the same red as the border
+        // so the two reinforce each other, while the window name keeps the status
+        // colour it shares with local cells.
+        let (barn_label, name_label) = match &cell.origin {
+            Origin::Local => (None, format!(" {} ", win.name)),
             Origin::Barn(barn) => {
                 // Two columns go to the block's corners; the rest is the title.
                 // Everything but the barn name is fixed: chip, badge, the two
@@ -1029,13 +1033,16 @@ impl SessionGridView {
                     // to exactly the local title keeps a remote cell from ever
                     // being worse off than the same cell would be at home — the
                     // red border still says where it lives.
-                    b if b.is_empty() => format!(" {} ", win.name),
-                    b => format!(" {} · {} ", b, win.name),
+                    b if b.is_empty() => (None, format!(" {} ", win.name)),
+                    // ` <barn> ` + `· <name> ` reassembles to exactly the
+                    // ` <barn> · <name> ` this used to build as one string, so
+                    // the width arithmetic above is unchanged.
+                    b => (Some(format!(" {} ", b)), format!("· {} ", win.name)),
                 }
             }
         };
 
-        let title = Line::from(vec![
+        let mut title = Line::from(vec![
             Span::styled(
                 number,
                 Style::default()
@@ -1043,16 +1050,28 @@ impl SessionGridView {
                     .bg(color)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(label, Style::default().fg(color)),
-            Span::styled(
-                badge_text,
-                Style::default().fg(color).add_modifier(if needs_attention {
-                    Modifier::BOLD
-                } else {
-                    Modifier::DIM
-                }),
-            ),
         ]);
+        // The barn name in the border's own red, bold: the two say "this is not
+        // your machine" together instead of the border saying it alone. A stale
+        // cell drops to STALE_FG with the rest of its title rather than keeping a
+        // bright red name, since nothing about it is live news any more.
+        if let Some(barn_label) = barn_label {
+            title.push_span(Span::styled(
+                barn_label,
+                Style::default()
+                    .fg(if is_stale { STALE_FG } else { BARN_RED })
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        title.push_span(Span::styled(name_label, Style::default().fg(color)));
+        title.push_span(Span::styled(
+            badge_text,
+            Style::default().fg(color).add_modifier(if needs_attention {
+                Modifier::BOLD
+            } else {
+                Modifier::DIM
+            }),
+        ));
 
         // Remote cells are red whatever they are doing; local cells keep the
         // border as their status channel. See [`BARN_RED`]. A dead barn's red is
@@ -1062,13 +1081,25 @@ impl SessionGridView {
             Origin::Barn(_) if is_stale => STALE_BORDER,
             Origin::Barn(_) => BARN_RED,
         };
+        // Remote cells are always heavy. The weight is a second, colour-blind
+        // channel for the same claim the red makes — useful on a terminal whose
+        // palette mangles #8b1a1a, and readable at a glance across a full grid.
+        //
+        // This retargets what Thick means. It used to say "needs attention", and
+        // a stale cell deliberately suppressed it so a dead barn could not shout.
+        // Now it says "not your machine", which a stale cell still is — so stale
+        // keeps the weight and gives up only the colour, dropping to the dimmed
+        // STALE_BORDER. Attention still reads clearly on a barn: it lives in the
+        // number chip and the badge, which is exactly why those two kept the
+        // status colour when the border stopped carrying it.
+        let border_type = match &cell.origin {
+            Origin::Barn(_) => BorderType::Thick,
+            Origin::Local if needs_attention => BorderType::Thick,
+            Origin::Local => BorderType::Plain,
+        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(if needs_attention {
-                BorderType::Thick
-            } else {
-                BorderType::Plain
-            })
+            .border_type(border_type)
             .border_style(Style::default().fg(border_color))
             .title(title);
 
@@ -2107,6 +2138,81 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_cell_draws_a_heavier_border_than_a_local_one() {
+        // The weight is a second channel for the same claim the red makes, so it
+        // survives a terminal whose palette mangles #8b1a1a. `┏` is the thick
+        // corner, `┌` the plain one.
+        let v = SessionGridView::new(GridScope::All);
+
+        let quiet = barns(vec![frame_of("guided", vec![rwin(1, "api", "%1", "claude")])]);
+        let buf = render_buffer(&v, &[], &quiet, 120, 40);
+        assert_eq!(
+            buf.cell((2, 2)).expect("a corner").symbol(),
+            "┏",
+            "an idle remote cell is not drawn heavy"
+        );
+
+        // A local cell with nothing to report stays light, or the weight means
+        // nothing.
+        let none = HashMap::new();
+        let buf = render_buffer(&v, &[win(1, "claude", "P", "local")], &none, 120, 40);
+        assert_eq!(
+            buf.cell((2, 2)).expect("a corner").symbol(),
+            "┌",
+            "a quiet local cell picked up the remote weight"
+        );
+    }
+
+    #[test]
+    fn the_barn_name_wears_the_border_red_and_bold_while_the_window_name_keeps_status() {
+        // The two halves of a remote title say different things and must not be
+        // painted the same: the barn is where it lives, the window is what it is
+        // doing. Collapsing them loses the status colour the border gave up.
+        let v = SessionGridView::new(GridScope::All);
+        let mut f = frame_of("guided", vec![rwin(1, "api", "%1", "claude")]);
+        remote_signal(&mut f, "%1", SessionStatus::Waiting, 10);
+        let remote = barns(vec![f]);
+
+        let buf = render_buffer(&v, &[], &remote, 120, 40);
+        let title_y = 2;
+
+        let barn_col = col_of(&buf, title_y, 120, "guided");
+        assert_eq!(
+            fg_at(&buf, barn_col, title_y),
+            BARN_RED,
+            "the barn name is not barn red"
+        );
+        assert!(
+            buf.cell((barn_col, title_y))
+                .expect("a cell")
+                .modifier
+                .contains(Modifier::BOLD),
+            "the barn name is not bold"
+        );
+
+        // The window name is a different span and keeps the status colour.
+        let name_col = col_of(&buf, title_y, 120, "api");
+        assert_eq!(
+            fg_at(&buf, name_col, title_y),
+            AMBER,
+            "the window name lost the status colour to the barn's red"
+        );
+    }
+
+    #[test]
+    fn a_stale_barn_name_stops_wearing_live_red() {
+        // Same reason the border dims: nothing about a photograph is news.
+        let v = SessionGridView::new(GridScope::All);
+        let remote = barns(vec![frame_of("alpha", vec![rwin(1, "api", "%1", "claude")])]);
+        let buf =
+            render_buffer_stale(&v, &[], &remote, &stale_set(&["alpha"]), 120, 40);
+
+        let barn_col = col_of(&buf, 2, 120, "alpha");
+        assert_eq!(fg_at(&buf, barn_col, 2), STALE_FG);
+        assert_ne!(fg_at(&buf, barn_col, 2), BARN_RED);
+    }
+
+    #[test]
     fn grid_scope_barn_still_filters_by_the_yeehaw_barn_tag_not_by_origin() {
         // `GridScope::Barn(b)` selects windows whose *work targets* b. A local
         // ssh window into `guided` is Origin::Local with barn == "guided" and
@@ -2999,12 +3105,29 @@ mod tests {
             AMBER,
             "the number chip still carries the frozen status colour"
         );
-        // Thick borders are the attention channel. `┏` is the thick corner and
-        // `┌` the plain one.
+        // AMENDED. This asserted `┌` — a stale cell must not draw the thick
+        // border — back when Thick meant "needs attention" and a dead barn
+        // shouting was the thing to prevent.
+        //
+        // Thick now means "not your machine": every remote cell wears it, so the
+        // weight is a colour-blind restatement of the red rather than an alarm. A
+        // stale cell is still on a barn, so it keeps the weight and gives up the
+        // colour instead — STALE_BORDER, asserted by
+        // `a_stale_cell_dims_its_border_rather_than_wearing_live_barn_red`.
+        //
+        // The original intent is intact and still guarded, just by the other
+        // assertions in this test: the frozen status colour is off the chip and
+        // the WAITING badge is gone. Those were always the loud channels; the
+        // border was the quiet one.
         assert_eq!(
             buf.cell((2, title_y)).expect("a corner").symbol(),
-            "┌",
-            "a stale cell still draws the attention border"
+            "┏",
+            "a remote cell lost its weight when it went stale — it is still remote"
+        );
+        assert_ne!(
+            fg_at(&buf, 2, title_y),
+            BARN_RED,
+            "a stale cell kept the live barn red"
         );
     }
 
