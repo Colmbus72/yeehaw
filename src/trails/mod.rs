@@ -19,7 +19,15 @@ pub struct Trail {
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
     pub jobs: BTreeMap<String, TrailJob>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
+
+crate::impl_identified!(Trail);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrailTrigger {

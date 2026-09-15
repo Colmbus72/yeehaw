@@ -724,10 +724,7 @@ mod tests {
             port: None,
             identity_file: None,
             critters: vec![],
-            source: None,
-            connection_type: None,
-            connection_config: None,
-            connectable: None,
+            ..Default::default()
         }
     }
 

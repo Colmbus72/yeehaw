@@ -121,6 +121,23 @@ impl BarnContextView {
             connection_type: original.connection_type.clone(),
             connection_config: original.connection_config.clone(),
             connectable: original.connectable,
+            // Carried, every one of them, and deliberately NOT
+            // `..Default::default()`. This is an edit of an existing barn: a
+            // default here is not a default, it is a deletion. Dropping the
+            // identity would make the save look like a delete plus a create to
+            // anything that syncs on the uuid; dropping `brand` would revoke the
+            // barn's key from every `authorized_keys` the Ranch House manages;
+            // dropping `is_ranch_house` would leave the ranch with no house.
+            // Editing a host must not do any of that.
+            synced: original.synced,
+            brand: original.brand.clone(),
+            is_ranch_house: original.is_ranch_house,
+            tunnel_port: original.tunnel_port,
+            last_seen: original.last_seen.clone(),
+            addresses: original.addresses.clone(),
+            id: original.id.clone(),
+            created_at: original.created_at.clone(),
+            updated_at: original.updated_at.clone(),
         }
     }
 
@@ -458,5 +475,53 @@ impl BarnContextView {
         let hints = Paragraph::new(hint_text)
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(hints, chunks[5]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Editing a barn's host must not revoke its ranch membership.
+    ///
+    /// `build_updated` rebuilds the whole struct from a literal, and the six
+    /// Slice D fields are not among the ones the form edits — so the only way
+    /// they survive is by being carried explicitly. The tempting shortening,
+    /// `..Default::default()`, is a silent `brand: None` / `is_ranch_house: None`
+    /// on every host edit: the barn's key would vanish from every
+    /// `authorized_keys` the Ranch House manages, and a ranch could lose its
+    /// house to someone fixing a typo in an IP address.
+    #[test]
+    fn editing_a_host_preserves_the_barns_ranch_fields() {
+        let original = Barn {
+            name: "pi".into(),
+            host: Some("10.0.0.2".into()),
+            synced: Some(true),
+            brand: Some("ssh-ed25519 AAAAC3Nz yeehaw-ranch-pi".into()),
+            is_ranch_house: Some(true),
+            tunnel_port: Some(2222),
+            last_seen: Some("2026-09-10T09:00:00+00:00".into()),
+            addresses: vec!["pi.local".into(), "100.64.0.3".into()],
+            id: Some("3f0c1e8a-5f2b-4a55-9a3d-6d1c2b7e4f01".into()),
+            ..Default::default()
+        };
+
+        let mut view = BarnContextView::new();
+        view.start_edit(&original);
+        view.edit_host = "10.0.0.9".into();
+        let updated = view.build_updated(&original);
+
+        assert_eq!(updated.host.as_deref(), Some("10.0.0.9"), "the edit must land");
+
+        assert_eq!(updated.synced, original.synced);
+        assert_eq!(updated.brand, original.brand, "a host edit must not revoke the barn's key");
+        assert_eq!(
+            updated.is_ranch_house, original.is_ranch_house,
+            "a host edit must not unseat the ranch house"
+        );
+        assert_eq!(updated.tunnel_port, original.tunnel_port);
+        assert_eq!(updated.last_seen, original.last_seen);
+        assert_eq!(updated.addresses, original.addresses);
+        assert_eq!(updated.id, original.id, "and the identity, as before");
     }
 }

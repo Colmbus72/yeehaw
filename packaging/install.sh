@@ -21,7 +21,11 @@ have() { command -v "$1" >/dev/null 2>&1; }
 kernel="$(uname -s)"
 case "$kernel" in
   Darwin) os_slug="apple-darwin" ;;
-  Linux)  os_slug="unknown-linux-gnu" ;;
+  # musl, not gnu: the published Linux builds are statically linked so they run
+  # on any glibc vintage. A gnu build refuses to start on a machine older than
+  # the one that built it, which for a fleet of mixed-age boxes is the common
+  # case, not the edge case.
+  Linux)  os_slug="unknown-linux-musl" ;;
   *)      err "unsupported OS: $kernel (supported: macOS, Linux)" ;;
 esac
 

@@ -45,6 +45,17 @@ pub fn install_hook_script() -> anyhow::Result<PathBuf> {
     }
 
     let path = hook_script_path();
+    // Note the ordering rule this does *not* follow. The correct sequence for a
+    // file that must be executable the instant it is reachable is: write a temp
+    // file, chmod the temp file, then rename it into place — the mode travels
+    // with the inode, so the name never resolves to a non-executable script.
+    // Chmod-after-publish (either shape: `write` then chmod, as here, or rename
+    // then chmod) leaves a window where the script exists and is not yet 0755.
+    //
+    // Left as-is deliberately: this is reachable only from the one-shot
+    // `yeehaw hooks install` command, where nothing is racing the write.
+    // `store::write_atomic_with_mode` is the helper to reach for if that ever
+    // stops being true.
     fs::write(&path, HOOK_SCRIPT_CONTENT)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
 
@@ -86,7 +97,14 @@ pub fn install_skill() -> anyhow::Result<PathBuf> {
     }
 
     let path = skills_dir.join("yeehaw-project-setup.skill");
-    fs::write(&path, SKILL_BYTES)?;
+    // Temp-and-rename, not a bare write. `ensure_config_dirs()` calls this only
+    // when the file is absent — it is guarded by `skill_installed()`, an
+    // existence check — so in practice it runs on a fresh ranch or an explicit
+    // `yeehaw skills install`, not on every load. The rename still earns its
+    // keep: two processes hitting that first run at once would otherwise have
+    // one truncate-in-place while the other's `read_skill_markdown` unzips the
+    // same path, handing it a corrupt archive.
+    crate::store::write_atomic_bytes(&path, SKILL_BYTES)?;
     Ok(path)
 }
 

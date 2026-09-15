@@ -18,6 +18,22 @@ pub enum GridScope {
 }
 
 impl GridScope {
+    /// The scope for pressing `v` on a barn row.
+    ///
+    /// The name is canonicalised, because adoption leaves the barns list with
+    /// two rows meaning the same machine: the synthetic `local` and the real
+    /// barn `adopt_this_machine` persisted. Windows for work that runs here are
+    /// tagged `local` on both sides of the migration, so the real name has to
+    /// collapse to the alias or `v` on that row shows an empty grid.
+    ///
+    /// Canonicalising here rather than inside [`GridScope::matches`] is
+    /// deliberate: matching stays a pure comparison of two tags, with no config
+    /// read on the render path and none of the ambiguity that would come from
+    /// resolving a *remote* barn's `local` tag against this machine's name.
+    pub fn for_barn(name: &str) -> GridScope {
+        GridScope::Barn(crate::config::canonical_barn_name(name))
+    }
+
     fn title(&self) -> String {
         match self {
             GridScope::All => "ALL SESSIONS".to_string(),
@@ -115,7 +131,7 @@ const STALE_NOTE: Color = Color::Rgb(190, 90, 80);
 
 /// The window types the filter can toggle. Order here is the order shown in the
 /// filter panel.
-pub const WINDOW_TYPES: &[&str] = &["claude", "shell", "ssh", "worm", "slack"];
+pub const WINDOW_TYPES: &[&str] = &["claude", "shell", "ssh", "worm"];
 
 const CLAUDE: &str = "claude";
 /// Bucket for windows created before scope tagging existed.
@@ -1434,6 +1450,48 @@ mod tests {
         assert_eq!(visible[0].index, 1);
     }
 
+    /// Adoption gives this machine a second name, so the barns list ends up
+    /// with two rows meaning the same machine — the synthetic `local` and the
+    /// real one. Pressing `v` on either has to reach the same sessions, and the
+    /// tag they carry is `local`.
+    #[test]
+    fn both_names_for_this_machine_scope_to_the_same_sessions() {
+        let _ranch = crate::testing::temp_ranch();
+        let windows = vec![
+            win(1, "claude", "P", "local"),
+            win(2, "ssh", "P", "pi"),
+        ];
+
+        let visible = |scope: GridScope| -> Vec<u32> {
+            SessionGridView::new(scope)
+                .visible(&windows)
+                .iter()
+                .map(|w| w.index)
+                .collect()
+        };
+
+        assert_eq!(visible(GridScope::for_barn("local")), vec![1]);
+        assert_eq!(visible(GridScope::for_barn("pi")), vec![2]);
+
+        crate::migrate::adopt_this_machine("imac").unwrap();
+
+        assert_eq!(
+            visible(GridScope::for_barn("imac")),
+            vec![1],
+            "the machine's real name must reach its own sessions"
+        );
+        assert_eq!(
+            visible(GridScope::for_barn("local")),
+            vec![1],
+            "and the alias must still reach them"
+        );
+        assert_eq!(
+            visible(GridScope::for_barn("pi")),
+            vec![2],
+            "a real remote barn is untouched by adoption"
+        );
+    }
+
     #[test]
     fn barn_scope_filters_by_barn_tag() {
         let v = SessionGridView::new(GridScope::Barn("local".to_string()));
@@ -1619,6 +1677,29 @@ mod tests {
     }
 
     /// The same, with some of the barns' streams dead.
+    ///
+    /// Renders against a temp ranch. `render_cell` reads each *local* pane's
+    /// status from `signals_dir()`, so without one every render here would
+    /// answer from whatever happens to be in the developer's real
+    /// `~/.yeehaw/session-signals` — different results on different machines.
+    /// Remote signals are the in-memory ones on `RemoteFrame`, untouched by
+    /// this.
+    ///
+    /// CONSTRAINT: this helper owns that ranch. It establishes a *fresh, empty*
+    /// temp ranch for the duration of the draw and drops it on return, so a
+    /// caller's own `testing::temp_ranch()` is shadowed for exactly the call
+    /// that matters. A test shaped like
+    ///
+    /// ```ignore
+    /// let ranch = testing::temp_ranch();
+    /// seed_signal(&ranch, "%1", "working");   // written to the caller's ranch
+    /// let buf = render_buffer(&v, &windows, &remote, 120, 40);
+    /// ```
+    ///
+    /// will not see that signal: the render reads the helper's empty ranch, and
+    /// the test then quietly asserts the *opposite* of what it appears to. Any
+    /// test that needs to seed local signal files must render through a helper
+    /// that takes the ranch instead of making its own.
     fn render_buffer_stale(
         v: &SessionGridView,
         windows: &[TmuxWindow],
@@ -1627,6 +1708,7 @@ mod tests {
         w: u16,
         h: u16,
     ) -> ratatui::buffer::Buffer {
+        let _ranch = crate::testing::temp_ranch();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
             .expect("test terminal");
         terminal
@@ -2489,6 +2571,20 @@ mod tests {
         text
     }
 
+    /// Presses of `j` that land the filter cursor on the `n`th source row —
+    /// `local` is 0, then the barns alphabetically.
+    ///
+    /// The panel's rows are the window types, then `untagged`, then the sources,
+    /// and the cursor opens on row zero. Derived from `WINDOW_TYPES` rather than
+    /// written out because the length of that list is not what any of these tests
+    /// is about: removing one window type moved four hardcoded cursors onto the
+    /// wrong row at once, and what each of those tests then did was press `space`
+    /// on a row it never meant to touch. Callers still assert off the rendered
+    /// panel which row they actually landed on — this only keeps them aimed.
+    fn js_to_source_row(n: usize) -> usize {
+        WINDOW_TYPES.len() + 1 + n
+    }
+
     /// Everything painted on the grid, cells and header alike.
     fn screen(
         v: &SessionGridView,
@@ -2627,11 +2723,11 @@ mod tests {
         seed_captures(&mut v, &local, &["LOCAL-SCREEN"]);
         let remote = two_barns();
 
-        // Rows are the six types, then `local`, then the barns alphabetically,
-        // so zulu is the ninth. Which row the cursor actually landed on is
-        // asserted off the panel rather than counted on.
+        // Rows are the window types, then `untagged`, then `local`, then the
+        // barns alphabetically — see `js_to_source_row`. Which row the cursor
+        // actually landed on is asserted off the panel rather than counted on.
         v.handle_input(KeyCode::Char('f'), &local, &remote);
-        for _ in 0..8 {
+        for _ in 0..js_to_source_row(2) {
             v.handle_input(KeyCode::Char('j'), &local, &remote);
         }
         let panel = filter_panel(&render_buffer(&v, &local, &remote, 120, 40), 2, 120, 40);
@@ -2663,7 +2759,7 @@ mod tests {
         let remote = two_barns();
 
         v.handle_input(KeyCode::Char('f'), &local, &remote);
-        for _ in 0..6 {
+        for _ in 0..js_to_source_row(0) {
             v.handle_input(KeyCode::Char('j'), &local, &remote);
         }
         let panel = filter_panel(&render_buffer(&v, &local, &remote, 120, 40), 2, 120, 40);
@@ -2718,7 +2814,7 @@ mod tests {
         let remote = two_barns();
 
         v.handle_input(KeyCode::Char('f'), &local, &remote);
-        for _ in 0..8 {
+        for _ in 0..js_to_source_row(2) {
             v.handle_input(KeyCode::Char('j'), &local, &remote);
         }
         let panel = filter_panel(&render_buffer(&v, &local, &remote, 120, 40), 2, 120, 40);
@@ -2760,7 +2856,7 @@ mod tests {
         let remote = two_barns();
 
         v.handle_input(KeyCode::Char('f'), &local, &remote);
-        for _ in 0..6 {
+        for _ in 0..js_to_source_row(0) {
             v.handle_input(KeyCode::Char('j'), &local, &remote);
         }
         v.handle_input(KeyCode::Char(' '), &local, &remote);

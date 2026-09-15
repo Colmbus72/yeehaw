@@ -684,12 +684,20 @@ pub fn update_status_bar(project_name: Option<&str>) {
         .output();
 }
 
-pub fn set_window_type_pub(window_index: u32, window_type: &str) {
-    set_window_type(window_index, window_type);
-}
-
 fn set_window_type(window_index: u32, window_type: &str) {
     set_window_option(window_index, "@yeehaw_type", window_type);
+}
+
+/// The `@yeehaw_barn` value for a window whose work points at `barn`.
+///
+/// `None` — which is what [`config::resolve_livestock_barn`] answers for a
+/// livestock on this machine — tags `local`. That spelling is deliberately
+/// *not* the machine's real barn name after adoption: it is the tag that stays
+/// the same on both sides of the migration, so windows opened before it keep
+/// matching the ones opened after and the grid does not split one machine's
+/// sessions in two.
+pub(crate) fn window_barn_tag(barn: Option<&str>) -> &str {
+    barn.filter(|b| !b.is_empty()).unwrap_or(config::LOCAL_BARN_NAME)
 }
 
 /// Tag a window with the project and barn it belongs to, so the session grid can
@@ -700,8 +708,7 @@ pub fn set_window_scope(window_index: u32, project: &str, barn: Option<&str>) {
     if !project.is_empty() {
         set_window_option(window_index, "@yeehaw_project", project);
     }
-    let barn = barn.filter(|b| !b.is_empty()).unwrap_or(config::LOCAL_BARN_NAME);
-    set_window_option(window_index, "@yeehaw_barn", barn);
+    set_window_option(window_index, "@yeehaw_barn", window_barn_tag(barn));
 }
 
 fn set_window_option(window_index: u32, option: &str, value: &str) {
@@ -1266,6 +1273,50 @@ mod tests {
         fields.join("\t")
     }
 
+    fn livestock_on(barn: Option<&str>) -> crate::types::Livestock {
+        crate::types::Livestock {
+            name: "web".into(),
+            path: "/tmp/web".into(),
+            barn: barn.map(str::to_string),
+            repo: None,
+            branch: None,
+            log_path: None,
+            env_path: None,
+            source: None,
+            k8s_metadata: None,
+            trails: vec![],
+        }
+    }
+
+    /// The tag the session grid filters on. `local` is the spelling that is
+    /// stable across adoption: a window opened before `adopt_this_machine` ran
+    /// and one opened after must carry the same tag, or the grid splits one
+    /// machine's sessions across two cells and a `local` filter loses half of
+    /// them. Tagging with the machine's real name instead would also silently
+    /// orphan every window already open when the migration ran.
+    #[test]
+    fn a_window_for_a_livestock_here_is_tagged_local_on_both_sides_of_adoption() {
+        let _ranch = crate::testing::temp_ranch();
+
+        fn tag(ls: &crate::types::Livestock) -> String {
+            window_barn_tag(config::resolve_livestock_barn(ls)).to_string()
+        }
+
+        assert_eq!(tag(&livestock_on(None)), "local");
+        assert_eq!(tag(&livestock_on(Some("local"))), "local");
+        assert_eq!(tag(&livestock_on(Some("pi"))), "pi");
+
+        crate::migrate::adopt_this_machine("imac").unwrap();
+
+        assert_eq!(
+            tag(&livestock_on(Some("imac"))),
+            "local",
+            "adoption must not retag this machine's windows"
+        );
+        assert_eq!(tag(&livestock_on(None)), "local");
+        assert_eq!(tag(&livestock_on(Some("pi"))), "pi");
+    }
+
     #[test]
     fn parses_a_fully_tagged_window() {
         let w = parse_window_line(&line(&[
@@ -1489,10 +1540,7 @@ mod tests {
             port: Some(2222),
             identity_file: None,
             critters: vec![],
-            source: None,
-            connection_type: None,
-            connection_config: None,
-            connectable: None,
+            ..Default::default()
         }
     }
 

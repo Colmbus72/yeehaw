@@ -37,10 +37,20 @@ enum FilterField {
     Sort,
 }
 
+#[derive(Debug)]
 pub enum IssuesAction {
     None,
     Back,
     OpenClaude(String), // context string for claude
+    /// The view saved the project and is handing back the saved copy.
+    ///
+    /// The view is given a `&Project` and has to clone it to save it, and
+    /// `save_project` stamps the *clone*. Dropping that clone leaves the view's
+    /// snapshot — the one `go_back` carries to the project view — without the
+    /// identity that just landed on disk, so the next edit mints a second uuid
+    /// over the first. Handing the stamped copy back is how every other view
+    /// signals a write; the app reloads and refreshes the snapshot.
+    ProjectUpdated(Project),
 }
 
 pub struct IssuesView {
@@ -339,10 +349,18 @@ impl IssuesView {
                         team_id: Some(team_id.clone()),
                         team_name: Some(team_name),
                     });
-                    let _ = crate::config::save_project(&proj);
+                    let saved = crate::config::save_project(&mut proj).is_ok();
                     // Load issues
                     self.view_state = ViewState::Loading;
                     self.load_linear_issues(&team_id);
+                    if saved {
+                        // `save_project` stamped `proj`, not the caller's
+                        // `project`. Dropping it here would leave the view — and
+                        // `go_back` after it — holding a snapshot with no id,
+                        // and the next save would mint a second uuid over the
+                        // one that just reached the file.
+                        return IssuesAction::ProjectUpdated(proj);
+                    }
                 }
             }
             _ => {}
@@ -923,4 +941,81 @@ fn build_issue_context(project: &Project, issue: &Issue) -> String {
         }
     }
     ctx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unstamped_project(name: &str) -> Project {
+        Project {
+            name: name.into(),
+            path: format!("/tmp/{name}"),
+            summary: None,
+            color: None,
+            gradient_spread: None,
+            gradient_inverted: None,
+            livestock: vec![],
+            herds: vec![],
+            wiki: vec![],
+            issue_provider: None,
+            wiki_provider: None,
+            // `None` on purpose: this is a project on its first session after
+            // the upgrade that introduced identity, which is exactly the case
+            // the double-mint bug corrupted.
+            id: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// Picking a Linear team writes the project to disk. `save_project` stamps
+    /// the copy it is handed, and this view hands it a clone it then drops — so
+    /// uuid A lands in the file while the view's snapshot stays at `id: None`.
+    /// `go_back` carries that snapshot to the project view, and the next edit
+    /// saves it and mints uuid B over A. The uuid changes twice in one session.
+    ///
+    /// The fix is the pattern every other view already uses: hand the saved
+    /// copy back as an action so the app can refresh its snapshot.
+    #[test]
+    fn choosing_a_team_hands_the_stamped_project_back_to_the_app() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let project = unstamped_project("api");
+
+        let mut view = IssuesView::new();
+        view.view_state = ViewState::SelectTeam;
+        view.teams = vec![LinearTeam {
+            id: "team-1".into(),
+            name: "Core".into(),
+            key: "CORE".into(),
+        }];
+        view.team_select_index = 0;
+
+        let action = view.handle_input(KeyCode::Enter, &project);
+
+        let on_disk = crate::config::load_projects()
+            .into_iter()
+            .find(|p| p.name == "api")
+            .expect("the team choice must have been saved");
+        let id = on_disk.id.clone().expect("the save must have stamped the file");
+
+        match action {
+            IssuesAction::ProjectUpdated(returned) => {
+                assert_eq!(
+                    returned.id.as_ref(),
+                    Some(&id),
+                    "the view must hand back the identity it just wrote, not the stale snapshot"
+                );
+                assert!(
+                    matches!(
+                        returned.issue_provider,
+                        Some(IssueProviderConfig::Linear { .. })
+                    ),
+                    "the returned project must carry the team choice"
+                );
+            }
+            other => panic!("expected the saved project to come back, got {other:?}"),
+        }
+    }
 }

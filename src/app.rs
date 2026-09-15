@@ -35,7 +35,6 @@ use crate::views::trail_view::{TrailView, TrailViewAction};
 use crate::views::vault_view::{VaultView, VaultAction, VaultMode};
 use crate::vault::crypto;
 use crate::trails::provider::TrailProvider;
-use crate::slack::{self, SlackStatus, SlackEvent};
 
 // ============================================================================
 // App State
@@ -89,10 +88,6 @@ pub struct App {
     pub trail_provider: Option<crate::trails::native::NativeProvider>,
     pub trail_run_receiver: Option<tokio::sync::mpsc::Receiver<crate::trails::provider::StepUpdate>>,
     pub trail_run_dir: Option<std::path::PathBuf>,
-
-    // Slack integration
-    pub slack_rx: Option<std::sync::mpsc::Receiver<SlackEvent>>,
-    pub slack_status: SlackStatus,
 
     // Editor request: (content, callback_id) — handled by main loop
     pub pending_editor: Option<PendingEditor>,
@@ -155,8 +150,6 @@ impl App {
             trail_provider: None,
             trail_run_receiver: None,
             trail_run_dir: None,
-            slack_rx: None,
-            slack_status: SlackStatus::default(),
             pending_editor: None,
             claude_splash: None,
             claude_splash_window: None,
@@ -164,14 +157,6 @@ impl App {
             claude_splash_tools: None,
             claude_splash_tick: None,
         }
-    }
-
-    pub fn start_slack(&mut self) {
-        let cfg = config::load_config();
-        if cfg.slack.as_ref().is_some_and(|s| s.enabled) {
-            self.slack_status.enabled = true;
-        }
-        self.slack_rx = slack::start_slack_listener();
     }
 
     pub fn reload(&mut self) {
@@ -477,9 +462,6 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     // Start file watcher
     let watch_rx = watcher::start_watcher(&config::yeehaw_dir());
 
-    // Start Slack listener
-    app.start_slack();
-
     loop {
         // Process file watcher events (non-blocking)
         if let Some(ref rx) = watch_rx {
@@ -495,19 +477,6 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
             }
         }
 
-        // Process Slack events (non-blocking)
-        {
-            let mut slack_events = Vec::new();
-            if let Some(ref rx) = app.slack_rx {
-                while let Ok(event) = rx.try_recv() {
-                    slack_events.push(event);
-                }
-            }
-            for event in slack_events {
-                handle_slack_event(&mut app, event);
-            }
-        }
-
         // Handle pending editor (needs terminal access)
         if let Some(pending) = app.pending_editor.take() {
             // Restore terminal for the editor
@@ -520,7 +489,7 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                 match pending.callback {
                     EditorCallback::UpdateWormCommand(mut worm) => {
                         worm.command = new_content;
-                        if config::save_worm(&worm).is_ok() {
+                        if config::save_worm(&mut worm).is_ok() {
                             let _ = crontab::sync_crontab();
                             app.reload();
                             app.navigate(AppView::Worm { worm });
@@ -787,7 +756,7 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                                 KeyCode::Esc => { app.go_back(); continue; }
                                 KeyCode::Char('v') => {
                                     if let AppView::Barn { ref barn } = app.view {
-                                        let scope = GridScope::Barn(barn.name.clone());
+                                        let scope = GridScope::for_barn(&barn.name);
                                         app.open_session_grid(scope);
                                     }
                                     continue;
@@ -856,6 +825,9 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                                     Err(e) => { app.error = Some(e.to_string()); }
                                 }
                                 app.refresh_windows();
+                            }
+                            IssuesAction::ProjectUpdated(updated) => {
+                                apply_issues_project_update(&mut app, updated);
                             }
                             IssuesAction::None => {}
                         }
@@ -1001,6 +973,13 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
 
 fn handle_global_dashboard_input(app: &mut App, key: KeyCode) {
     let action = app.global_dashboard.handle_input(key, &app.projects, &app.barns, &app.worms, &app.windows);
+    apply_dashboard_action(app, action);
+}
+
+/// The dashboard's side of the loop, split from the keystroke that produced
+/// the action so the effects — which write to the ranch — can be driven
+/// directly from a test.
+fn apply_dashboard_action(app: &mut App, action: DashboardAction) {
     match action {
         DashboardAction::None => {}
         DashboardAction::SelectProject(idx) => {
@@ -1074,7 +1053,7 @@ fn handle_global_dashboard_input(app: &mut App, key: KeyCode) {
             }
         }
         DashboardAction::CreateProject(name, path) => {
-            let project = Project {
+            let mut project = Project {
                 name,
                 path,
                 summary: None,
@@ -1086,8 +1065,14 @@ fn handle_global_dashboard_input(app: &mut App, key: KeyCode) {
                 wiki: vec![],
                 issue_provider: None,
                 wiki_provider: None,
+                id: None,
+                created_at: None,
+                updated_at: None,
             };
-            match config::save_project(&project) {
+            // `create_*`, not `save_*`: a plain save writes over whatever is
+            // at that name, and this struct's empty livestock/herds/wiki plus
+            // a fresh uuid would replace the existing entity outright.
+            match config::create_project(&mut project) {
                 Ok(()) => {
                     app.reload();
                     app.project_view = ProjectContextView::new();
@@ -1097,19 +1082,16 @@ fn handle_global_dashboard_input(app: &mut App, key: KeyCode) {
             }
         }
         DashboardAction::CreateBarn(name, host, user, port, identity_file) => {
-            let barn = Barn {
+            let mut barn = Barn {
                 name,
                 host: Some(host),
                 user: Some(user),
                 port: Some(port),
                 identity_file,
                 critters: vec![],
-                source: None,
-                connection_type: None,
-                connection_config: None,
-                connectable: None,
+                ..Default::default()
             };
-            match config::save_barn(&barn) {
+            match config::create_barn(&mut barn) {
                 Ok(()) => {
                     app.reload();
                     app.barn_view = BarnContextView::new();
@@ -1119,7 +1101,7 @@ fn handle_global_dashboard_input(app: &mut App, key: KeyCode) {
             }
         }
         DashboardAction::CreateWorm(name, command, schedule) => {
-            let worm = Worm {
+            let mut worm = Worm {
                 name,
                 command,
                 schedule,
@@ -1127,8 +1109,11 @@ fn handle_global_dashboard_input(app: &mut App, key: KeyCode) {
                 enabled: true,
                 project: None,
                 working_dir: None,
+                id: None,
+                created_at: None,
+                updated_at: None,
             };
-            match config::save_worm(&worm) {
+            match config::create_worm(&mut worm) {
                 Ok(()) => {
                     let _ = crontab::sync_crontab();
                     app.reload();
@@ -1162,6 +1147,64 @@ fn handle_project_context_input(app: &mut App, key: KeyCode) {
     if let AppView::Project { ref project } = app.view {
         let project = project.clone();
         let action = app.project_view.handle_input(key, &project, &app.barns);
+        apply_project_action(app, project, action);
+    }
+}
+
+/// Replaces the Issues view's project snapshot with the copy the view just
+/// saved.
+///
+/// The view is handed a `&Project`, so it has to clone it to save it, and
+/// `save_project` stamps the clone. Without this the view keeps the pre-save
+/// snapshot — `id: None` on a project being stamped for the first time — and
+/// `go_back` carries that stale copy to the project view, where the next save
+/// mints a *second* uuid over the first.
+fn apply_issues_project_update(app: &mut App, updated: Project) {
+    app.reload();
+    let refreshed = app
+        .projects
+        .iter()
+        .find(|p| p.name == updated.name)
+        .cloned()
+        .unwrap_or(updated);
+    app.view = AppView::Issues { project: refreshed };
+}
+
+/// The barn a livestock's work runs on, or `None` when that is this machine.
+///
+/// The single lookup behind a shell, a log tail, a trail run and a worm-driven
+/// trail, so all four answer adoption the same way. `None` is what every one of
+/// them turns into the local path — an unpinned livestock has always produced
+/// it — which is exactly why the resolved form has to keep producing it once
+/// `adopt_this_machine` has rewritten `barn: None` to this machine's real name.
+///
+/// `source_barn` — the barn the user reached the livestock *through* — still
+/// wins, because that is how a livestock opened from a barn's own list gets
+/// ssh'd into. The one exception is this machine: adoption makes the self-barn
+/// a browsable record with no host, and reaching a local livestock through it
+/// must not turn a local shell into an ssh to nowhere.
+fn barn_for_livestock(
+    livestock: &Livestock,
+    barns: &[Barn],
+    source_barn: Option<&Barn>,
+) -> Option<Barn> {
+    source_barn
+        .filter(|b| !config::barn_is_this_machine(b))
+        .or_else(|| {
+            config::resolve_livestock_barn(livestock)
+                .and_then(|name| barns.iter().find(|b| b.name == name))
+        })
+        .cloned()
+}
+
+/// The project view's side of the loop, split from the keystroke that produced
+/// the action so the effects — which write to the ranch — can be driven
+/// directly from a test.
+///
+/// `project` is the snapshot the view was editing, so its name is the name the
+/// file still carries on disk. `UpdateProject` needs both to move a rename.
+fn apply_project_action(app: &mut App, project: Project, action: ProjectAction) {
+    {
         match action {
             ProjectAction::None => {}
             ProjectAction::SelectLivestock(idx) => {
@@ -1200,7 +1243,7 @@ fn handle_project_context_input(app: &mut App, key: KeyCode) {
                     let ctx = context::build_livestock_context(&project, &ls.name);
                     match tmux::create_claude_window_with_context(&working_dir, &window_name, &ctx) {
                         Ok(idx) => {
-                            tmux::set_window_scope(idx, &project.name, ls.barn.as_deref());
+                            tmux::set_window_scope(idx, &project.name, config::resolve_livestock_barn(ls));
                             let tools: Vec<String> = tmux::YEEHAW_MCP_TOOLS.iter()
                                 .map(|t| t.strip_prefix("mcp__yeehaw__").unwrap_or(t).to_string())
                                 .collect();
@@ -1212,15 +1255,13 @@ fn handle_project_context_input(app: &mut App, key: KeyCode) {
             }
             ProjectAction::OpenShell(ls_idx) => {
                 if let Some(ls) = project.livestock.get(ls_idx) {
-                    let barn = ls.barn.as_ref()
-                        .and_then(|bn| app.barns.iter().find(|b| b.name == *bn))
-                        .cloned();
+                    let barn = barn_for_livestock(ls, &app.barns, None);
                     let window_name = format!("{}-{}", project.name, ls.name);
                     if let Some(barn) = barn {
                         if !config::is_local_barn(&barn) {
                             match tmux::create_ssh_window(&window_name, &barn, &ls.path) {
                                 Ok(idx) => {
-                                    tmux::set_window_scope(idx, &project.name, ls.barn.as_deref());
+                                    tmux::set_window_scope(idx, &project.name, config::resolve_livestock_barn(ls));
                                     tmux::switch_to_window(idx);
                                 }
                                 Err(e) => app.error = Some(format!("SSH failed: {}", e)),
@@ -1230,7 +1271,7 @@ fn handle_project_context_input(app: &mut App, key: KeyCode) {
                     }
                     let working_dir = expand_path(&ls.path);
                     if let Ok(idx) = tmux::create_shell_window(&working_dir, &window_name) {
-                        tmux::set_window_scope(idx, &project.name, ls.barn.as_deref());
+                        tmux::set_window_scope(idx, &project.name, config::resolve_livestock_barn(ls));
                         tmux::switch_to_window(idx);
                     }
                 }
@@ -1285,7 +1326,7 @@ fn handle_project_context_input(app: &mut App, key: KeyCode) {
                     critters: vec![],
                     connections: vec![],
                 });
-                match config::save_project(&updated_project) {
+                match config::save_project(&mut updated_project) {
                     Ok(()) => {
                         app.reload();
                         if let Some(refreshed) = app.projects.iter().find(|p| p.name == updated_project.name).cloned() {
@@ -1298,7 +1339,7 @@ fn handle_project_context_input(app: &mut App, key: KeyCode) {
                 }
             }
             ProjectAction::CreateRanchHand { name, rh_type, herd } => {
-                let rh = RanchHand {
+                let mut rh = RanchHand {
                     name,
                     project: project.name.clone(),
                     rh_type,
@@ -1310,14 +1351,21 @@ fn handle_project_context_input(app: &mut App, key: KeyCode) {
                     herd,
                     resource_mappings: vec![],
                     last_sync: None,
+                    id: None,
+                    created_at: None,
+                    updated_at: None,
                 };
-                match config::save_ranchhand(&rh) {
+                match config::create_ranchhand(&mut rh) {
                     Ok(()) => { app.reload(); }
                     Err(e) => { app.error = Some(format!("Failed to create ranchhand: {}", e)); }
                 }
             }
-            ProjectAction::UpdateProject(updated) => {
-                match config::save_project(&updated) {
+            ProjectAction::UpdateProject(mut updated) => {
+                // `project` is the snapshot the view was editing, so its name
+                // is the name the file still carries. `save_project` alone
+                // would leave that file in place beside the renamed one, both
+                // holding the same uuid.
+                match config::rename_project(&project.name, &mut updated) {
                     Ok(()) => {
                         app.reload();
                         if let Some(refreshed) = app.projects.iter().find(|p| p.name == updated.name).cloned() {
@@ -1397,7 +1445,7 @@ fn handle_barn_context_input(app: &mut App, key: KeyCode) {
                     k8s_metadata: None,
                     tf_metadata: None,
                 });
-                match config::save_barn(&updated_barn) {
+                match config::save_barn(&mut updated_barn) {
                     Ok(()) => {
                         app.reload();
                         let refreshed = app.barns.iter().find(|b| b.name == updated_barn.name).cloned().unwrap_or(updated_barn);
@@ -1430,8 +1478,8 @@ fn handle_barn_context_input(app: &mut App, key: KeyCode) {
             BarnAction::ConnectBarn => {
                 connect_barn(app, &barn);
             }
-            BarnAction::UpdateBarn(updated) => {
-                match config::save_barn(&updated) {
+            BarnAction::UpdateBarn(mut updated) => {
+                match config::save_barn(&mut updated) {
                     Ok(()) => {
                         app.reload();
                         let refreshed_barn = app.barns.iter().find(|b| b.name == updated.name).cloned().unwrap_or(updated);
@@ -1455,7 +1503,7 @@ fn handle_worm_detail_input(app: &mut App, key: KeyCode) {
             WormAction::Toggle => {
                 let mut updated = worm.clone();
                 updated.enabled = !updated.enabled;
-                if config::save_worm(&updated).is_ok() {
+                if config::save_worm(&mut updated).is_ok() {
                     let _ = crontab::sync_crontab();
                     app.reload();
                     app.navigate(AppView::Worm { worm: updated });
@@ -1510,9 +1558,8 @@ fn handle_trail_input(app: &mut App, key: KeyCode) {
             }
             TrailViewAction::RunTrail => {
                 // Find the barn for this livestock (fall back to local barn)
-                let barn = source_barn.as_ref().or_else(|| {
-                    livestock.barn.as_ref().and_then(|bn| app.barns.iter().find(|b| b.name == *bn))
-                }).cloned().unwrap_or_else(config::local_barn);
+                let barn = barn_for_livestock(&livestock, &app.barns, source_barn.as_ref())
+                    .unwrap_or_else(config::local_barn);
 
                 match crate::trails::runner::start_trail(&trail, &livestock, &barn, Some(&project.name)) {
                     Ok((run_dir, rx, provider)) => {
@@ -1551,12 +1598,26 @@ fn handle_livestock_detail_input(app: &mut App, key: KeyCode) {
         let trails_count = trails.len();
 
         let action = app.livestock_view.handle_input(key, &project, &livestock, session_count, trails_count);
+        apply_livestock_action(app, project, livestock, source, source_barn, action);
+    }
+}
+
+/// The livestock view's side of the loop, split from the keystroke that
+/// produced the action so the effects — which write to the ranch — can be
+/// driven directly from a test.
+fn apply_livestock_action(
+    app: &mut App,
+    project: Project,
+    livestock: Livestock,
+    source: String,
+    source_barn: Option<Barn>,
+    action: LivestockAction,
+) {
+    {
         match action {
             LivestockAction::None => {}
             LivestockAction::OpenLogs => {
-                let barn = source_barn.as_ref().or_else(|| {
-                    livestock.barn.as_ref().and_then(|bn| app.barns.iter().find(|b| b.name == *bn))
-                }).cloned();
+                let barn = barn_for_livestock(&livestock, &app.barns, source_barn.as_ref());
                 app.logs_view = Some(LogsView::new(&project, &livestock, barn.as_ref()));
                 app.navigate(AppView::Logs {
                     project: project.clone(),
@@ -1571,7 +1632,7 @@ fn handle_livestock_detail_input(app: &mut App, key: KeyCode) {
                 let ctx = context::build_livestock_context(&project, &livestock.name);
                 match tmux::create_claude_window_with_context(&working_dir, &window_name, &ctx) {
                     Ok(idx) => {
-                        tmux::set_window_scope(idx, &project.name, livestock.barn.as_deref());
+                        tmux::set_window_scope(idx, &project.name, config::resolve_livestock_barn(&livestock));
                         let tools: Vec<String> = tmux::YEEHAW_MCP_TOOLS.iter()
                             .map(|t| t.strip_prefix("mcp__yeehaw__").unwrap_or(t).to_string())
                             .collect();
@@ -1581,15 +1642,13 @@ fn handle_livestock_detail_input(app: &mut App, key: KeyCode) {
                 }
             }
             LivestockAction::OpenShell => {
-                let barn = source_barn.as_ref().or_else(|| {
-                    livestock.barn.as_ref().and_then(|bn| app.barns.iter().find(|b| b.name == *bn))
-                }).cloned();
+                let barn = barn_for_livestock(&livestock, &app.barns, source_barn.as_ref());
                 let window_name = format!("{}-{}", project.name, livestock.name);
                 if let Some(barn) = barn {
                     if !config::is_local_barn(&barn) {
                         match tmux::create_ssh_window(&window_name, &barn, &livestock.path) {
                             Ok(idx) => {
-                                tmux::set_window_scope(idx, &project.name, livestock.barn.as_deref());
+                                tmux::set_window_scope(idx, &project.name, config::resolve_livestock_barn(&livestock));
                                 tmux::switch_to_window(idx);
                             }
                             Err(e) => app.error = Some(format!("SSH failed: {}", e)),
@@ -1599,7 +1658,7 @@ fn handle_livestock_detail_input(app: &mut App, key: KeyCode) {
                 }
                 let working_dir = expand_path(&livestock.path);
                 if let Ok(idx) = tmux::create_shell_window(&working_dir, &window_name) {
-                    tmux::set_window_scope(idx, &project.name, livestock.barn.as_deref());
+                    tmux::set_window_scope(idx, &project.name, config::resolve_livestock_barn(&livestock));
                     tmux::switch_to_window(idx);
                 }
             }
@@ -1666,8 +1725,12 @@ fn handle_livestock_detail_input(app: &mut App, key: KeyCode) {
                     }
                 }
             }
-            LivestockAction::SaveNewTrail(trail) => {
-                match config::save_trail(&trail) {
+            LivestockAction::SaveNewTrail(mut trail) => {
+                // `create_trail`, not `save_trail`: the name comes straight
+                // from a text field, and this `Trail` was built fresh with no
+                // id. A plain save on a name already in use replaces that trail
+                // outright and mints a new uuid over its old one.
+                match config::create_trail(&mut trail) {
                     Ok(()) => {
                         match config::link_trail_to_livestock(&project.name, &livestock.name, &trail.name) {
                             Ok(()) => {
@@ -2356,7 +2419,7 @@ fn render_view(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
     let items = get_bottom_bar_items(&app.view);
-    let mut spans: Vec<Span> = items
+    let spans: Vec<Span> = items
         .iter()
         .flat_map(|(key, label)| {
             vec![
@@ -2371,29 +2434,6 @@ fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
             ]
         })
         .collect();
-
-    // Slack status indicator (right-aligned)
-    if app.slack_status.enabled {
-        let slack_text = if app.slack_status.connected {
-            if app.slack_status.active_runs > 0 {
-                format!(" Slack: {} active ", app.slack_status.active_runs)
-            } else {
-                " Slack: connected ".to_string()
-            }
-        } else {
-            " Slack: disconnected ".to_string()
-        };
-        let slack_color = if app.slack_status.connected {
-            if app.slack_status.active_runs > 0 {
-                Color::Yellow
-            } else {
-                Color::Green
-            }
-        } else {
-            Color::Red
-        };
-        spans.push(Span::styled(slack_text, Style::default().fg(slack_color)));
-    }
 
     let bar = ratatui::widgets::Paragraph::new(Line::from(spans))
         .style(Style::default().bg(Color::Rgb(30, 30, 30)));
@@ -2503,6 +2543,9 @@ fn trigger_worm(error: &mut Option<String>, worm: &Worm) {
         "trigger": "manual"
     });
 
+    // Bare `fs::write`, never `store::write_atomic`: the watcher would consume
+    // and delete the temp file before the rename could publish it. See the
+    // invariant on `config::worm_triggers_dir()`.
     match std::fs::write(&trigger_path, trigger.to_string()) {
         Ok(()) => {}
         Err(e) => {
@@ -2559,8 +2602,7 @@ fn handle_worm_trigger(app: &mut App, filename: &str) {
             for project in &projects {
                 if let Some(ls) = project.livestock.iter().find(|l| l.name == livestock_name) {
                     if let Some(trail) = config::load_trail(trail_name) {
-                        let barn = ls.barn.as_ref()
-                            .and_then(|bn| config::load_barns().into_iter().find(|b| &b.name == bn))
+                        let barn = barn_for_livestock(ls, &config::load_barns(), None)
                             .unwrap_or_else(config::local_barn);
                         let proj_name = project_name_str.as_deref().unwrap_or(&project.name);
                         match crate::trails::runner::start_trail(&trail, ls, &barn, Some(proj_name)) {
@@ -2641,29 +2683,6 @@ fn handle_worm_trigger(app: &mut App, filename: &str) {
     }
 }
 
-fn handle_slack_event(app: &mut App, event: SlackEvent) {
-    match event {
-        SlackEvent::Connected => {
-            app.slack_status.connected = true;
-            app.slack_status.last_error = None;
-        }
-        SlackEvent::Disconnected => {
-            app.slack_status.connected = false;
-        }
-        SlackEvent::RunStarted { .. } => {
-            app.slack_status.active_runs += 1;
-        }
-        SlackEvent::RunCompleted { .. } => {
-            app.slack_status.active_runs = app.slack_status.active_runs.saturating_sub(1);
-            // Refresh windows since slack creates tmux windows
-            app.refresh_windows();
-        }
-        SlackEvent::Error(msg) => {
-            app.slack_status.last_error = Some(msg);
-        }
-    }
-}
-
 fn expand_path(path: &str) -> String {
     if path.starts_with("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -2687,6 +2706,11 @@ mod tests {
     };
     use std::cell::RefCell;
 
+    // `App::new` loads the ranch — `ensure_config_dirs` creates directories and
+    // `load_projects` reads them — so tests that build one open a temp ranch
+    // (`let _ranch = ...`) instead of touching the developer's real `~/.yeehaw`.
+    // The guard has to be a binding: it holds only until it drops.
+
     fn barn(name: &str) -> Barn {
         Barn {
             name: name.into(),
@@ -2695,10 +2719,7 @@ mod tests {
             port: None,
             identity_file: None,
             critters: vec![],
-            source: None,
-            connection_type: None,
-            connection_config: None,
-            connectable: None,
+            ..Default::default()
         }
     }
 
@@ -2913,6 +2934,7 @@ mod tests {
 
     #[test]
     fn navigating_off_the_grid_shuts_the_streams_down_through_the_real_app() {
+        let _ranch = crate::testing::temp_ranch();
         // The seam above is only worth anything if `navigate` calls it, and
         // `navigate` is the one place `App.view` is ever assigned — which is
         // what makes it cover the two routes that never touch `go_back`.
@@ -3040,6 +3062,7 @@ mod tests {
 
     #[test]
     fn opening_the_grid_reconciles_without_waiting_for_the_first_tick() {
+        let _ranch = crate::testing::temp_ranch();
         // Otherwise every remote cell is a quarter second late for nothing, and
         // the slow part — ssh connecting and `bash -l` sourcing a profile — has
         // not even begun.
@@ -3145,6 +3168,7 @@ mod tests {
 
     #[test]
     fn a_jump_to_a_barn_selects_on_the_barn_before_switching_locally() {
+        let _ranch = crate::testing::temp_ranch();
         // The order *is* the design. Switching first attaches to whatever window
         // the barn had selected and corrects it an ssh round trip later, so the
         // user watches the wrong session for 70-180ms every single jump.
@@ -3157,6 +3181,7 @@ mod tests {
 
     #[test]
     fn a_local_jump_switches_locally_and_never_reaches_a_barn() {
+        let _ranch = crate::testing::temp_ranch();
         // The unchanged path, asserted with a barn on the ranch so a jump that
         // wandered into the remote branch has somewhere to wander to.
         let mut app = ranch(&["guided"]);
@@ -3168,6 +3193,7 @@ mod tests {
 
     #[test]
     fn a_jump_to_a_barn_that_vanished_reports_an_error_rather_than_connecting() {
+        let _ranch = crate::testing::temp_ranch();
         // A frame outlives the config entry it came from: delete a barn while
         // its cells are on screen and the numbers stay drawn. Connecting to
         // *something* here means the number under the user's finger silently
@@ -3186,6 +3212,7 @@ mod tests {
 
     #[test]
     fn a_failed_remote_select_reports_the_error_and_does_not_connect() {
+        let _ranch = crate::testing::temp_ranch();
         // Connecting anyway lands the user on whatever the barn had selected —
         // the flash of the wrong session this ordering exists to prevent, made
         // permanent and silent.
@@ -3205,6 +3232,7 @@ mod tests {
 
     #[test]
     fn a_failed_connect_after_a_good_select_surfaces_the_whole_context_chain() {
+        let _ranch = crate::testing::temp_ranch();
         // `{:#}`, the same as `connect_barn`. Plain Display prints only the
         // outermost layer, and the layer that says what actually went wrong is
         // underneath it — this banner is the only place the user ever sees it.
@@ -3220,6 +3248,7 @@ mod tests {
 
     #[test]
     fn the_grid_is_drawn_with_the_registry_s_stale_barns_not_an_empty_set() {
+        let _ranch = crate::testing::temp_ranch();
         // The one seam between the registry that knows a stream died and the
         // view that draws it. Everything either side of this call is covered —
         // `stale()` by the registry's tests, the badge and the header note by
@@ -3250,6 +3279,7 @@ mod tests {
 
     #[test]
     fn a_jump_to_a_stale_barn_skips_the_blocking_remote_select() {
+        let _ranch = crate::testing::temp_ranch();
         // The whole reason a stale cell keeps its number, and the one thing that
         // makes keeping it affordable. `select_remote` is a blocking ssh exec:
         // ~70-180ms over a warm ControlMaster, but ssh's full ConnectTimeout —
@@ -3276,6 +3306,7 @@ mod tests {
 
     #[test]
     fn a_stale_jump_is_not_the_silent_no_op_it_would_be_easiest_to_ship() {
+        let _ranch = crate::testing::temp_ranch();
         // The alternative — ignore the key — leaves a cell wearing a number that
         // does nothing, which is the failure that pulled the remote jump forward
         // a task. A stale number still takes you to that barn; only the remote
@@ -3304,6 +3335,7 @@ mod tests {
 
     #[test]
     fn only_the_stale_barn_loses_its_remote_select() {
+        let _ranch = crate::testing::temp_ranch();
         // Staleness is per barn, like everything else about the merge. One dead
         // barn must not cost the healthy one beside it the window it was aimed
         // at.
@@ -3320,6 +3352,7 @@ mod tests {
 
     #[test]
     fn a_local_jump_is_untouched_by_a_stale_barn() {
+        let _ranch = crate::testing::temp_ranch();
         let mut app = ranch(&["guided"]);
         mark_failed(&mut app.remote_grid, "guided", "the stream to 'guided' ended");
 
@@ -3329,6 +3362,7 @@ mod tests {
 
     #[test]
     fn a_jump_finds_its_barn_by_exact_name_not_by_prefix() {
+        let _ranch = crate::testing::temp_ranch();
         // `guided` and `guided-2` are different production hosts, and the same
         // hazard the `=` in every tmux target guards. A `starts_with` here sends
         // the user to whichever one the config listed first.
@@ -3363,6 +3397,7 @@ mod tests {
 
     #[test]
     fn help_on_the_grid_is_the_grids_own_help_and_not_the_generic_one() {
+        let _ranch = crate::testing::temp_ranch();
         // `?` opens the overlay from the grid — it is not an input-mode view —
         // and the grid used to fall through this match to "general", which lists
         // `Esc` under a navigation block none of whose keys the grid answers.
@@ -3389,8 +3424,447 @@ mod tests {
         );
     }
 
+    // === identity across renames and creates ==============================
+
+    fn livestock_on(barn: Option<&str>) -> Livestock {
+        Livestock {
+            name: "web".into(),
+            path: "/tmp/web".into(),
+            barn: barn.map(str::to_string),
+            repo: None,
+            branch: None,
+            log_path: None,
+            env_path: None,
+            source: None,
+            k8s_metadata: None,
+            trails: vec![],
+        }
+    }
+
+    /// Every barn lookup behind a shell, a log tail, a trail run and a worm
+    /// trigger goes through this. `None` is what routes the work to the local
+    /// path, so an adopted machine answering `Some(self-barn)` here is an ssh
+    /// attempt at a barn record with no host.
+    #[test]
+    fn a_livestock_on_this_machine_has_no_barn_before_or_after_adoption() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut imac = barn("imac");
+        imac.host = None;
+        let barns = vec![config::local_barn(), imac, barn("pi")];
+
+        assert!(barn_for_livestock(&livestock_on(None), &barns, None).is_none());
+        assert!(barn_for_livestock(&livestock_on(Some("local")), &barns, None).is_none());
+        assert_eq!(
+            barn_for_livestock(&livestock_on(Some("pi")), &barns, None).map(|b| b.name),
+            Some("pi".to_string())
+        );
+
+        crate::migrate::adopt_this_machine("imac").unwrap();
+
+        assert!(
+            barn_for_livestock(&livestock_on(Some("imac")), &barns, None).is_none(),
+            "adoption renamed this machine's livestock; it did not move it"
+        );
+        assert!(barn_for_livestock(&livestock_on(None), &barns, None).is_none());
+        assert!(barn_for_livestock(&livestock_on(Some("local")), &barns, None).is_none());
+        assert_eq!(
+            barn_for_livestock(&livestock_on(Some("pi")), &barns, None).map(|b| b.name),
+            Some("pi".to_string()),
+            "a real remote barn is untouched by adoption"
+        );
+    }
+
+    /// The barn the user reached the livestock *through* still wins — that is
+    /// how a livestock opened from a barn's own list gets ssh'd into. But
+    /// adoption creates a browsable barn record for this machine, and reaching
+    /// a local livestock through it must not turn a local shell into an ssh to
+    /// a hostless barn.
+    #[test]
+    fn the_barn_a_livestock_was_reached_through_wins_unless_it_is_this_machine() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut imac = barn("imac");
+        imac.host = None;
+        let barns = vec![config::local_barn(), imac.clone(), barn("pi")];
+
+        assert_eq!(
+            barn_for_livestock(&livestock_on(None), &barns, Some(&barn("pi"))).map(|b| b.name),
+            Some("pi".to_string()),
+            "the source barn wins over the livestock's own"
+        );
+        assert!(
+            barn_for_livestock(&livestock_on(None), &barns, Some(&config::local_barn())).is_none(),
+            "the synthetic local barn is this machine, not a destination"
+        );
+
+        crate::migrate::adopt_this_machine("imac").unwrap();
+
+        assert!(
+            barn_for_livestock(&livestock_on(Some("imac")), &barns, Some(&imac)).is_none(),
+            "the adopted self-barn is this machine too"
+        );
+        assert_eq!(
+            barn_for_livestock(&livestock_on(Some("imac")), &barns, Some(&barn("pi"))).map(|b| b.name),
+            Some("pi".to_string()),
+            "a real barn reached through still wins"
+        );
+    }
+
+    fn test_project(name: &str) -> Project {
+        Project {
+            name: name.into(),
+            path: format!("/tmp/{name}"),
+            summary: None,
+            color: None,
+            gradient_spread: None,
+            gradient_inverted: None,
+            livestock: vec![],
+            herds: vec![],
+            wiki: vec![],
+            issue_provider: None,
+            wiki_provider: None,
+            id: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn project_file_names() -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(config::projects_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".yaml"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// `save_project` writes to `projects/<name>.yaml`. Renaming a project in
+    /// the project view and saving it therefore left the *old* file in place
+    /// beside the new one, both carrying the same uuid — one identity on two
+    /// files, which no uuid-keyed merge can resolve.
+    #[test]
+    fn renaming_a_project_in_the_project_view_removes_the_old_file() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let mut original = test_project("api");
+        config::save_project(&mut original).unwrap();
+        let id = original.id.clone().unwrap();
+
+        let mut app = App::new();
+        app.view = AppView::Project { project: original.clone() };
+
+        let mut renamed = original.clone();
+        renamed.name = "gateway".into();
+        apply_project_action(&mut app, original.clone(), ProjectAction::UpdateProject(renamed));
+
+        assert_eq!(app.error, None, "the rename must succeed");
+        assert_eq!(
+            project_file_names(),
+            vec!["gateway.yaml".to_string()],
+            "the old file must not survive the rename"
+        );
+        let loaded = config::load_projects();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].id.as_ref(),
+            Some(&id),
+            "a rename keeps the uuid — that is what distinguishes it from a delete plus a create"
+        );
+    }
+
+    /// The rename must not be able to swallow a different project that happens
+    /// to hold the destination name.
+    #[test]
+    fn renaming_a_project_onto_an_existing_one_is_refused_in_the_view() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let mut api = test_project("api");
+        config::save_project(&mut api).unwrap();
+        let mut gateway = test_project("gateway");
+        gateway.summary = Some("the real gateway".into());
+        config::save_project(&mut gateway).unwrap();
+        let gateway_id = gateway.id.clone().unwrap();
+
+        let mut app = App::new();
+        app.view = AppView::Project { project: api.clone() };
+
+        let mut renamed = api.clone();
+        renamed.name = "gateway".into();
+        apply_project_action(&mut app, api.clone(), ProjectAction::UpdateProject(renamed));
+
+        assert!(app.error.is_some(), "the collision must be reported, not swallowed");
+        assert_eq!(
+            project_file_names(),
+            vec!["api.yaml".to_string(), "gateway.yaml".to_string()],
+            "both projects must survive"
+        );
+        let survivor = config::load_projects().into_iter().find(|p| p.name == "gateway").unwrap();
+        assert_eq!(survivor.id.as_ref(), Some(&gateway_id));
+        assert_eq!(survivor.summary.as_deref(), Some("the real gateway"));
+    }
+
+    /// An edit that does not touch the name is still an ordinary save, and must
+    /// not delete the file it just wrote.
+    #[test]
+    fn editing_a_project_without_renaming_it_keeps_the_file() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let mut original = test_project("api");
+        config::save_project(&mut original).unwrap();
+        let id = original.id.clone().unwrap();
+
+        let mut app = App::new();
+        app.view = AppView::Project { project: original.clone() };
+
+        let mut edited = original.clone();
+        edited.summary = Some("edited".into());
+        apply_project_action(&mut app, original.clone(), ProjectAction::UpdateProject(edited));
+
+        assert_eq!(app.error, None);
+        assert_eq!(project_file_names(), vec!["api.yaml".to_string()]);
+        let loaded = config::load_projects();
+        assert_eq!(loaded[0].summary.as_deref(), Some("edited"));
+        assert_eq!(loaded[0].id.as_ref(), Some(&id));
+    }
+
+    /// The dashboard's create forms took a name and wrote it, with no check
+    /// that the name was free. A project built by that form has empty
+    /// livestock, herds and wiki and no id, so landing it on an existing entity
+    /// destroyed the content and minted a new uuid over the old one.
+    #[test]
+    fn creating_a_project_that_already_exists_is_refused_from_the_dashboard() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let mut existing = test_project("api");
+        existing.summary = Some("the real one".into());
+        existing.livestock.push(Livestock {
+            name: "web".into(),
+            path: "/tmp/web".into(),
+            barn: None,
+            repo: None,
+            branch: None,
+            log_path: None,
+            env_path: None,
+            source: None,
+            k8s_metadata: None,
+            trails: vec![],
+        });
+        config::save_project(&mut existing).unwrap();
+        let id = existing.id.clone().unwrap();
+
+        let mut app = App::new();
+        apply_dashboard_action(
+            &mut app,
+            DashboardAction::CreateProject("api".into(), "/tmp/elsewhere".into()),
+        );
+
+        assert!(app.error.is_some(), "the collision must be reported");
+        let loaded = config::load_projects();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id.as_ref(), Some(&id), "the uuid must not be re-minted");
+        assert_eq!(loaded[0].livestock.len(), 1, "the livestock must survive");
+        assert_eq!(loaded[0].summary.as_deref(), Some("the real one"));
+    }
+
+    /// The same for the other two dashboard forms. Each writes its own file.
+    ///
+    /// Only the refusal is driven here: the worm form's success path calls
+    /// `crontab::sync_crontab()`, which rewrites the developer's real crontab —
+    /// no temp ranch covers that.
+    #[test]
+    fn creating_a_barn_or_worm_that_already_exists_is_refused_from_the_dashboard() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let mut existing_barn = barn("pi");
+        config::save_barn(&mut existing_barn).unwrap();
+        let barn_id = existing_barn.id.clone().unwrap();
+
+        let mut existing_worm = Worm {
+            name: "nightly".into(),
+            command: "echo original".into(),
+            schedule: "* * * * *".into(),
+            worm_type: "shell".into(),
+            enabled: true,
+            project: None,
+            working_dir: None,
+            id: None,
+            created_at: None,
+            updated_at: None,
+        };
+        config::save_worm(&mut existing_worm).unwrap();
+        let worm_id = existing_worm.id.clone().unwrap();
+
+        let mut app = App::new();
+
+        apply_dashboard_action(
+            &mut app,
+            DashboardAction::CreateBarn("pi".into(), "192.168.0.9".into(), "root".into(), 2222, None),
+        );
+        assert!(app.error.is_some(), "the barn collision must be reported");
+        let reloaded = config::load_barns().into_iter().find(|b| b.name == "pi").unwrap();
+        assert_eq!(reloaded.id.as_ref(), Some(&barn_id), "barn uuid must not be re-minted");
+        assert_eq!(reloaded.host.as_deref(), Some("172.233.141.59"), "barn must not be rewritten");
+
+        app.error = None;
+        apply_dashboard_action(
+            &mut app,
+            DashboardAction::CreateWorm("nightly".into(), "rm -rf /".into(), "0 0 * * *".into()),
+        );
+        assert!(app.error.is_some(), "the worm collision must be reported");
+        let reloaded = config::load_worms().into_iter().find(|w| w.name == "nightly").unwrap();
+        assert_eq!(reloaded.id.as_ref(), Some(&worm_id), "worm uuid must not be re-minted");
+        assert_eq!(reloaded.command, "echo original", "worm must not be rewritten");
+    }
+
+    /// The livestock view's "new trail" form takes a name from a text field and
+    /// wrote it with no check that the name was free — the same clobber as the
+    /// dashboard forms, on a path the create audit had to go looking for.
+    #[test]
+    fn saving_a_new_trail_over_an_existing_one_is_refused_from_the_livestock_view() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let mut existing = crate::trails::Trail {
+            name: "deploy".into(),
+            on: None,
+            env: Some(std::collections::HashMap::from([(
+                "STAGE".to_string(),
+                "prod".to_string(),
+            )])),
+            jobs: Default::default(),
+            id: None,
+            created_at: None,
+            updated_at: None,
+        };
+        config::save_trail(&mut existing).unwrap();
+        let id = existing.id.clone().unwrap();
+
+        let project = test_project("api");
+        let livestock = Livestock {
+            name: "web".into(),
+            path: "/tmp/web".into(),
+            barn: None,
+            repo: None,
+            branch: None,
+            log_path: None,
+            env_path: None,
+            source: None,
+            k8s_metadata: None,
+            trails: vec![],
+        };
+
+        let intruder = crate::trails::Trail {
+            name: "deploy".into(),
+            on: None,
+            env: None,
+            jobs: Default::default(),
+            id: None,
+            created_at: None,
+            updated_at: None,
+        };
+
+        let mut app = App::new();
+        apply_livestock_action(
+            &mut app,
+            project,
+            livestock,
+            "project".to_string(),
+            None,
+            LivestockAction::SaveNewTrail(intruder),
+        );
+
+        assert!(app.error.is_some(), "the collision must be reported");
+        let reloaded = config::load_trail("deploy").unwrap();
+        assert_eq!(reloaded.id.as_ref(), Some(&id), "trail uuid must not be re-minted");
+        assert!(reloaded.env.is_some(), "the existing trail must not be rewritten");
+    }
+
+    /// The other half of the issues-view fix. `go_back` navigates out of
+    /// `Issues` with whatever project the view is holding, so refreshing that
+    /// snapshot is what stops the stale copy from reaching the project view and
+    /// minting a second uuid over the one already on disk.
+    #[test]
+    fn an_issues_project_update_refreshes_the_snapshot_go_back_will_carry() {
+        let _ranch = crate::testing::temp_ranch();
+
+        // The state the view leaves behind: the file is stamped, the view's
+        // snapshot is not.
+        let stale = test_project("api");
+        assert!(stale.id.is_none());
+        let mut saved = stale.clone();
+        config::save_project(&mut saved).unwrap();
+        let id = saved.id.clone().unwrap();
+
+        let mut app = App::new();
+        app.view = AppView::Issues { project: stale };
+
+        apply_issues_project_update(&mut app, saved);
+
+        match &app.view {
+            AppView::Issues { project } => {
+                assert_eq!(project.id.as_ref(), Some(&id), "the snapshot must carry the saved id");
+            }
+            other => panic!("expected to stay on Issues, got {other:?}"),
+        }
+
+        app.go_back();
+        match &app.view {
+            AppView::Project { project } => {
+                assert_eq!(
+                    project.id.as_ref(),
+                    Some(&id),
+                    "go_back must not carry a project whose id was dropped"
+                );
+            }
+            other => panic!("expected the project view, got {other:?}"),
+        }
+    }
+
+    /// The project view's own create form, which writes a ranch hand file.
+    #[test]
+    fn creating_a_ranchhand_that_already_exists_is_refused_from_the_project_view() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let mut project = test_project("api");
+        config::save_project(&mut project).unwrap();
+
+        let mut existing = RanchHand {
+            name: "cluster".into(),
+            project: "api".into(),
+            rh_type: "kubernetes".into(),
+            config: serde_yaml::Value::Null,
+            sync_settings: RanchHandSyncSettings { auto_sync: false, interval_minutes: None },
+            herd: "infra".into(),
+            resource_mappings: vec![],
+            last_sync: None,
+            id: None,
+            created_at: None,
+            updated_at: None,
+        };
+        config::save_ranchhand(&mut existing).unwrap();
+        let id = existing.id.clone().unwrap();
+
+        let mut app = App::new();
+        app.view = AppView::Project { project: project.clone() };
+        apply_project_action(
+            &mut app,
+            project.clone(),
+            ProjectAction::CreateRanchHand {
+                name: "cluster".into(),
+                rh_type: "terraform".into(),
+                herd: "elsewhere".into(),
+            },
+        );
+
+        assert!(app.error.is_some(), "the collision must be reported");
+        let reloaded = config::load_ranchhands().into_iter().find(|r| r.name == "cluster").unwrap();
+        assert_eq!(reloaded.id.as_ref(), Some(&id), "ranchhand uuid must not be re-minted");
+        assert_eq!(reloaded.herd, "infra", "ranchhand must not be rewritten");
+    }
+
     #[test]
     fn the_grids_bottom_bar_names_the_source_filter_and_the_help_key() {
+        let _ranch = crate::testing::temp_ranch();
         // The other place a key goes to be discovered, and the one a user sees
         // without pressing anything. `l` and `?` were both live on the grid and
         // named in neither this bar nor the overlay.

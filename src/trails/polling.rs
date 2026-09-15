@@ -56,6 +56,9 @@ pub fn check_and_trigger(
     });
 
     std::fs::create_dir_all(config::worm_triggers_dir())?;
+    // Bare `fs::write`, never `store::write_atomic`: the watcher would consume
+    // and delete the temp file before the rename could publish it. See the
+    // invariant on `config::worm_triggers_dir()`.
     std::fs::write(&trigger_path, serde_json::to_string_pretty(&trigger)?)?;
 
     Ok(true)

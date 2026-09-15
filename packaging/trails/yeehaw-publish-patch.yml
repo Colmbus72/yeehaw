@@ -49,6 +49,43 @@ jobs:
             cargo build --release --target "$target"
           done
 
+      # Cross-compiled from the same Mac. zig supplies the cross toolchain, so
+      # this needs no Docker and no per-arch linker setup.
+      #
+      # musl, not gnu: a gnu binary links against whatever glibc built it and
+      # refuses to run on an older one. A ranch spans machines of unknown
+      # vintage — a Pi, a VPS, whatever the server happens to be — and a static
+      # musl binary runs on all of them.
+      #
+      # No signing or notarization below: that is Apple's, and Linux wants
+      # neither. These tarballs are packaged alongside the macOS ones and the
+      # release step globs *.tar.xz, so nothing downstream changes.
+      - name: Build Linux (x86_64 + aarch64, static musl)
+        timeout-minutes: 30
+        run: |
+          set -e
+          command -v cargo-zigbuild >/dev/null || {
+            echo "cargo-zigbuild is required: cargo install cargo-zigbuild" >&2
+            exit 1
+          }
+          command -v zig >/dev/null || {
+            echo "zig is required: brew install zig" >&2
+            exit 1
+          }
+
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            echo "🐧 Building $target"
+            rustup target add "$target" >/dev/null 2>&1 || true
+            cargo zigbuild --release --target "$target"
+
+            # A wrong-architecture or dynamically linked binary here would not
+            # fail until it reached a barn and refused to start, so check now.
+            case "$(file -b "target/$target/release/yeehaw")" in
+              *"statically linked"*) ;;
+              *) echo "✗ $target is not statically linked" >&2; exit 1 ;;
+            esac
+          done
+
       - name: Sign and notarize macOS binaries
         timeout-minutes: 20
         run: |
@@ -91,7 +128,8 @@ jobs:
           set -e
           VERSION=$(cat .yeehaw-publish-version)
           cd packaging/dist
-          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+          for target in aarch64-apple-darwin x86_64-apple-darwin \
+                        x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             DIR="yeehaw-$target"
             mkdir -p "$DIR"
             cp "../../target/$target/release/yeehaw" "$DIR/yeehaw"

@@ -929,6 +929,10 @@ pub(crate) mod tests {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
+    // Anything that builds a real ssh command reaches the ranch for the
+    // ControlPath, so those tests open a temp one (`let _ranch = ...`). The
+    // guard has to be a binding: it holds only until it drops.
+
     const SPLIT: &str = SPLIT_SENTINEL;
     const SEP: &str = SEP_SENTINEL;
     const FRAME: &str = FRAME_SENTINEL;
@@ -1694,6 +1698,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_select_never_stops_at_a_password_prompt() {
+        let _ranch = crate::testing::temp_ranch();
         // Batch mode, for a reason the stream has too: this runs behind a
         // full-screen TUI, where an ssh prompt is invisible and unanswerable.
         // Without it a jump to a barn with a passphrase-locked key hangs
@@ -1879,15 +1884,13 @@ pub(crate) mod tests {
             port: Some(2222),
             identity_file: None,
             critters: vec![],
-            source: None,
-            connection_type: None,
-            connection_config: None,
-            connectable: None,
+            ..Default::default()
         }
     }
 
     #[test]
     fn the_stream_asks_for_no_remote_tty_and_batches_the_frame_command() {
+        let _ranch = crate::testing::temp_ranch();
         // No `-t`: a remote pty gives the loop a controlling terminal, and the
         // SIGPIPE on its next write is the only thing that ends it when the
         // connection goes. BatchMode because a stream must fail rather than sit
@@ -3015,6 +3018,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_barn_that_cannot_be_reached_is_recorded_rather_than_spawning_a_child() {
+        let _ranch = crate::testing::temp_ranch();
         // The real `reconcile`, the real `RemoteStream::spawn`: a barn with no
         // host cannot even produce an ssh argv. The failure has to be recorded
         // like any other, or reconcile retries it four times a second forever.

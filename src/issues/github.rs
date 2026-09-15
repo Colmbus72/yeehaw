@@ -1,6 +1,7 @@
 use std::process::Command;
 
 use super::types::*;
+use crate::config;
 use crate::types::Livestock;
 
 struct GitHubRepo {
@@ -42,8 +43,13 @@ fn extract_repos(livestock: &[Livestock]) -> Vec<GitHubRepo> {
     let mut seen = std::collections::HashSet::new();
 
     for l in livestock {
-        if l.barn.is_some() {
-            continue; // Only local livestock
+        // Only livestock whose checkout is on this machine. `barn.is_some()`
+        // used to stand in for that, which stops being true the moment
+        // `adopt_this_machine` rewrites every `barn: None` to this machine's
+        // real name — and the failure is silent, because an empty repo list
+        // makes `fetch_github_issues` return `Ok(vec![])`.
+        if !config::livestock_is_on_this_machine(l) {
+            continue;
         }
         if let Some(ref repo_url) = l.repo {
             if let Some((owner, repo)) = parse_github_url(repo_url) {
@@ -162,4 +168,77 @@ pub fn fetch_github_issues(livestock: &[Livestock], state: IssueState) -> Result
     // Sort by updated date (most recent first)
     all_issues.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Ok(all_issues)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn livestock(name: &str, barn: Option<&str>, repo: &str) -> Livestock {
+        Livestock {
+            name: name.into(),
+            path: format!("/tmp/{name}"),
+            barn: barn.map(str::to_string),
+            repo: Some(repo.into()),
+            branch: None,
+            log_path: None,
+            env_path: None,
+            source: None,
+            k8s_metadata: None,
+            trails: vec![],
+        }
+    }
+
+    fn names(repos: &[GitHubRepo]) -> Vec<String> {
+        repos.iter().map(|r| format!("{}/{}", r.owner, r.repo)).collect()
+    }
+
+    /// The quietest failure in the codebase. This filter is the only thing
+    /// standing between the issues view and an empty list, and an empty list is
+    /// indistinguishable from "no open issues" — `fetch_github_issues` returns
+    /// `Ok(vec![])`, so there is no error and no banner to attribute it to.
+    /// Adoption rewrites every `barn: None` to this machine's real name, which
+    /// under a plain `barn.is_some()` test skips *every* livestock on the ranch.
+    #[test]
+    fn adoption_does_not_silently_empty_the_repo_list() {
+        crate::testing::with_temp_ranch(|_| {
+            let unadopted = vec![
+                livestock("web", None, "https://github.com/acme/web"),
+                livestock("ios", Some("local"), "git@github.com:acme/ios.git"),
+                livestock("worker", Some("pi"), "https://github.com/acme/worker"),
+            ];
+            let before = names(&extract_repos(&unadopted));
+            assert_eq!(
+                before,
+                ["acme/web", "acme/ios"],
+                "a livestock spelled `local` is on this machine too"
+            );
+
+            crate::migrate::adopt_this_machine("imac").unwrap();
+
+            // The same three livestock, as an adopted machine's files spell
+            // them: what was `None` now names the machine.
+            let adopted = vec![
+                livestock("web", Some("imac"), "https://github.com/acme/web"),
+                livestock("ios", Some("local"), "git@github.com:acme/ios.git"),
+                livestock("worker", Some("pi"), "https://github.com/acme/worker"),
+            ];
+            assert_eq!(
+                names(&extract_repos(&adopted)),
+                before,
+                "adoption must not change which repos the issues view reads"
+            );
+        });
+    }
+
+    /// The exclusion the filter exists for has to survive the fix: a repo whose
+    /// checkout lives on another machine is not this machine's to report on.
+    #[test]
+    fn livestock_on_a_real_remote_barn_is_still_excluded() {
+        crate::testing::with_temp_ranch(|_| {
+            crate::migrate::adopt_this_machine("imac").unwrap();
+            let livestock = vec![livestock("worker", Some("pi"), "https://github.com/acme/worker")];
+            assert!(extract_repos(&livestock).is_empty());
+        });
+    }
 }

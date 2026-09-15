@@ -9,14 +9,19 @@ mod git;
 mod hooks;
 mod issues;
 mod mcp_server;
+mod migrate;
+mod ranch;
 mod ranchhand_k8s;
 mod ranchhand_terraform;
 mod remote_grid;
 mod signals;
-mod slack;
 mod ssh;
+mod store;
+#[cfg(test)]
+mod testing;
 mod trails;
 mod tmux;
+mod tombstones;
 mod types;
 mod update_check;
 mod vault;
@@ -27,7 +32,13 @@ mod views;
 use anyhow::Result;
 
 fn main() -> Result<()> {
-    // Ensure config directories exist
+    // Ensure config directories exist.
+    //
+    // Must stay before `ratatui::init()` and the panic hook installed in
+    // `run_tui()`: this is the first call to resolve `YEEHAW_HOME`, and a
+    // non-absolute value panics here. Running it on a clean terminal means that
+    // message prints legibly instead of being scrambled across a raw-mode
+    // alternate screen.
     config::ensure_config_dirs();
 
     let args: Vec<String> = std::env::args().collect();
@@ -89,16 +100,16 @@ fn handle_subcommands(args: &[String]) -> bool {
             handle_worm_subcommand(args);
             true
         }
-        Some("slack") => {
-            handle_slack_subcommand(args);
-            true
-        }
         Some("trail") => {
             handle_trail_subcommand(args);
             true
         }
         Some("skills") => {
             handle_skills_subcommand(args);
+            true
+        }
+        Some("ranch") => {
+            handle_ranch_subcommand(args);
             true
         }
         Some("connect") => {
@@ -182,6 +193,112 @@ fn handle_skills_subcommand(args: &[String]) {
     }
 }
 
+fn handle_ranch_subcommand(args: &[String]) {
+    match ranch::parse_args(args) {
+        ranch::RanchCommand::Serve => {
+            // Not a `RanchCommand` field: `serve` is a verb, `--selftest` is a
+            // flag on it, and keeping the enum a plain description of the verb
+            // keeps `parse_args` free of flag handling.
+            let selftest = args.iter().any(|a| a == "--selftest");
+            if let Err(e) = ranch::serve(selftest) {
+                // stderr, never stdout: stdout is the protocol stream.
+                eprintln!("\x1b[31mError:\x1b[0m {}", e);
+                std::process::exit(1);
+            }
+        }
+        ranch::RanchCommand::Init { name } => {
+            // `{:#}` throughout this arm, not `{}`: `ranch init` surfaces
+            // `migrate::adopt_this_machine`'s refusals, and those are the whole
+            // of the user's guidance — an unparseable project's path, or the
+            // barn that turns out to be some other machine. Plain `{}` renders
+            // only the outermost context and throws every one of them away.
+            match ranch::init(name) {
+                Ok(report) => {
+                    println!("This machine is now the Ranch House, as barn '{}'.", report.barn);
+                    if report.adoption.barn_created {
+                        println!("  created barns/{}.yaml", report.barn);
+                    }
+                    if report.adoption.livestock_reassigned > 0 {
+                        println!(
+                            "  pinned {} livestock to '{}' across {} project(s)",
+                            report.adoption.livestock_reassigned,
+                            report.barn,
+                            report.adoption.projects_touched.len()
+                        );
+                    }
+                    println!("  stamped {} entities and recorded a sync base for each", report.stamped);
+                    println!("  brand: {}", report.brand);
+                    println!("\nOn another machine, run: yeehaw ranch join <this machine>");
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31mError:\x1b[0m {:#}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        ranch::RanchCommand::Join { target, name } => match ranch::join(&target, name) {
+            Ok(outcome) => {
+                // Before the apply lines, because it happened before them and
+                // because it is the one thing a join changes about *this*
+                // machine: the name came from the house's roster, not from this
+                // hostname, and every livestock here now names it.
+                if let Some(adoption) = &outcome.adopted {
+                    if adoption.barn_created || adoption.livestock_reassigned > 0 {
+                        println!("\nThis machine is barn '{}' on that ranch.", outcome.barn);
+                        if adoption.barn_created {
+                            println!("  created barns/{}.yaml", outcome.barn);
+                        }
+                        if adoption.livestock_reassigned > 0 {
+                            println!(
+                                "  pinned {} livestock to '{}' across {} project(s)",
+                                adoption.livestock_reassigned,
+                                outcome.barn,
+                                adoption.projects_touched.len()
+                            );
+                        }
+                    }
+                }
+                match outcome.applied {
+                    Some(applied) => {
+                        println!(
+                            "\nJoined the ranch at '{}': {} written, {} deleted.",
+                            outcome.peer, applied.written, applied.deleted
+                        );
+                        if let Some(backup) = &outcome.backup {
+                            println!("  the ranch as it was: {}", backup.display());
+                        }
+                        if outcome.brand_pushed {
+                            println!("  this machine's brand is installed on '{}'", target);
+                        }
+                        for warning in &outcome.warnings {
+                            eprintln!("\x1b[33mWarning:\x1b[0m {}", warning);
+                        }
+                    }
+                    None => println!("\nNothing applied."),
+                }
+            }
+            Err(e) => {
+                eprintln!("\x1b[31mError:\x1b[0m {:#}", e);
+                std::process::exit(1);
+            }
+        },
+        ranch::RanchCommand::Status => {
+            eprintln!("\x1b[31mError:\x1b[0m `yeehaw ranch status` is not implemented yet");
+            std::process::exit(1);
+        }
+        ranch::RanchCommand::Usage => {
+            println!("Usage:");
+            println!("  yeehaw ranch init [name]    Make this machine the Ranch House");
+            println!("  yeehaw ranch join <target> [--as <name>]");
+            println!("                              Join the ranch at <target> (user@host).");
+            println!("                              --as proposes what this machine is called;");
+            println!("                              the Ranch House has the final say.");
+            println!("  yeehaw ranch serve          Speak the sync protocol on stdio (run over ssh)");
+            println!("  yeehaw ranch status         Show this machine's ranch membership");
+        }
+    }
+}
+
 fn handle_worm_subcommand(args: &[String]) {
     match args.get(2).map(|s| s.as_str()) {
         Some("exec") => {
@@ -226,71 +343,6 @@ fn handle_worm_subcommand(args: &[String]) {
     }
 }
 
-fn handle_slack_subcommand(args: &[String]) {
-    match args.get(2).map(|s| s.as_str()) {
-        Some("auth") => {
-            run_slack_auth();
-        }
-        Some("status") => {
-            let cfg = config::load_config();
-            let tokens = issues::auth::get_slack_tokens();
-
-            println!("\x1b[36mSlack Integration Status\x1b[0m");
-            println!();
-            let enabled = cfg.slack.as_ref().map(|s| s.enabled).unwrap_or(false);
-            println!("  Enabled:        {}", if enabled { "\x1b[32myes\x1b[0m" } else { "\x1b[31mno\x1b[0m" });
-            println!("  Auth:           {}", if tokens.is_some() { "\x1b[32mconfigured\x1b[0m" } else { "\x1b[31mnot configured\x1b[0m" });
-            if let Some(ref t) = tokens {
-                if let Some(ref uid) = t.user_id {
-                    println!("  Bot User ID:    {}", uid);
-                }
-            }
-            let allowed = cfg.slack.as_ref().map(|s| s.allowed_users.join(", ")).unwrap_or_default();
-            println!("  Allowed Users:  {}", if allowed.is_empty() { "none".to_string() } else { allowed });
-            if let Some(ref s) = cfg.slack {
-                if let Some(ref dp) = s.default_project {
-                    println!("  Default Project: {}", dp);
-                }
-            }
-        }
-        Some("enable") => {
-            let mut cfg = config::load_config();
-            match cfg.slack.as_mut() {
-                Some(s) => s.enabled = true,
-                None => {
-                    cfg.slack = Some(types::SlackConfig {
-                        enabled: true,
-                        allowed_users: vec![],
-                        default_project: None,
-                        channel_projects: None,
-                        system_prompt: None,
-                    });
-                }
-            }
-            let content = serde_yaml::to_string(&cfg).unwrap_or_default();
-            let _ = std::fs::write(config::config_file(), content);
-            println!("\x1b[32m✓\x1b[0m Slack integration enabled");
-            println!("Restart Yeehaw for changes to take effect.");
-        }
-        Some("disable") => {
-            let mut cfg = config::load_config();
-            if let Some(ref mut s) = cfg.slack {
-                s.enabled = false;
-            }
-            let content = serde_yaml::to_string(&cfg).unwrap_or_default();
-            let _ = std::fs::write(config::config_file(), content);
-            println!("\x1b[32m✓\x1b[0m Slack integration disabled");
-        }
-        _ => {
-            println!("Usage:");
-            println!("  yeehaw slack auth         Configure Slack bot tokens");
-            println!("  yeehaw slack status       Show Slack integration status");
-            println!("  yeehaw slack enable       Enable Slack bot");
-            println!("  yeehaw slack disable      Disable Slack bot");
-        }
-    }
-}
-
 fn handle_trail_subcommand(args: &[String]) {
     match args.get(2).map(|s| s.as_str()) {
         Some("poll") => {
@@ -317,22 +369,36 @@ fn handle_trail_subcommand(args: &[String]) {
     }
 }
 
-fn handle_trail_poll(livestock_name: &str, trail_name: &str) {
-    // 1. Find livestock across all projects
-    let projects = config::load_projects();
-    let mut found = None;
-    for project in &projects {
-        if let Some(ls) = project.livestock.iter().find(|l| l.name == livestock_name) {
-            if let Some(barn_name) = &ls.barn {
-                if let Some(barn) = config::load_barns().into_iter().find(|b| &b.name == barn_name) {
-                    found = Some((ls.clone(), barn, project.name.clone()));
-                    break;
-                }
-            }
+/// The livestock named `livestock_name`, the barn to poll it on, and its
+/// project.
+///
+/// The poller drives a trail on the machine the checkout lives on, over ssh, so
+/// a livestock that lives *here* has no barn to poll it from and never had one:
+/// before adoption it said `barn: None` and this search skipped it. Resolving
+/// keeps that true afterwards, rather than letting adoption quietly point the
+/// poller at this machine's own self-barn — a record with no host, which would
+/// turn a clean "has no barn" into an ssh failure inside the run.
+fn find_pollable_livestock(
+    livestock_name: &str,
+) -> Option<(types::Livestock, types::Barn, String)> {
+    let barns = config::load_barns();
+    for project in config::load_projects() {
+        let Some(ls) = project.livestock.iter().find(|l| l.name == livestock_name) else {
+            continue;
+        };
+        let Some(barn_name) = config::resolve_livestock_barn(ls) else {
+            continue;
+        };
+        if let Some(barn) = barns.iter().find(|b| b.name == barn_name) {
+            return Some((ls.clone(), barn.clone(), project.name.clone()));
         }
     }
+    None
+}
 
-    let (livestock, barn, _project) = match found {
+fn handle_trail_poll(livestock_name: &str, trail_name: &str) {
+    // 1. Find livestock across all projects
+    let (livestock, barn, _project) = match find_pollable_livestock(livestock_name) {
         Some(f) => f,
         None => {
             eprintln!("Livestock '{}' not found or has no barn", livestock_name);
@@ -382,110 +448,6 @@ fn handle_trail_poll(livestock_name: &str, trail_name: &str) {
     }
 }
 
-fn run_slack_auth() {
-    use std::io::{self, BufRead, Write};
-
-    println!("\x1b[36mSlack Bot Setup\x1b[0m");
-    println!();
-    println!("You need two tokens from your Slack app:");
-    println!("  1. Bot Token (xoxb-...) — from OAuth & Permissions");
-    println!("  2. App Token (xapp-...) — from Socket Mode settings");
-    println!();
-
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-
-    print!("Bot Token (xoxb-...): ");
-    let _ = stdout.flush();
-    let mut bot_token = String::new();
-    stdin.lock().read_line(&mut bot_token).unwrap_or(0);
-    let bot_token = bot_token.trim().to_string();
-
-    if !bot_token.starts_with("xoxb-") {
-        eprintln!("\x1b[31mError:\x1b[0m Bot token must start with xoxb-");
-        std::process::exit(1);
-    }
-
-    print!("App Token (xapp-...): ");
-    let _ = stdout.flush();
-    let mut app_token = String::new();
-    stdin.lock().read_line(&mut app_token).unwrap_or(0);
-    let app_token = app_token.trim().to_string();
-
-    if !app_token.starts_with("xapp-") {
-        eprintln!("\x1b[31mError:\x1b[0m App token must start with xapp-");
-        std::process::exit(1);
-    }
-
-    println!("\nValidating tokens...");
-
-    // Validate via Slack auth.test API
-    match ureq::post("https://slack.com/api/auth.test")
-        .set("Authorization", &format!("Bearer {}", bot_token))
-        .set("Content-Type", "application/json")
-        .send_string("{}")
-    {
-        Ok(resp) => {
-            if let Ok(data) = resp.into_json::<serde_json::Value>() {
-                if data["ok"].as_bool() != Some(true) {
-                    eprintln!("\x1b[31mError:\x1b[0m Slack API error: {}", data["error"].as_str().unwrap_or("unknown"));
-                    std::process::exit(1);
-                }
-
-                let bot_user_id = data["user_id"].as_str().unwrap_or("");
-                let user_name = data["user"].as_str().unwrap_or("unknown");
-                println!("\x1b[32m✓\x1b[0m Bot authenticated as: {} ({})", user_name, bot_user_id);
-
-                issues::auth::set_slack_tokens(&bot_token, &app_token, if bot_user_id.is_empty() { None } else { Some(bot_user_id) });
-                println!("\x1b[32m✓\x1b[0m Tokens saved");
-
-                println!();
-                println!("\x1b[33mNote:\x1b[0m You need to add YOUR Slack user ID to the allowed list.");
-                println!("To find your ID: click your profile in Slack → \"...\" → \"Copy member ID\"");
-                println!();
-
-                print!("Your Slack User ID (U...): ");
-                let _ = stdout.flush();
-                let mut human_id = String::new();
-                stdin.lock().read_line(&mut human_id).unwrap_or(0);
-                let human_id = human_id.trim().to_string();
-
-                let mut cfg = config::load_config();
-                if cfg.slack.is_none() {
-                    cfg.slack = Some(types::SlackConfig {
-                        enabled: false,
-                        allowed_users: vec![],
-                        default_project: None,
-                        channel_projects: None,
-                        system_prompt: None,
-                    });
-                }
-
-                if human_id.starts_with('U') {
-                    if let Some(ref mut s) = cfg.slack {
-                        if !s.allowed_users.contains(&human_id) {
-                            s.allowed_users.push(human_id.clone());
-                            println!("\x1b[32m✓\x1b[0m Added {} to allowed_users", human_id);
-                        } else {
-                            println!("\x1b[32m✓\x1b[0m {} already in allowed_users", human_id);
-                        }
-                    }
-                } else {
-                    println!("\x1b[33mSkipped:\x1b[0m No valid user ID provided. Add it manually to ~/.yeehaw/config.yaml");
-                }
-
-                let content = serde_yaml::to_string(&cfg).unwrap_or_default();
-                let _ = std::fs::write(config::config_file(), content);
-                println!("\nNext: run \x1b[36myeehaw slack enable\x1b[0m to activate the bot");
-            }
-        }
-        Err(e) => {
-            eprintln!("\x1b[31mError:\x1b[0m Failed to validate: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
 fn run_tui() -> Result<()> {
     let mut terminal = ratatui::init();
 
@@ -518,6 +480,97 @@ fn run_worm_exec(worm_name: &str) -> Result<()> {
         "trigger": "cron"
     });
 
+    // Bare `fs::write`, never `store::write_atomic` — and Task 11 of the Phase 1
+    // plan is wrong to say "`grep -n 'fs::write' cli/src/main.rs` must return
+    // nothing". This one has to stay: the watcher matches any path under
+    // `worm-triggers/` and the handler deletes what it reads, so a temp file
+    // here is consumed before the rename can publish it. See the invariant on
+    // `config::worm_triggers_dir()`.
     std::fs::write(&trigger_path, trigger.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn livestock(name: &str, barn: Option<&str>) -> types::Livestock {
+        types::Livestock {
+            name: name.into(),
+            path: format!("/tmp/{name}"),
+            barn: barn.map(str::to_string),
+            repo: Some("https://github.com/acme/api".into()),
+            branch: None,
+            log_path: None,
+            env_path: None,
+            source: None,
+            k8s_metadata: None,
+            trails: vec![],
+        }
+    }
+
+    fn barn(name: &str) -> types::Barn {
+        types::Barn {
+            name: name.into(),
+            host: Some("10.0.0.2".into()),
+            user: Some("forge".into()),
+            port: None,
+            identity_file: None,
+            critters: vec![],
+            ..Default::default()
+        }
+    }
+
+    /// `yeehaw trail poll` drives a trail on the machine the checkout lives on,
+    /// over ssh. A livestock that lives *here* has never been pollable — it
+    /// said `barn: None` and this search skipped it — and adoption must not
+    /// change that by quietly pointing the poller at this machine's own
+    /// hostless self-barn.
+    #[test]
+    fn the_trail_poller_answers_the_same_before_and_after_adoption() {
+        let _ranch = testing::temp_ranch();
+
+        let mut pi = barn("pi");
+        config::save_barn(&mut pi).unwrap();
+
+        let mut project = types::Project {
+            name: "api".into(),
+            path: "/tmp/api".into(),
+            summary: None,
+            color: None,
+            gradient_spread: None,
+            gradient_inverted: None,
+            livestock: vec![livestock("web", None), livestock("worker", Some("pi"))],
+            herds: vec![],
+            wiki: vec![],
+            issue_provider: None,
+            wiki_provider: None,
+            id: None,
+            created_at: None,
+            updated_at: None,
+        };
+        config::save_project(&mut project).unwrap();
+
+        assert!(
+            find_pollable_livestock("web").is_none(),
+            "a livestock on this machine has no barn to poll it on"
+        );
+        assert_eq!(
+            find_pollable_livestock("worker").map(|(_, b, _)| b.name),
+            Some("pi".to_string())
+        );
+
+        // Rewrites `web` on disk to `barn: imac` and persists the self-barn.
+        migrate::adopt_this_machine("imac").unwrap();
+
+        assert!(
+            find_pollable_livestock("web").is_none(),
+            "adoption renamed the livestock; it did not give it somewhere to be polled from"
+        );
+        assert_eq!(
+            find_pollable_livestock("worker").map(|(_, b, _)| b.name),
+            Some("pi".to_string()),
+            "a real remote barn is untouched by adoption"
+        );
+    }
 }

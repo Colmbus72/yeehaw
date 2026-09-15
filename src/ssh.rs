@@ -187,6 +187,12 @@ mod tests {
     use super::*;
     use crate::types::Barn;
 
+    // `ssh_args` puts the ControlPath under the ranch and `ssh::command`
+    // creates its parent directory, so the tests below open a temp ranch
+    // (`let _ranch = ...`) rather than reading and writing the developer's real
+    // `~/.yeehaw/ssh`. The guard has to be a binding: it points the ranch at a
+    // temp directory only until it drops.
+
     fn barn(identity: Option<&str>) -> Barn {
         Barn {
             name: "guided".into(),
@@ -195,21 +201,20 @@ mod tests {
             port: Some(2222),
             identity_file: identity.map(|s| s.into()),
             critters: vec![],
-            source: None,
-            connection_type: None,
-            connection_config: None,
-            connectable: None,
+            ..Default::default()
         }
     }
 
     #[test]
     fn builds_target_from_user_and_host() {
+        let _ranch = crate::testing::temp_ranch();
         let args = ssh_args(&barn(None), Opts::default()).expect("configured barn");
         assert!(args.contains(&"forge@172.233.141.59".to_string()));
     }
 
     #[test]
     fn passes_the_configured_port() {
+        let _ranch = crate::testing::temp_ranch();
         let args = ssh_args(&barn(None), Opts::default()).unwrap();
         let p = args.iter().position(|a| a == "-p").expect("-p present");
         assert_eq!(args[p + 1], "2222");
@@ -217,6 +222,7 @@ mod tests {
 
     #[test]
     fn omits_identity_flag_when_barn_has_no_key() {
+        let _ranch = crate::testing::temp_ranch();
         // A barn relying on ssh-agent or ~/.ssh/config must still connect.
         let args = ssh_args(&barn(None), Opts::default()).unwrap();
         assert!(!args.contains(&"-i".to_string()));
@@ -224,6 +230,7 @@ mod tests {
 
     #[test]
     fn includes_identity_flag_when_barn_has_a_key() {
+        let _ranch = crate::testing::temp_ranch();
         let args = ssh_args(&barn(Some("~/.ssh/id_big_ups")), Opts::default()).unwrap();
         let i = args.iter().position(|a| a == "-i").expect("-i present");
         assert_eq!(args[i + 1], "~/.ssh/id_big_ups");
@@ -231,6 +238,7 @@ mod tests {
 
     #[test]
     fn always_pins_host_keys_with_accept_new() {
+        let _ranch = crate::testing::temp_ranch();
         // StrictHostKeyChecking=no accepts any key silently and permits MITM.
         // accept-new pins on first use and refuses on change.
         let args = ssh_args(&barn(None), Opts::default()).unwrap();
@@ -240,6 +248,7 @@ mod tests {
 
     #[test]
     fn always_sets_a_connect_timeout() {
+        let _ranch = crate::testing::temp_ranch();
         // Without this an unreachable barn hangs the caller forever.
         let args = ssh_args(&barn(None), Opts::default()).unwrap();
         assert!(args.iter().any(|a| a.starts_with("ConnectTimeout=")));
@@ -247,6 +256,7 @@ mod tests {
 
     #[test]
     fn enables_connection_multiplexing() {
+        let _ranch = crate::testing::temp_ranch();
         let args = ssh_args(&barn(None), Opts::default()).unwrap();
         assert!(args.contains(&"ControlMaster=auto".to_string()));
         assert!(args.iter().any(|a| a.starts_with("ControlPersist=")));
@@ -254,6 +264,7 @@ mod tests {
 
     #[test]
     fn batch_mode_is_opt_in_so_interactive_auth_still_works() {
+        let _ranch = crate::testing::temp_ranch();
         let probe = ssh_args(&barn(None), Opts { batch: true, ..Opts::default() }).unwrap();
         assert!(probe.contains(&"BatchMode=yes".to_string()));
 
@@ -263,6 +274,7 @@ mod tests {
 
     #[test]
     fn requests_a_tty_only_when_asked() {
+        let _ranch = crate::testing::temp_ranch();
         let with = ssh_args(&barn(None), Opts { tty: true, ..Opts::default() }).unwrap();
         assert!(with.contains(&"-t".to_string()));
 
@@ -279,6 +291,7 @@ mod tests {
 
     #[test]
     fn defaults_the_user_and_port_when_absent() {
+        let _ranch = crate::testing::temp_ranch();
         let mut b = barn(None);
         b.user = None;
         b.port = None;
@@ -301,6 +314,7 @@ mod tests {
 
     #[test]
     fn allow_failure_does_not_alter_the_ssh_argv() {
+        let _ranch = crate::testing::temp_ranch();
         // It is a decision about how `run` reads the exit status, not an ssh
         // flag; the connection must be built identically either way.
         let plain = ssh_args(&barn(Some("~/.ssh/k")), Opts::default()).unwrap();

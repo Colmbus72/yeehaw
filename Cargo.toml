@@ -51,8 +51,6 @@ schemars = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 ureq = { version = "2", features = ["json"] }
-tungstenite = { version = "0.24", features = ["native-tls"] }
-native-tls = "0.2"
 regex = "1.12.3"
 
 # Vault encryption
@@ -60,6 +58,13 @@ argon2 = "0.5"
 aes-gcm = "0.10"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
+
+# Advisory file locks for read-modify-write on the config store
+fs2 = "0.4"
+
+# Content hashing for ranch sync — the canonical form of an entity is what is
+# hashed, never the file's bytes.
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

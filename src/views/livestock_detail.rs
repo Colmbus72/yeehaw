@@ -165,6 +165,10 @@ impl LivestockDetailView {
         Livestock {
             name: self.edit_name.clone(),
             path: self.edit_path.clone(),
+            // Verbatim on purpose. The edit form has no barn field, and
+            // resolving here would rewrite an adopted machine's `Some("imac")`
+            // back to `None` on every save — silently un-migrating the record
+            // the adoption existed to create.
             barn: original.barn.clone(),
             repo: if self.edit_repo.is_empty() { None } else { Some(self.edit_repo.clone()) },
             branch: if self.edit_branch.is_empty() { None } else { Some(self.edit_branch.clone()) },
@@ -556,6 +560,9 @@ impl LivestockDetailView {
             on,
             env: None,
             jobs,
+            id: None,
+            created_at: None,
+            updated_at: None,
         };
 
         self.wizard_mode = WizardMode::Inactive;

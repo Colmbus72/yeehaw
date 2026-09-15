@@ -398,7 +398,12 @@ impl ProjectContextView {
                 }
             }
             InputMode::NewLivestockBarn => {
-                self.new_ls_barn = if value.is_empty() || value == "local" { String::new() } else { value };
+                // Never the literal `local`: it is machine-relative with a
+                // different spelling than `None`, so it looks like a real pin
+                // while meaning "whichever machine reads this". Before adoption
+                // that stores nothing; after, it stores this machine's real
+                // name, which is what makes the record portable at all.
+                self.new_ls_barn = config::stored_barn_name(&value).unwrap_or_default();
                 self.input_mode = InputMode::NewLivestockRepo;
                 // Pre-fill with git-detected repo URL
                 self.text_input = TextInput::new(&self.new_ls_repo);
@@ -478,12 +483,16 @@ impl ProjectContextView {
         ProjectAction::None
     }
 
+    /// `_barns`: the livestock list used to consult it to tell the synthetic
+    /// local barn from a real one. `config::barn_label` answers that from the
+    /// livestock alone now. Kept in the signature the way `handle_input` keeps
+    /// its own, so every view is still called the same way.
     pub fn render(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         project: &Project,
-        barns: &[Barn],
+        _barns: &[Barn],
         windows: &[TmuxWindow],
     ) {
         let session_windows: Vec<_> = windows.iter()
@@ -552,7 +561,7 @@ impl ProjectContextView {
             hints: Some("[n] new  [c] claude  [s] shell  [e] edit project"),
         };
         let livestock_inner = livestock_panel.render(frame, left_panels[0]);
-        let livestock_items = build_livestock_items(&project.livestock, barns);
+        let livestock_items = build_livestock_items(&project.livestock);
         list::render_list(
             frame, livestock_inner, &livestock_items,
             &mut self.livestock_state,
@@ -854,12 +863,12 @@ impl ProjectContextView {
     }
 }
 
-fn build_livestock_items(livestock: &[Livestock], barns: &[Barn]) -> Vec<ListItem> {
+fn build_livestock_items(livestock: &[Livestock]) -> Vec<ListItem> {
     livestock.iter().map(|ls| {
-        let barn_info = ls.barn.as_ref().map(|bn| {
-            let is_local = bn == "local" || barns.iter().any(|b| b.name == *bn && config::is_local_barn(b));
-            if is_local { "local".to_string() } else { bn.clone() }
-        }).unwrap_or_else(|| "local".to_string());
+        // `local` covers every spelling of "on this machine", adoption's real
+        // barn name included. The column says here-or-elsewhere; it is not the
+        // place the user learns their own machine's name.
+        let barn_info = config::barn_label(ls).to_string();
 
         ListItem {
             id: ls.name.clone(),
@@ -885,4 +894,110 @@ fn build_herd_items(herds: &[Herd]) -> Vec<ListItem> {
             actions: vec![],
         }
     }).collect()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bare_project() -> Project {
+        Project {
+            name: "api".into(),
+            path: "/tmp/api".into(),
+            summary: None,
+            color: None,
+            gradient_spread: None,
+            gradient_inverted: None,
+            livestock: vec![],
+            herds: vec![],
+            wiki: vec![],
+            issue_provider: None,
+            wiki_provider: None,
+            id: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// Runs the new-livestock wizard from the barn step to the end and returns
+    /// the barn it asks the app to store.
+    fn barn_picked(typed: &str) -> Option<String> {
+        let project = bare_project();
+        let mut view = ProjectContextView::new();
+        view.new_ls_name = "web".into();
+        view.new_ls_path = "/tmp/web".into();
+
+        view.input_mode = InputMode::NewLivestockBarn;
+        view.text_input = TextInput::new(typed);
+        view.handle_submit(&project);
+
+        // Repo, then branch: the branch step is the one that emits the action.
+        view.text_input = TextInput::new("");
+        view.handle_submit(&project);
+        view.text_input = TextInput::new("main");
+        match view.handle_submit(&project) {
+            ProjectAction::CreateLivestock(_, _, barn, _, _) => barn,
+            _ => panic!("the branch step must emit CreateLivestock"),
+        }
+    }
+
+    /// The literal `local` must never reach disk. It is machine-relative with a
+    /// different spelling than `None`, so it looks like a real pin while
+    /// meaning "whichever machine reads this" — two livestock in the real ranch
+    /// carry it. Before adoption the picker stores `None`; after, it stores the
+    /// machine's real name, which is the entire point of adoption.
+    #[test]
+    fn the_barn_picker_never_stores_the_literal_local() {
+        let _ranch = crate::testing::temp_ranch();
+
+        assert_eq!(barn_picked("local"), None);
+        assert_eq!(barn_picked(""), None);
+        assert_eq!(barn_picked("  Local "), None, "case is not a new barn");
+        assert_eq!(barn_picked("pi"), Some("pi".to_string()));
+
+        crate::migrate::adopt_this_machine("imac").unwrap();
+
+        assert_eq!(barn_picked("local"), Some("imac".to_string()));
+        assert_eq!(barn_picked(""), Some("imac".to_string()));
+        assert_eq!(barn_picked("pi"), Some("pi".to_string()));
+    }
+
+    /// The livestock column says here-or-elsewhere. Adoption renames this
+    /// machine's livestock without moving it, so the column must not start
+    /// reading the machine's own hostname where it read `local` yesterday.
+    #[test]
+    fn the_livestock_column_reads_local_on_both_sides_of_adoption() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let mut here = Livestock {
+            name: "web".into(),
+            path: "/tmp/web".into(),
+            barn: None,
+            repo: None,
+            branch: None,
+            log_path: None,
+            env_path: None,
+            source: None,
+            k8s_metadata: None,
+            trails: vec![],
+        };
+        let mut away = here.clone();
+        away.name = "worker".into();
+        away.barn = Some("pi".into());
+
+        let metas = |ls: &[Livestock]| -> Vec<String> {
+            build_livestock_items(ls)
+                .into_iter()
+                .map(|i| i.meta.unwrap_or_default())
+                .collect()
+        };
+
+        assert_eq!(metas(&[here.clone(), away.clone()]), ["local", "pi"]);
+
+        crate::migrate::adopt_this_machine("imac").unwrap();
+        here.barn = Some("imac".into());
+
+        assert_eq!(metas(&[here, away]), ["local", "pi"]);
+    }
 }

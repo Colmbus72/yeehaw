@@ -142,13 +142,16 @@ pub fn render_livestock_header(
         ),
     ]));
 
-    if let Some(ref barn) = livestock.barn {
+    // Only livestock that lives somewhere else gets a `Barn:` row. A livestock
+    // on this machine never had one, and adoption renaming it from `None` to
+    // the machine's own name is not a fact worth a line of the header.
+    if let Some(barn) = crate::config::resolve_livestock_barn(livestock) {
         lines.push(Line::from(vec![
             Span::styled(
                 " Barn:    ",
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled(barn.clone(), Style::default().fg(Color::White)),
+            Span::styled(barn.to_string(), Style::default().fg(Color::White)),
         ]));
     }
 
@@ -167,4 +170,67 @@ pub fn render_livestock_header(
 
     let paragraph = Paragraph::new(visible);
     frame.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn livestock_on(barn: Option<&str>) -> Livestock {
+        Livestock {
+            name: "web".into(),
+            path: "/tmp/web".into(),
+            barn: barn.map(str::to_string),
+            repo: None,
+            branch: None,
+            log_path: None,
+            env_path: None,
+            source: None,
+            k8s_metadata: None,
+            trails: vec![],
+        }
+    }
+
+    /// Draws the header and reads the screen back as one string.
+    fn screen(livestock: &Livestock) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 40)).expect("terminal");
+        terminal
+            .draw(|f| render_livestock_header(f, f.area(), livestock, "api"))
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        (0..40)
+            .map(|y| {
+                (0..60)
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .map(|c| c.symbol().to_string())
+                            .unwrap_or_default()
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The header names a barn only for livestock that lives somewhere else.
+    /// A livestock here never had the row — `barn: None` skipped it — and
+    /// adoption renaming it to this machine's own name must not conjure one.
+    #[test]
+    fn the_header_names_a_barn_only_for_livestock_that_is_elsewhere() {
+        let _ranch = crate::testing::temp_ranch();
+
+        assert!(!screen(&livestock_on(None)).contains("Barn:"));
+        assert!(!screen(&livestock_on(Some("local"))).contains("Barn:"));
+        assert!(screen(&livestock_on(Some("pi"))).contains("Barn:"));
+
+        crate::migrate::adopt_this_machine("imac").unwrap();
+
+        assert!(
+            !screen(&livestock_on(Some("imac"))).contains("Barn:"),
+            "adoption renamed this livestock; it did not move it"
+        );
+        assert!(!screen(&livestock_on(None)).contains("Barn:"));
+        assert!(screen(&livestock_on(Some("pi"))).contains("Barn:"));
+    }
 }

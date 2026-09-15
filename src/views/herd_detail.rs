@@ -109,7 +109,9 @@ impl HerdDetailView {
 
         let livestock_items: Vec<ListItem> = herd.livestock.iter().map(|ls_name| {
             let ls = project.livestock.iter().find(|l| l.name == *ls_name);
-            let meta = ls.map(|l| l.barn.as_deref().unwrap_or("local").to_string());
+            // `local` for anything on this machine, adoption's real barn name
+            // included: see `config::barn_label`.
+            let meta = ls.map(|l| crate::config::barn_label(l).to_string());
             ListItem {
                 id: ls_name.clone(),
                 label: ls_name.clone(),

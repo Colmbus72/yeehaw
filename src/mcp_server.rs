@@ -531,13 +531,17 @@ impl YeehawServer {
     #[tool(description = "Create a new project")]
     async fn create_project(&self, params: Parameters<CreateProjectParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let project = types::Project {
+        let mut project = types::Project {
             name: p.name, path: p.path, summary: p.summary, color: p.color,
             gradient_spread: None, gradient_inverted: None,
             livestock: vec![], herds: vec![], wiki: vec![],
             issue_provider: None, wiki_provider: None,
+            id: None, created_at: None, updated_at: None,
         };
-        match config::save_project(&project) {
+        // `create_*`, not `save_*`: a plain save writes over whatever is at
+        // that name, and this struct's empty livestock/herds/wiki plus a fresh
+        // uuid would replace the existing entity outright.
+        match config::create_project(&mut project) {
             Ok(()) => ok_json(&project),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -553,7 +557,7 @@ impl YeehawServer {
         if let Some(summary) = p.summary { project.summary = Some(summary); }
         if let Some(color) = p.color { project.color = Some(color); }
         if let Some(path) = p.path { project.path = path; }
-        match config::save_project(&project) {
+        match config::save_project(&mut project) {
             Ok(()) => ok_json(&project),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -577,8 +581,12 @@ impl YeehawServer {
     #[tool(description = "Add livestock (deployed app instance) to a project")]
     async fn add_livestock(&self, params: Parameters<AddLivestockParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
+        // The other writer of `livestock.barn`, and the one that can be handed
+        // the literal `local` by an agent. Same rule as the TUI's picker: it is
+        // machine-relative with a different spelling than `None`.
+        let barn = p.barn.as_deref().and_then(config::stored_barn_name);
         let livestock = types::Livestock {
-            name: p.name, path: p.path, barn: p.barn, repo: p.repo,
+            name: p.name, path: p.path, barn, repo: p.repo,
             branch: p.branch, log_path: p.log_path, env_path: p.env_path,
             source: None, k8s_metadata: None, trails: vec![],
         };
@@ -600,7 +608,7 @@ impl YeehawServer {
         if project.livestock.len() == before {
             return err_text(&format!("Livestock '{}' not found", p.name));
         }
-        match config::save_project(&project) {
+        match config::save_project(&mut project) {
             Ok(()) => ok_text(&format!("Livestock '{}' removed", p.name)),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -623,9 +631,12 @@ impl YeehawServer {
         };
         let full_path = if log_path.starts_with('/') { log_path } else { format!("{}/{}", livestock.path, log_path) };
         let lines = p.lines.unwrap_or(100);
-        let barn = livestock.barn.as_ref().and_then(|bn| find_barn(bn));
+        // Resolved, not read raw: after adoption this machine's own livestock
+        // names a real barn record with no host, and reading its logs over ssh
+        // fails outright for a file sitting right here.
+        let barn = config::resolve_livestock_barn(livestock).and_then(find_barn);
 
-        let output = if let Some(barn) = barn.filter(|b| !config::is_local_barn(b)) {
+        let output = if let Some(barn) = barn.filter(|b| !config::barn_is_this_machine(b)) {
             // No stat available over ssh, so the trailing slash is the only signal.
             let cmd = build_log_command(&full_path, lines, p.pattern.as_deref(), full_path.ends_with('/'));
             read_remote_output(&barn, &cmd)
@@ -703,13 +714,12 @@ impl YeehawServer {
     async fn create_barn(&self, params: Parameters<CreateBarnParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         if p.name == config::LOCAL_BARN_NAME { return err_text("Cannot create a barn named 'local'"); }
-        let barn = types::Barn {
+        let mut barn = types::Barn {
             name: p.name, host: Some(p.host), user: Some(p.user),
             port: Some(p.port.unwrap_or(22)), identity_file: Some(p.identity_file),
-            critters: vec![], source: None, connection_type: None,
-            connection_config: None, connectable: None,
+            ..Default::default()
         };
-        match config::save_barn(&barn) {
+        match config::create_barn(&mut barn) {
             Ok(()) => ok_json(&barn),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -727,7 +737,7 @@ impl YeehawServer {
         if let Some(user) = p.user { barn.user = Some(user); }
         if let Some(port) = p.port { barn.port = Some(port); }
         if let Some(key) = p.identity_file { barn.identity_file = Some(key); }
-        match config::save_barn(&barn) {
+        match config::save_barn(&mut barn) {
             Ok(()) => ok_json(&barn),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -781,7 +791,7 @@ impl YeehawServer {
             return err_text(&format!("Section '{}' already exists", p.title));
         }
         project.wiki.push(types::WikiSection { title: p.title.clone(), content: p.content });
-        match config::save_project(&project) {
+        match config::save_project(&mut project) {
             Ok(()) => ok_text(&format!("Section '{}' added", p.title)),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -800,7 +810,7 @@ impl YeehawServer {
         };
         if let Some(new_title) = p.new_title { section.title = new_title; }
         if let Some(content) = p.content { section.content = content; }
-        match config::save_project(&project) {
+        match config::save_project(&mut project) {
             Ok(()) => ok_text(&format!("Section '{}' updated", p.title)),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -818,7 +828,7 @@ impl YeehawServer {
         if project.wiki.len() == before {
             return err_text(&format!("Section '{}' not found", p.title));
         }
-        match config::save_project(&project) {
+        match config::save_project(&mut project) {
             Ok(()) => ok_text(&format!("Section '{}' deleted", p.title)),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -843,7 +853,7 @@ impl YeehawServer {
             source: None, endpoint: None, port: None,
             k8s_metadata: None, tf_metadata: None,
         });
-        match config::save_barn(&barn) {
+        match config::save_barn(&mut barn) {
             Ok(()) => ok_text(&format!("Critter '{}' added to barn '{}'", p.name, p.barn)),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -861,7 +871,7 @@ impl YeehawServer {
         if barn.critters.len() == before {
             return err_text(&format!("Critter '{}' not found", p.name));
         }
-        match config::save_barn(&barn) {
+        match config::save_barn(&mut barn) {
             Ok(()) => ok_text(&format!("Critter '{}' removed", p.name)),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -950,7 +960,7 @@ impl YeehawServer {
         project.herds.push(types::Herd {
             name: p.name.clone(), livestock: vec![], critters: vec![], connections: vec![],
         });
-        match config::save_project(&project) {
+        match config::save_project(&mut project) {
             Ok(()) => ok_text(&format!("Herd '{}' created", p.name)),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -968,7 +978,7 @@ impl YeehawServer {
         if project.herds.len() == before {
             return err_text(&format!("Herd '{}' not found", p.name));
         }
-        match config::save_project(&project) {
+        match config::save_project(&mut project) {
             Ok(()) => ok_text(&format!("Herd '{}' deleted", p.name)),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -994,7 +1004,7 @@ impl YeehawServer {
             None => return err_text(&format!("Herd '{}' not found", p.herd)),
         };
         herd.livestock.push(p.livestock.clone());
-        match config::save_project(&project) {
+        match config::save_project(&mut project) {
             Ok(()) => ok_text(&format!("Livestock '{}' added to herd '{}'", p.livestock, p.herd)),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -1016,7 +1026,7 @@ impl YeehawServer {
         if herd.livestock.len() == before {
             return err_text(&format!("Livestock '{}' not in herd '{}'", p.livestock, p.herd));
         }
-        match config::save_project(&project) {
+        match config::save_project(&mut project) {
             Ok(()) => ok_text(&format!("Livestock '{}' removed from herd '{}'", p.livestock, p.herd)),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -1037,7 +1047,7 @@ impl YeehawServer {
             return err_text("Critter already in herd");
         }
         herd.critters.push(types::HerdCritterRef { barn: p.barn.clone(), critter: p.critter.clone() });
-        match config::save_project(&project) {
+        match config::save_project(&mut project) {
             Ok(()) => ok_text(&format!("Critter '{}/{}' added to herd '{}'", p.barn, p.critter, p.herd)),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -1059,7 +1069,7 @@ impl YeehawServer {
         if herd.critters.len() == before {
             return err_text("Critter not in herd");
         }
-        match config::save_project(&project) {
+        match config::save_project(&mut project) {
             Ok(()) => ok_text(&format!("Critter removed from herd '{}'", p.herd)),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -1094,11 +1104,12 @@ impl YeehawServer {
         if p.worm_type != "shell" && p.worm_type != "claude" {
             return err_text("Worm type must be 'shell' or 'claude'");
         }
-        let worm = types::Worm {
+        let mut worm = types::Worm {
             name: p.name, command: p.command, schedule: p.schedule,
             worm_type: p.worm_type, enabled: true, project: p.project, working_dir: p.working_dir,
+            id: None, created_at: None, updated_at: None,
         };
-        match config::save_worm(&worm) {
+        match config::create_worm(&mut worm) {
             Ok(()) => { let _ = crontab::sync_crontab(); ok_json(&worm) }
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -1115,7 +1126,7 @@ impl YeehawServer {
         if let Some(schedule) = p.schedule { worm.schedule = schedule; }
         if let Some(project) = p.project { worm.project = Some(project); }
         if let Some(working_dir) = p.working_dir { worm.working_dir = Some(working_dir); }
-        match config::save_worm(&worm) {
+        match config::save_worm(&mut worm) {
             Ok(()) => { let _ = crontab::sync_crontab(); ok_json(&worm) }
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -1138,7 +1149,7 @@ impl YeehawServer {
             None => return err_text(&format!("Worm '{}' not found", p.name)),
         };
         worm.enabled = p.enabled.unwrap_or(!worm.enabled);
-        match config::save_worm(&worm) {
+        match config::save_worm(&mut worm) {
             Ok(()) => {
                 let _ = crontab::sync_crontab();
                 let state = if worm.enabled { "enabled" } else { "disabled" };
@@ -1185,6 +1196,9 @@ impl YeehawServer {
             "triggered_at": now.to_rfc3339(),
             "trigger": "manual"
         });
+        // Bare `fs::write`, never `store::write_atomic`: the watcher would consume
+        // and delete the temp file before the rename could publish it. See the
+        // invariant on `config::worm_triggers_dir()`.
         match std::fs::write(&trigger_path, trigger.to_string()) {
             Ok(()) => ok_text(&format!("Worm '{}' triggered", params.0.name)),
             Err(e) => err_text(&format!("Failed: {}", e)),
@@ -1234,7 +1248,7 @@ impl YeehawServer {
             serde_json::to_value(&p.config).unwrap_or_default()
         ).unwrap_or_default();
 
-        let rh = types::RanchHand {
+        let mut rh = types::RanchHand {
             name: p.name,
             project: p.project,
             rh_type: p.rh_type,
@@ -1246,8 +1260,11 @@ impl YeehawServer {
             herd: p.herd,
             resource_mappings: vec![],
             last_sync: None,
+            id: None,
+            created_at: None,
+            updated_at: None,
         };
-        match config::save_ranchhand(&rh) {
+        match config::create_ranchhand(&mut rh) {
             Ok(()) => ok_json(&rh),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -1309,7 +1326,7 @@ impl YeehawServer {
             None => return err_text(&format!("Ranch hand not found: {}", p.name)),
         };
         rh.herd = selected_herds.first().map(|s| s.to_string()).unwrap_or_default();
-        match config::save_ranchhand(&rh) {
+        match config::save_ranchhand(&mut rh) {
             Ok(()) => ok_text(&format!("Updated ranch hand '{}' to sync herd: {}", p.name, if rh.herd.is_empty() { "(none)" } else { &rh.herd })),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
@@ -1344,13 +1361,15 @@ impl YeehawServer {
         let sync_summary;
 
         if rh.rh_type == "kubernetes" {
-            let result = match ranchhand_k8s::sync_k8s_resources(&rh) {
+            let mut result = match ranchhand_k8s::sync_k8s_resources(&rh) {
                 Ok(r) => r,
                 Err(e) => return err_text(&format!("K8s sync failed: {}", e)),
             };
 
-            // Save barns (create if not exists)
-            for barn in &result.barns {
+            // Save barns (create if not exists). Iterated mutably so
+            // `save_barn` stamps the barn that stays in `result` too, rather
+            // than a throwaway clone.
+            for barn in &mut result.barns {
                 if find_barn(&barn.name).is_none() {
                     let _ = config::save_barn(barn);
                 }
@@ -1384,19 +1403,20 @@ impl YeehawServer {
                 }
             }
 
-            let _ = config::save_project(&project);
+            let _ = config::save_project(&mut project);
             let _ = config::update_ranchhand_last_sync(&rh_name);
 
             sync_summary = format!("Synced from K8s: {} barns, {} livestock, {} critters, {} herds",
                 result.barns.len(), result.livestock.len(), result.critters.len(), result.herds.len());
         } else if rh.rh_type == "terraform" {
-            let result = match ranchhand_terraform::sync_terraform_resources(&rh) {
+            let mut result = match ranchhand_terraform::sync_terraform_resources(&rh) {
                 Ok(r) => r,
                 Err(e) => return err_text(&format!("Terraform sync failed: {}", e)),
             };
 
-            // Save barns (create if not exists)
-            for barn in &result.barns {
+            // See the K8s branch: mutable so the stamp lands on the barn that
+            // `result` keeps holding.
+            for barn in &mut result.barns {
                 if find_barn(&barn.name).is_none() {
                     let _ = config::save_barn(barn);
                 }
@@ -1415,16 +1435,17 @@ impl YeehawServer {
                     connection_type: Some("terraform".to_string()),
                     connection_config: None,
                     connectable: Some(false),
+                    ..Default::default()
                 });
                 for critter in &result.critters {
                     if !tf_barn.critters.iter().any(|c| c.name == critter.name) {
                         tf_barn.critters.push(critter.clone());
                     }
                 }
-                let _ = config::save_barn(&tf_barn);
+                let _ = config::save_barn(&mut tf_barn);
             }
 
-            let _ = config::save_project(&project);
+            let _ = config::save_project(&mut project);
             let _ = config::update_ranchhand_last_sync(&rh_name);
 
             sync_summary = format!("Synced from Terraform: {} barns, {} critters",
@@ -1474,7 +1495,7 @@ impl YeehawServer {
     #[tool(description = "Create a new trail from GHA-compatible YAML content")]
     async fn create_trail(&self, params: Parameters<CreateTrailParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let trail: crate::trails::Trail = match serde_yaml::from_str(&p.content) {
+        let mut trail: crate::trails::Trail = match serde_yaml::from_str(&p.content) {
             Ok(t) => t,
             Err(e) => return err_text(&format!("Invalid trail YAML: {}", e)),
         };
@@ -1487,7 +1508,7 @@ impl YeehawServer {
         if trail.jobs.is_empty() {
             return err_text("Trail must have at least one job");
         }
-        match config::save_trail(&trail) {
+        match config::create_trail(&mut trail) {
             Ok(_) => ok_text(&format!("Trail '{}' created", p.name)),
             Err(e) => err_text(&format!("Failed to save trail: {}", e)),
         }
@@ -1496,14 +1517,37 @@ impl YeehawServer {
     #[tool(description = "Update an existing trail with new YAML content")]
     async fn update_trail(&self, params: Parameters<UpdateTrailParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        if config::load_trail(&p.name).is_none() {
-            return err_text(&format!("Trail '{}' not found", p.name));
-        }
-        let trail: crate::trails::Trail = match serde_yaml::from_str(&p.content) {
+        let existing = match config::load_trail(&p.name) {
+            Some(t) => t,
+            None => return err_text(&format!("Trail '{}' not found", p.name)),
+        };
+        let mut trail: crate::trails::Trail = match serde_yaml::from_str(&p.content) {
             Ok(t) => t,
             Err(e) => return err_text(&format!("Invalid trail YAML: {}", e)),
         };
-        match config::save_trail(&trail) {
+        // The same guard `create_trail` has. `save_trail` writes to
+        // `trails/<yaml name>.yaml`, so without it an update whose YAML names a
+        // different trail is an unguarded rename: it writes a second file
+        // carrying this trail's uuid while the original file keeps it too.
+        // Renaming a trail is not something this tool offers; say so.
+        if trail.name != p.name {
+            return err_text(&format!(
+                "Trail name in YAML ('{}') doesn't match parameter ('{}')",
+                trail.name, p.name
+            ));
+        }
+        // This replaces the file wholesale from caller-supplied YAML, which
+        // normally carries no meta fields. Without the carry-forward the update
+        // would mint a fresh uuid and read downstream as a delete plus a
+        // create.
+        //
+        // `existing` first, deliberately. The other order lets the payload win,
+        // so YAML copied from another trail silently re-parents this one onto
+        // that trail's uuid. Identity belongs to the file on disk; the caller
+        // is supplying content, not identity.
+        trail.id = existing.id.or(trail.id);
+        trail.created_at = existing.created_at.or(trail.created_at);
+        match config::save_trail(&mut trail) {
             Ok(_) => ok_text(&format!("Trail '{}' updated", p.name)),
             Err(e) => err_text(&format!("Failed to update trail: {}", e)),
         }
@@ -1556,6 +1600,9 @@ impl YeehawServer {
         let trigger_path = config::worm_triggers_dir().join(&filename);
         std::fs::create_dir_all(config::worm_triggers_dir())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Bare `fs::write`, never `store::write_atomic`: the watcher would consume
+        // and delete the temp file before the rename could publish it. See the
+        // invariant on `config::worm_triggers_dir()`.
         std::fs::write(&trigger_path, serde_json::to_string_pretty(&trigger).unwrap())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         ok_text(&format!(
@@ -1732,6 +1779,441 @@ pub async fn run() -> Result<()> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    // === MCP tool harness ==================================================
+
+    /// Drives one async tool body to completion on the *calling* thread.
+    ///
+    /// A current-thread runtime on purpose: `crate::testing`'s ranch override
+    /// is thread-local, so a multi-thread runtime would run the tool on a
+    /// worker that never inherited it and `yeehaw_dir()` would panic.
+    fn call_tool<F>(future: F) -> CallToolResult
+    where
+        F: std::future::Future<Output = Result<CallToolResult, McpError>>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime")
+            .block_on(future)
+            .expect("a tool must return a result, not a protocol error")
+    }
+
+    fn is_error(result: &CallToolResult) -> bool {
+        result.is_error.unwrap_or(false)
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        serde_json::to_string(&result.content).unwrap_or_default()
+    }
+
+    fn trail_yaml(name: &str, extra: &str) -> String {
+        format!(
+            "name: {name}\n{extra}jobs:\n  build:\n    steps:\n      - name: echo\n        run: echo hi\n"
+        )
+    }
+
+    fn trail_files() -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(config::trails_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".yaml"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// `create_trail` checks that the YAML's `name` matches the `name`
+    /// parameter; `update_trail` did not. Updating "deploy" with YAML naming
+    /// "deploy-v2" therefore wrote a *second* file carrying deploy's uuid while
+    /// `deploy.yaml` kept it too — an unguarded rename that leaves one identity
+    /// on two files.
+    #[test]
+    fn update_trail_refuses_yaml_that_renames_the_trail() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let mut trail: crate::trails::Trail =
+            serde_yaml::from_str(&trail_yaml("deploy", "")).unwrap();
+        config::save_trail(&mut trail).unwrap();
+        let id = trail.id.clone().unwrap();
+
+        let result = call_tool(YeehawServer::new().update_trail(Parameters(UpdateTrailParams {
+            name: "deploy".into(),
+            content: trail_yaml("deploy-v2", ""),
+        })));
+
+        assert!(
+            is_error(&result),
+            "a rename disguised as an update must be refused, got: {}",
+            text_of(&result)
+        );
+        assert_eq!(
+            trail_files(),
+            vec!["deploy.yaml".to_string()],
+            "no second file may be created"
+        );
+        assert_eq!(
+            config::load_trail("deploy").unwrap().id.as_ref(),
+            Some(&id),
+            "the original must keep its identity"
+        );
+    }
+
+    /// The identity carry-forward has to read the *file*, not the payload.
+    /// `trail.id.or(existing.id)` lets caller-supplied YAML win, so pasting a
+    /// trail copied from somewhere else silently re-parents this one onto that
+    /// trail's uuid — two files, one identity, again.
+    #[test]
+    fn update_trail_keeps_the_stored_identity_over_one_supplied_by_the_caller() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let mut trail: crate::trails::Trail =
+            serde_yaml::from_str(&trail_yaml("deploy", "")).unwrap();
+        config::save_trail(&mut trail).unwrap();
+        let stored_id = trail.id.clone().unwrap();
+        let stored_created_at = trail.created_at.clone().unwrap();
+
+        let result = call_tool(YeehawServer::new().update_trail(Parameters(UpdateTrailParams {
+            name: "deploy".into(),
+            content: trail_yaml(
+                "deploy",
+                "id: 00000000-0000-4000-8000-000000000000\ncreated_at: '2000-01-01T00:00:00+00:00'\n",
+            ),
+        })));
+
+        assert!(!is_error(&result), "the update itself must succeed: {}", text_of(&result));
+
+        let loaded = config::load_trail("deploy").unwrap();
+        assert_eq!(
+            loaded.id.as_ref(),
+            Some(&stored_id),
+            "the file on disk is authoritative for identity"
+        );
+        assert_eq!(
+            loaded.created_at.as_ref(),
+            Some(&stored_created_at),
+            "created_at is identity too and must not be overridable"
+        );
+    }
+
+    // === create must not clobber ==========================================
+    //
+    // Only the refusal path is driven through the MCP tools here. The happy
+    // path for `create_worm` calls `crontab::sync_crontab()`, which rewrites
+    // the developer's real crontab — no temp ranch protects that. Successful
+    // creation is covered in `config::tests` instead, where it stays on disk.
+
+    /// The likeliest source of the two `barn: local` records in the real
+    /// ranch. An agent can pass any string here, and `local` is the obvious one
+    /// to reach for — but it is machine-relative with a different spelling than
+    /// `None`, which is exactly the pin the ranch cannot sync.
+    #[test]
+    fn add_livestock_never_stores_the_literal_local() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let mut project = types::Project {
+            name: "api".into(),
+            path: "/tmp/api".into(),
+            summary: None,
+            color: None,
+            gradient_spread: None,
+            gradient_inverted: None,
+            livestock: vec![],
+            herds: vec![],
+            wiki: vec![],
+            issue_provider: None,
+            wiki_provider: None,
+            id: None,
+            created_at: None,
+            updated_at: None,
+        };
+        config::save_project(&mut project).unwrap();
+
+        let add = |name: &str, barn: Option<&str>| {
+            call_tool(YeehawServer::new().add_livestock(Parameters(AddLivestockParams {
+                project: "api".into(),
+                name: name.into(),
+                path: format!("/tmp/{name}"),
+                barn: barn.map(str::to_string),
+                repo: None,
+                branch: None,
+                log_path: None,
+                env_path: None,
+            })));
+        };
+
+        add("web", Some("local"));
+        add("worker", Some("pi"));
+        add("cron", None);
+
+        let stored = |name: &str| -> Option<String> {
+            config::load_projects()
+                .into_iter()
+                .find(|p| p.name == "api")
+                .unwrap()
+                .livestock
+                .into_iter()
+                .find(|l| l.name == name)
+                .unwrap()
+                .barn
+        };
+
+        assert_eq!(stored("web"), None, "`local` is not a barn to pin to");
+        assert_eq!(stored("worker"), Some("pi".to_string()));
+        assert_eq!(stored("cron"), None);
+
+        crate::migrate::adopt_this_machine("imac").unwrap();
+        add("api", Some("local"));
+
+        assert_eq!(
+            stored("api"),
+            Some("imac".to_string()),
+            "an adopted machine writes its real name"
+        );
+    }
+
+    /// `read_livestock_logs` picked its barn straight off `livestock.barn`, so
+    /// after adoption a log file sitting on this very machine is read over ssh
+    /// — to a self-barn with no host, which fails outright. The livestock has
+    /// not moved; only its spelling changed.
+    #[test]
+    fn logs_for_a_livestock_here_are_read_locally_after_adoption() {
+        let _ranch = crate::testing::temp_ranch();
+        let (_dir, log_path) = log_fixture("the local log line\n");
+
+        let mut project = types::Project {
+            name: "api".into(),
+            path: "/tmp/api".into(),
+            summary: None,
+            color: None,
+            gradient_spread: None,
+            gradient_inverted: None,
+            livestock: vec![types::Livestock {
+                name: "web".into(),
+                path: "/tmp/web".into(),
+                barn: None,
+                repo: None,
+                branch: None,
+                log_path: Some(log_path.clone()),
+                env_path: None,
+                source: None,
+                k8s_metadata: None,
+                trails: vec![],
+            }],
+            herds: vec![],
+            wiki: vec![],
+            issue_provider: None,
+            wiki_provider: None,
+            id: None,
+            created_at: None,
+            updated_at: None,
+        };
+        config::save_project(&mut project).unwrap();
+
+        let read = || {
+            text_of(&call_tool(YeehawServer::new().read_livestock_logs(Parameters(
+                ReadLogsParams {
+                    project: "api".into(),
+                    livestock: "web".into(),
+                    lines: None,
+                    pattern: None,
+                },
+            ))))
+        };
+
+        let before = read();
+        assert!(before.contains("the local log line"), "got: {before}");
+
+        crate::migrate::adopt_this_machine("imac").unwrap();
+
+        let after = read();
+        assert!(
+            after.contains("the local log line"),
+            "adoption must not turn a local log read into ssh, got: {after}"
+        );
+    }
+
+    /// `create_project` builds a project with empty `livestock`, `herds` and
+    /// `wiki` and no id. Landing that on an existing file destroys the content
+    /// *and* mints a fresh uuid over the old one: the entity is gone and, to
+    /// anything syncing on the uuid, a different entity now wears its name.
+    #[test]
+    fn create_project_refuses_to_overwrite_an_existing_project() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let mut existing = types::Project {
+            name: "api".into(),
+            path: "/tmp/api".into(),
+            summary: Some("the real one".into()),
+            color: None,
+            gradient_spread: None,
+            gradient_inverted: None,
+            livestock: vec![types::Livestock {
+                name: "web".into(),
+                path: "/tmp/web".into(),
+                barn: None,
+                repo: None,
+                branch: None,
+                log_path: None,
+                env_path: None,
+                source: None,
+                k8s_metadata: None,
+                trails: vec![],
+            }],
+            herds: vec![],
+            wiki: vec![],
+            issue_provider: None,
+            wiki_provider: None,
+            id: None,
+            created_at: None,
+            updated_at: None,
+        };
+        config::save_project(&mut existing).unwrap();
+        let id = existing.id.clone().unwrap();
+
+        let result = call_tool(YeehawServer::new().create_project(Parameters(CreateProjectParams {
+            name: "api".into(),
+            path: "/tmp/elsewhere".into(),
+            summary: None,
+            color: None,
+        })));
+
+        assert!(
+            is_error(&result),
+            "creating over an existing project must be refused, got: {}",
+            text_of(&result)
+        );
+        let loaded = config::load_projects();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id.as_ref(), Some(&id), "the uuid must not be re-minted");
+        assert_eq!(loaded[0].livestock.len(), 1, "the livestock must survive");
+        assert_eq!(loaded[0].summary.as_deref(), Some("the real one"));
+    }
+
+    /// The other four creators, each through its own tool. Every one writes its
+    /// own file, so the guard on one proves nothing about the rest.
+    #[test]
+    fn every_mcp_creator_refuses_to_overwrite_an_existing_entity() {
+        let _ranch = crate::testing::temp_ranch();
+        let server = YeehawServer::new();
+
+        let mut barn = types::Barn {
+            name: "pi".into(),
+            host: Some("10.0.0.2".into()),
+            user: Some("forge".into()),
+            port: Some(22),
+            identity_file: None,
+            critters: vec![],
+            ..Default::default()
+        };
+        config::save_barn(&mut barn).unwrap();
+        let barn_id = barn.id.clone().unwrap();
+        let result = call_tool(server.create_barn(Parameters(CreateBarnParams {
+            name: "pi".into(),
+            host: "192.168.0.9".into(),
+            user: "root".into(),
+            port: None,
+            identity_file: "/dev/null".into(),
+        })));
+        assert!(is_error(&result), "create_barn must refuse: {}", text_of(&result));
+        let reloaded = config::load_barns().into_iter().find(|b| b.name == "pi").unwrap();
+        assert_eq!(reloaded.id.as_ref(), Some(&barn_id), "barn uuid must not be re-minted");
+        assert_eq!(reloaded.host.as_deref(), Some("10.0.0.2"), "barn must not be rewritten");
+
+        let mut worm = types::Worm {
+            name: "nightly".into(),
+            command: "echo original".into(),
+            schedule: "* * * * *".into(),
+            worm_type: "shell".into(),
+            enabled: true,
+            project: None,
+            working_dir: None,
+            id: None,
+            created_at: None,
+            updated_at: None,
+        };
+        config::save_worm(&mut worm).unwrap();
+        let worm_id = worm.id.clone().unwrap();
+        let result = call_tool(server.create_worm(Parameters(CreateWormParams {
+            name: "nightly".into(),
+            command: "rm -rf /".into(),
+            schedule: "0 0 * * *".into(),
+            worm_type: "shell".into(),
+            project: None,
+            working_dir: None,
+        })));
+        assert!(is_error(&result), "create_worm must refuse: {}", text_of(&result));
+        let reloaded = config::load_worms().into_iter().find(|w| w.name == "nightly").unwrap();
+        assert_eq!(reloaded.id.as_ref(), Some(&worm_id), "worm uuid must not be re-minted");
+        assert_eq!(reloaded.command, "echo original", "worm must not be rewritten");
+
+        let mut rh = types::RanchHand {
+            name: "cluster".into(),
+            project: "api".into(),
+            rh_type: "kubernetes".into(),
+            config: serde_yaml::Value::Null,
+            sync_settings: types::RanchHandSyncSettings { auto_sync: false, interval_minutes: None },
+            herd: "infra".into(),
+            resource_mappings: vec![],
+            last_sync: None,
+            id: None,
+            created_at: None,
+            updated_at: None,
+        };
+        config::save_ranchhand(&mut rh).unwrap();
+        let rh_id = rh.id.clone().unwrap();
+        let result = call_tool(server.create_ranchhand(Parameters(CreateRanchHandParams {
+            name: "cluster".into(),
+            project: "other".into(),
+            rh_type: "terraform".into(),
+            config: serde_json::Value::Null,
+            herd: "elsewhere".into(),
+        })));
+        assert!(is_error(&result), "create_ranchhand must refuse: {}", text_of(&result));
+        let reloaded = config::load_ranchhands().into_iter().find(|r| r.name == "cluster").unwrap();
+        assert_eq!(reloaded.id.as_ref(), Some(&rh_id), "ranchhand uuid must not be re-minted");
+        assert_eq!(reloaded.herd, "infra", "ranchhand must not be rewritten");
+
+        let mut trail: crate::trails::Trail =
+            serde_yaml::from_str(&trail_yaml("deploy", "")).unwrap();
+        config::save_trail(&mut trail).unwrap();
+        let trail_id = trail.id.clone().unwrap();
+        let result = call_tool(server.create_trail(Parameters(CreateTrailParams {
+            name: "deploy".into(),
+            content: trail_yaml("deploy", "env:\n  STAGE: clobbered\n"),
+        })));
+        assert!(is_error(&result), "create_trail must refuse: {}", text_of(&result));
+        let reloaded = config::load_trail("deploy").unwrap();
+        assert_eq!(reloaded.id.as_ref(), Some(&trail_id), "trail uuid must not be re-minted");
+        assert!(reloaded.env.is_none(), "trail must not be rewritten");
+    }
+
+    /// An update that carries no meta fields at all — the ordinary case — must
+    /// still inherit the stored identity rather than mint a fresh uuid.
+    #[test]
+    fn update_trail_carries_identity_forward_when_the_yaml_has_none() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let mut trail: crate::trails::Trail =
+            serde_yaml::from_str(&trail_yaml("deploy", "")).unwrap();
+        config::save_trail(&mut trail).unwrap();
+        let stored_id = trail.id.clone().unwrap();
+
+        let result = call_tool(YeehawServer::new().update_trail(Parameters(UpdateTrailParams {
+            name: "deploy".into(),
+            content: trail_yaml("deploy", "env:\n  STAGE: prod\n"),
+        })));
+
+        assert!(!is_error(&result), "expected success: {}", text_of(&result));
+        let loaded = config::load_trail("deploy").unwrap();
+        assert_eq!(loaded.id.as_ref(), Some(&stored_id));
+        assert_eq!(
+            loaded.env.as_ref().and_then(|e| e.get("STAGE")).map(String::as_str),
+            Some("prod"),
+            "the update must still apply"
+        );
+    }
 
     // === log command construction ==========================================
     //

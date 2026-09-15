@@ -119,16 +119,14 @@ pub fn save_vault(path: &Path, vault: &Vault, master_password: &str) -> Result<(
     output.extend_from_slice(&nonce_bytes);
     output.extend_from_slice(&ciphertext);
 
-    let tmp_path = path.with_extension("enc.tmp");
-    fs::write(&tmp_path, &output).context("Failed to write vault file")?;
-    fs::rename(&tmp_path, path).context("Failed to finalize vault file")?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        let _ = fs::set_permissions(path, perms);
-    }
+    // The vault is plaintext credentials once decrypted, so it is written
+    // through the store's atomic-write helper rather than by hand: a temp name
+    // that is unique per call (no collision between two overlapping saves), an
+    // fsync of the contents, and 0600 applied to the temp file *before* the
+    // rename — so the file is never reachable at its real name with anything
+    // laxer than owner-only.
+    crate::store::write_atomic_with_mode(path, &output, 0o600)
+        .context("Failed to write vault file")?;
 
     Ok(())
 }
@@ -223,5 +221,121 @@ mod tests {
         assert!(unlock_vault(&path, "old").is_err());
         let loaded = unlock_vault(&path, "new").unwrap();
         assert_eq!(loaded.entries.len(), 1);
+    }
+
+    /// The vault holds plaintext credentials. It must be 0600 the moment the
+    /// name resolves — not 0600 shortly after a rename published it at the
+    /// default mode.
+    #[cfg(unix)]
+    #[test]
+    fn saved_vault_is_owner_only_and_leaves_no_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+
+        create_vault(&path, "pw").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "vault mode is {:o}, expected 600", mode);
+
+        let names: Vec<String> = fs::read_dir(dir.path()).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["vault.enc".to_string()], "stray temp file: {:?}", names);
+    }
+
+    /// A resave must keep 0600 even when the target already exists at a laxer
+    /// mode — `rename` carries the *temp file's* mode onto the target, so the
+    /// mode has to be set on the temp file rather than inherited.
+    #[cfg(unix)]
+    #[test]
+    fn resaving_a_world_readable_vault_restores_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        create_vault(&path, "pw").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let vault = unlock_vault(&path, "pw").unwrap();
+        save_vault(&path, &vault, "pw").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "vault mode is {:o}, expected 600", mode);
+    }
+
+    /// Two saves of the same vault path must both succeed. A fixed temp name
+    /// (`vault.enc.tmp`) makes them collide: both write the same temp file,
+    /// the first rename moves it away, and the second fails with ENOENT — or
+    /// worse, the two interleaved writes are renamed into place as a corrupt
+    /// vault. Correct behavior is atomic last-wins.
+    #[test]
+    fn concurrent_saves_of_one_vault_all_succeed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        create_vault(&path, "pw").unwrap();
+
+        const THREADS: usize = 4;
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut vault = Vault::new();
+                vault.entries.push(crate::types::VaultEntry {
+                    id: format!("id-{}", t),
+                    name: format!("entry-{}", t),
+                    username: None,
+                    password: "pw".to_string(),
+                    notes: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    updated_at: "2026-01-01T00:00:00Z".to_string(),
+                });
+                save_vault(&path, &vault, "pw")
+                    .unwrap_or_else(|e| panic!("thread {} save failed: {:?}", t, e));
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The survivor must be exactly one writer's vault, never a mixture.
+        let loaded = unlock_vault(&path, "pw").expect("surviving vault must decrypt");
+        assert_eq!(loaded.entries.len(), 1);
+        assert!(
+            (0..THREADS).any(|t| loaded.entries[0].name == format!("entry-{}", t)),
+            "unexpected surviving entry: {}",
+            loaded.entries[0].name
+        );
+
+        let names: Vec<String> = fs::read_dir(dir.path()).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["vault.enc".to_string()], "stray temp file: {:?}", names);
+    }
+
+    /// The temp file's name must be unique per call, not a fixed
+    /// `<target>.enc.tmp` derived from the target. Two saves of one vault that
+    /// overlap would otherwise build the *same* temp path: they interleave
+    /// their bytes into one file, and the second rename fails with ENOENT
+    /// after the first has already moved it away.
+    ///
+    /// That race is far too narrow to provoke on demand — Argon2 dominates
+    /// every save, so two threads are essentially never inside the few
+    /// microseconds between write and rename together. So the property is
+    /// pinned the way `store.rs` pins it: occupy the predictable name and
+    /// require the save to be unaffected by it. A save that still insists on
+    /// `vault.enc.tmp` cannot get past this.
+    #[test]
+    fn saving_does_not_depend_on_a_predictable_temp_name() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+
+        // Squat on the name the hand-rolled writer used.
+        fs::create_dir(dir.path().join("vault.enc.tmp")).unwrap();
+
+        create_vault(&path, "pw").expect("save must not collide with vault.enc.tmp");
+        let loaded = unlock_vault(&path, "pw").unwrap();
+        assert!(loaded.entries.is_empty());
     }
 }

@@ -351,6 +351,9 @@ pub fn sync_terraform_resources(ranchhand: &RanchHand) -> Result<TerraformSyncRe
                     connection_type: Some("terraform".to_string()),
                     connection_config: None,
                     connectable: Some(endpoint.is_some()),
+                    // Discovery output, not a stored entity — see the note in
+                    // `ranchhand_k8s.rs`.
+                    ..Default::default()
                 });
             }
         }

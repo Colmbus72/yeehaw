@@ -287,6 +287,13 @@ pub fn sync_k8s_resources(ranchhand: &RanchHand) -> Result<K8sSyncResult, String
                 node: node.metadata.name.clone(),
             }),
             connectable: Some(false),
+            // Discovery output, not a stored entity, so everything `Default`
+            // leaves unset stays unset. The identity in particular: the caller
+            // only persists these when no barn of that name exists yet, so
+            // `save_barn` mints it there, and carrying a fresh uuid here would
+            // hand every sync a new one. Nor does discovery know anything about
+            // ranch membership — a k8s node is not enrolled by being found.
+            ..Default::default()
         }
     }).collect();
 
