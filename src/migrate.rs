@@ -1,11 +1,202 @@
-//! One-time migrations of the on-disk config store.
+//! One-time migrations of the on-disk config store, and the contents of the
+//! record they mint: this machine's own barn.
 
 use std::fs;
+use std::process::Command;
 
 use anyhow::{Context, Result};
 
 use crate::config;
 use crate::types::*;
+
+// ============================================================================
+// What this machine advertises about itself
+// ============================================================================
+
+/// One word of `hostname`'s output, lowercased, or `None` when it says nothing
+/// usable.
+///
+/// Shelled out the same way this codebase shells out to `ssh`, `kubectl` and
+/// `crontab` — there is no hostname in `std` and no crate for it in this tree.
+/// Lowercased for the same reason `ranch::this_machine_default_name` lowercases:
+/// `Cams-iMac.local` is not what anybody types, and DNS does not care.
+///
+/// `localhost` is not an answer. It names the machine asking, which is the one
+/// machine that never needs this list.
+fn hostname(flag: &str) -> Option<String> {
+    let out = Command::new("hostname").arg(flag).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
+    if name.is_empty() || name == "localhost" || name.starts_with("localhost.") {
+        return None;
+    }
+    Some(name)
+}
+
+/// Where this machine believes it can be reached, best effort, freshest first.
+///
+/// # Why a machine has to volunteer this at all
+///
+/// Nobody else can work it out. This machine's own barn record carries no `host`
+/// — from here there is nothing to dial — and that record is exactly what every
+/// peer receives on sync. Unless it says how to be reached, it arrives somewhere
+/// else as a barn with no address at all, which is the bug: `yeehaw connect
+/// smashed-air` from the iMac, and the same in reverse, both refused a machine
+/// the join had reached over ssh minutes earlier.
+///
+/// # What is on the list, and what is deliberately not
+///
+/// **`<hostname>.local`.** mDNS answers it on the same network with no DNS
+/// server, no DHCP reservation and no configuration — it is what the user's iMac
+/// answered to when the join was typed by hand. It survives a new lease, which
+/// is the property that matters here.
+///
+/// **Not the LAN IPs.** They were considered and rejected, on the strength of
+/// what the list *is*: `merge::merge_addresses` unions it and honours no
+/// removals, so an address that reaches a peer can never be taken off again. A
+/// DHCP lease makes `192.168.1.numbers` wrong within the week and then wrong
+/// forever, on every machine on the ranch — and since `ssh::dial_host` dials the
+/// head of the list, a stale entry that reached the head costs a 10-second
+/// `ConnectTimeout` on every connect. A *name* has no such failure mode: it is
+/// re-resolved on each dial, so it follows the machine across leases and
+/// networks. The union's own safety argument in `canonical.rs` ("an address one
+/// machine can use and another cannot costs a connect timeout, not a lost host")
+/// is an argument for tolerating a bad entry, not for minting ones that are
+/// known to go bad.
+///
+/// **Not `hostname -f`.** It performs a reverse lookup, which blocks for seconds
+/// on a machine with no working resolver — and this runs at the head of `ranch
+/// serve`, where the peer is waiting on a greeting.
+///
+/// An address the *user* demonstrably reached this ranch at is a different
+/// matter: that one is known good rather than inferred, and `ranch::join_with`
+/// records it on the peer's record for exactly that reason.
+pub fn this_machine_addresses() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(short) = hostname("-s") {
+        out.push(format!("{}.local", short));
+    }
+    out
+}
+
+/// The user a peer should ssh to this machine as.
+///
+/// `ssh::ssh_args` falls back to `root` for a barn with no user, and macOS
+/// refuses `root@` outright — so a Mac that advertises an address and no user is
+/// still unreachable. `whoami` rather than `$USER`: the environment is not set
+/// for a process launched by sshd or launchd, and this is read on both paths.
+pub fn this_machine_user() -> Option<String> {
+    let out = Command::new("whoami").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let user = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if user.is_empty() {
+        None
+    } else {
+        Some(user)
+    }
+}
+
+/// Folds what this machine knows about itself into its own barn record, and
+/// reports whether anything actually changed.
+///
+/// **The return value is not a courtesy.** `config::save_barn` stamps
+/// `updated_at`, and a stamped entity is one the next sync offers; re-writing an
+/// unchanged record on every `ranch serve` would make this machine's own barn
+/// read as modified forever. Callers save only when this says `true` — the same
+/// rule `adopt_this_machine` already applies to projects it did not touch.
+///
+/// **`host` is never written.** That absence is load-bearing: it is how
+/// `adopt_this_machine` tells this machine's own record from a real remote one,
+/// what `connect` and `ranch::resolve_target` read as "nothing to dial", and the
+/// slot a human's own answer in the barn form occupies. Reachability this
+/// machine *inferred* about itself goes to `addresses`, which is a union no
+/// machine has to arbitrate.
+///
+/// **`user` is filled only when absent**, because a user typed into the barn
+/// form is an answer somebody gave on purpose.
+pub fn advertise_this_machine(barn: &mut Barn) -> bool {
+    let mut changed = false;
+
+    if barn.user.is_none() {
+        if let Some(user) = this_machine_user() {
+            barn.user = Some(user);
+            changed = true;
+        }
+    }
+
+    // Current candidates first, then everything already on the record that is
+    // not one of them. Two properties at once: the freshest answer is what
+    // `ssh::dial_host` reaches for, and nothing is ever removed — which is what
+    // `merge::merge_addresses` does on the wire, so the local list and the merged
+    // one agree about order instead of flapping.
+    let mut next = this_machine_addresses();
+    for existing in &barn.addresses {
+        if !next.contains(existing) {
+            next.push(existing.clone());
+        }
+    }
+    if next != barn.addresses {
+        barn.addresses = next;
+        changed = true;
+    }
+
+    changed
+}
+
+/// Applies [`advertise_this_machine`] to this machine's own barn record on disk.
+///
+/// The repair path, and the reason there is deliberately no startup sweep over
+/// the store: a self-barn written before this existed is fixed the next time the
+/// machine adopts ([`adopt_this_machine`]) or syncs (`ranch::serve_session` and
+/// the end of `ranch::join_with`) — on the one record it owns, leaving every
+/// other machine's record alone.
+///
+/// A machine that has never been adopted has no record to write to, and
+/// inventing one would plant a barn the user never named. `Ok(false)`, the same
+/// refusal `ranch::record_our_brand` makes for the same reason.
+///
+/// No sync base is recorded, matching `record_our_brand`: this is a local edit
+/// that has not been sent anywhere, and a base claiming otherwise would have the
+/// next sync read it as already-synced and never offer it.
+pub fn advertise_self_barn() -> Result<bool> {
+    let Some(name) = config::this_barn_name() else {
+        return Ok(false);
+    };
+    advertise_barn_named(&name)
+}
+
+/// [`advertise_self_barn`] against a name the caller already knows.
+///
+/// Split out for [`adopt_this_machine`], which repairs the record it just found
+/// *before* `this_barn` has been written — at that point this machine's own name
+/// is the argument the user passed, not something the config can be asked for.
+fn advertise_barn_named(name: &str) -> Result<bool> {
+    // Held across the read and the write. `save_barn` takes no lock of its own,
+    // so a concurrent writer — the TUI's barn form, `record_our_brand` — read
+    // either side of this would be silently discarded.
+    let _guard = crate::store::lock_entity(&config::barns_dir(), name)?;
+
+    let path = config::barns_dir().join(format!("{}.yaml", name));
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        // `this_barn` names a record that is not there. Not an error worth
+        // failing a sync over, and not something to recreate from nothing.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let mut barn: Barn = serde_yaml::from_str(&content)
+        .with_context(|| format!("barn file {} does not parse", path.display()))?;
+
+    if !advertise_this_machine(&mut barn) {
+        return Ok(false);
+    }
+    config::save_barn(&mut barn)?;
+    Ok(true)
+}
 
 /// What [`adopt_this_machine`] actually changed.
 #[derive(Debug, Clone, PartialEq)]
@@ -134,8 +325,19 @@ pub fn adopt_this_machine(name: &str) -> Result<AdoptionReport> {
             );
         }
         // Already this machine's own record: an earlier adoption under the same
-        // name, or a hand-written hostless barn. Nothing to create.
-        Some(_) => {}
+        // name, or a hand-written hostless barn. Nothing to create — but the
+        // record may well predate the advertisement, which is exactly the state
+        // the live ranch is in: a self-barn with `host: null`, `user: null` and
+        // no addresses, unreachable from every other machine on the ranch. This
+        // is one of the two places that repairs it (the other is a sync), and it
+        // is why there is no silent sweep on startup: the user re-runs the
+        // adoption, or syncs, and gets their own record fixed — nobody else's.
+        //
+        // Not fatal. A machine that cannot work out its own hostname is still
+        // correctly adopted; it is only harder for a peer to reach.
+        Some(_) => {
+            let _ = advertise_barn_named(name);
+        }
         None => {
             let mut barn = Barn {
                 name: name.to_string(),
@@ -156,6 +358,14 @@ pub fn adopt_this_machine(name: &str) -> Result<AdoptionReport> {
                 connectable: Some(false),
                 ..Default::default()
             };
+            // How every *other* machine reaches this one. `host` stays `None`
+            // above because there is nothing to dial from here — but this record
+            // is precisely what syncs to every peer, and to them it is remote.
+            // Without this it arrives as a barn with no address at all, which is
+            // why `yeehaw connect smashed-air` from the iMac answered "has no
+            // host configured" for a machine the join had reached over ssh
+            // minutes earlier. See `advertise_this_machine`.
+            advertise_this_machine(&mut barn);
             // `create_barn`, never `save_barn`: a plain save writes over
             // whatever is at `barns/<name>.yaml`, so a stale existence check
             // would replace a real barn's host, user and critters with this
@@ -406,6 +616,250 @@ mod tests {
             assert_eq!(
                 after.updated_at, before.updated_at,
                 "an untouched project must not be restamped"
+            );
+        });
+    }
+
+    // === what this machine advertises about itself =========================
+    //
+    // THE BUG these cover: `adopt_this_machine` writes this machine's own record
+    // with `host: None` and `user: None`, because from here there is nothing to
+    // dial. That record is exactly what every other machine receives on sync,
+    // and to them it is remote and unreachable — `yeehaw connect smashed-air`
+    // from the iMac answered "barn 'smashed-air' has no host configured", and the
+    // same in reverse, even though the join had just reached both over ssh.
+    //
+    // Nobody else can know how to reach this machine, so it has to volunteer
+    // candidates.
+
+    /// `hostname -s` here, so the expectations below are about *this* machine
+    /// rather than a name baked into the test.
+    fn short_hostname() -> Option<String> {
+        let out = std::process::Command::new("hostname").arg("-s").output().ok()?;
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
+        if !out.status.success() || name.is_empty() || name == "localhost" {
+            None
+        } else {
+            Some(name)
+        }
+    }
+
+    #[test]
+    fn this_machine_advertises_its_mdns_name() {
+        let Some(short) = short_hostname() else {
+            // A machine with no usable hostname has nothing to advertise, and
+            // the candidate list is empty by design. Nothing to assert.
+            return;
+        };
+        let addresses = this_machine_addresses();
+        assert!(
+            addresses.contains(&format!("{}.local", short)),
+            "`<hostname>.local` resolves over mDNS on the same network with no DNS server and \
+             no DHCP reservation — it is what the user's iMac answered to. Got {:?}",
+            addresses
+        );
+    }
+
+    /// Loopback names a machine only to itself, which is the one machine that
+    /// never needs the list. Advertised, it would be dialled by a peer and
+    /// connect to *that peer*.
+    #[test]
+    fn this_machine_never_advertises_loopback() {
+        for a in this_machine_addresses() {
+            assert!(
+                !a.starts_with("localhost") && a != "127.0.0.1" && a != "::1",
+                "loopback names the dialer, not this machine: {:?}",
+                a
+            );
+        }
+    }
+
+    #[test]
+    fn this_machine_knows_which_user_to_be_reached_as() {
+        // `ssh::ssh_args` falls back to `root` for a barn with no user, and a Mac
+        // refuses `root@` outright. The record has to carry the real one.
+        let user = this_machine_user().expect("`whoami` names the user running this");
+        assert!(!user.trim().is_empty());
+        assert_ne!(user, "root", "this suite is not expected to run as root");
+    }
+
+    /// The freshest candidate goes to the head of the list, because that is the
+    /// one `ssh::dial_host` dials and `merge::merge_addresses` preserves the
+    /// order on every peer.
+    #[test]
+    fn advertising_puts_this_machines_own_candidates_first() {
+        let Some(short) = short_hostname() else { return };
+        let mut barn = Barn {
+            name: "smashed-air".into(),
+            addresses: vec!["an-old-name.local".into()],
+            ..Default::default()
+        };
+
+        assert!(advertise_this_machine(&mut barn), "there was something to add");
+        assert_eq!(
+            barn.addresses.first().map(String::as_str),
+            Some(format!("{}.local", short).as_str()),
+            "the current candidate must be dialled first: {:?}",
+            barn.addresses
+        );
+        assert!(
+            barn.addresses.iter().any(|a| a == "an-old-name.local"),
+            "`merge_addresses` honours no removals, so neither may this: {:?}",
+            barn.addresses
+        );
+    }
+
+    /// `save_barn` stamps `updated_at`, and a stamped entity is one the next sync
+    /// offers. Re-advertising the same thing every serve session would make this
+    /// machine's own record look changed on every sync, forever.
+    #[test]
+    fn advertising_twice_changes_nothing_the_second_time() {
+        let mut barn = Barn { name: "smashed-air".into(), ..Default::default() };
+        advertise_this_machine(&mut barn);
+        let after_first = barn.clone();
+
+        assert!(
+            !advertise_this_machine(&mut barn),
+            "nothing changed, so nothing may be reported as changed"
+        );
+        assert_eq!(barn.addresses, after_first.addresses);
+        assert_eq!(barn.user, after_first.user);
+    }
+
+    /// A user the person typed into the TUI's barn form beats `whoami`. They are
+    /// the same machine either way, and the record is the place the answer was
+    /// deliberately given.
+    #[test]
+    fn advertising_does_not_overwrite_a_user_already_on_the_record() {
+        let mut barn = Barn {
+            name: "smashed-air".into(),
+            user: Some("deploy".into()),
+            ..Default::default()
+        };
+        advertise_this_machine(&mut barn);
+        assert_eq!(barn.user.as_deref(), Some("deploy"));
+    }
+
+    /// `host` stays `None`, and that is load-bearing rather than an oversight.
+    /// It is what `adopt_this_machine` reads to tell this machine's own record
+    /// from a real remote one, what `connect` and the TUI see as "nothing to
+    /// dial", and what a human's own answer in the barn form would occupy.
+    /// Reachability that this machine *inferred* about itself belongs in
+    /// `addresses`, which is a union nobody has to arbitrate.
+    #[test]
+    fn advertising_never_invents_a_host() {
+        let mut barn = Barn { name: "smashed-air".into(), ..Default::default() };
+        advertise_this_machine(&mut barn);
+        assert_eq!(barn.host, None, "a machine does not ssh to itself");
+    }
+
+    /// The repair path, and the reason there is no startup sweep: an existing
+    /// self-barn with `host: null` is fixed the next time this machine adopts or
+    /// syncs, on the record it already has, without rewriting anything else.
+    #[test]
+    fn the_self_barn_is_repaired_in_place() {
+        crate::testing::with_temp_ranch(|_| {
+            let Some(short) = short_hostname() else { return };
+            // Exactly what the live ranch holds today: adopted, no host, no user,
+            // no addresses.
+            let mut stale = Barn {
+                name: "smashed-air".into(),
+                connectable: Some(false),
+                source: Some("self".into()),
+                ..Default::default()
+            };
+            config::save_barn(&mut stale).unwrap();
+            let mut cfg = config::load_config();
+            cfg.this_barn = Some("smashed-air".into());
+            config::save_config(&cfg).unwrap();
+
+            assert!(advertise_self_barn().unwrap(), "there was a repair to make");
+
+            let fixed = config::load_barns()
+                .into_iter()
+                .find(|b| b.name == "smashed-air")
+                .expect("the record survives");
+            assert!(
+                fixed.addresses.contains(&format!("{}.local", short)),
+                "{:?}",
+                fixed.addresses
+            );
+            assert!(fixed.user.is_some(), "a peer dialling this must not fall back to root@");
+            assert_eq!(fixed.source.as_deref(), Some("self"), "nothing else may be rewritten");
+            assert_eq!(fixed.connectable, Some(false));
+
+            assert!(
+                !advertise_self_barn().unwrap(),
+                "a second pass has nothing to do, and must not restamp the record"
+            );
+        });
+    }
+
+    /// Before `ranch init` or `ranch join` there is no record to write to, and
+    /// inventing one would plant a barn the user never named — the same refusal
+    /// `ranch::record_our_brand` makes.
+    #[test]
+    fn a_machine_that_was_never_adopted_advertises_nothing() {
+        crate::testing::with_temp_ranch(|_| {
+            assert!(!advertise_self_barn().unwrap());
+            assert!(
+                config::load_barns().iter().all(config::is_local_barn),
+                "no barn may be created by an advertisement"
+            );
+        });
+    }
+
+    /// Adoption is where the record is minted, so it is the first chance to say
+    /// how to reach this machine — and the record it mints is precisely the one
+    /// that syncs to every other machine.
+    #[test]
+    fn adoption_mints_a_record_that_says_how_to_reach_this_machine() {
+        crate::testing::with_temp_ranch(|_| {
+            let Some(short) = short_hostname() else { return };
+            adopt_this_machine("imac").unwrap();
+
+            let imac = config::load_barns()
+                .into_iter()
+                .find(|b| b.name == "imac")
+                .expect("the barn was created");
+            assert!(
+                imac.addresses.contains(&format!("{}.local", short)),
+                "a record with no addresses is unreachable from every other machine: {:?}",
+                imac
+            );
+            assert!(imac.user.is_some(), "and `root@` is not the answer on a Mac");
+            assert_eq!(imac.host, None, "still nothing to dial from here");
+            assert_eq!(imac.connectable, Some(false));
+            assert!(
+                crate::ssh::dial_host(&imac).is_some(),
+                "the whole point: a peer holding this record can build an ssh destination"
+            );
+        });
+    }
+
+    /// The live ranch's self-barns predate the advertisement, and a second
+    /// adoption is how the user re-runs it. It has to repair them — while still
+    /// reporting that it created nothing, which is what `is_idempotent` pins.
+    #[test]
+    fn re_adopting_repairs_a_self_barn_that_advertises_nothing() {
+        crate::testing::with_temp_ranch(|_| {
+            let Some(short) = short_hostname() else { return };
+            let mut stale = Barn {
+                name: "imac".into(),
+                connectable: Some(false),
+                source: Some("self".into()),
+                ..Default::default()
+            };
+            config::save_barn(&mut stale).unwrap();
+
+            let report = adopt_this_machine("imac").unwrap();
+            assert!(!report.barn_created, "the record was already there");
+
+            let imac = config::load_barns().into_iter().find(|b| b.name == "imac").unwrap();
+            assert!(
+                imac.addresses.contains(&format!("{}.local", short)),
+                "an existing self-barn must be repaired, not left unreachable: {:?}",
+                imac
             );
         });
     }

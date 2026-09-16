@@ -33,14 +33,52 @@ fn control_path() -> PathBuf {
     config::yeehaw_dir().join("ssh").join("%r@%h:%p")
 }
 
+/// The address to dial for `barn`: its configured `host`, else the first
+/// address it advertises about itself.
+///
+/// # Why the fallback lives here and nowhere else
+///
+/// `migrate::adopt_this_machine` writes a machine's own barn record with
+/// `host: None`, because from that machine there is nothing to dial — you do not
+/// ssh to yourself. That record is also exactly what every *other* machine
+/// receives on sync, and to them it is remote and unreachable: `ssh_args` refused
+/// it with "has no host configured" even though the join that created it had
+/// reached that machine over ssh moments earlier.
+///
+/// `Barn.addresses` is what a machine volunteers instead (see
+/// [`crate::migrate::advertise_this_machine`]), and this is the one function
+/// that reads it. Every path that dials a barn — [`ssh_args`], and through it
+/// `probe`, `connect`, `remote_grid`, the trail runner — goes through here, and
+/// `ranch::resolve_target` asks the same question before refusing a target. A
+/// fallback written at each of those call sites is five chances to disagree
+/// about which address a barn is at.
+///
+/// **`host` wins.** It is what a human configured for this barn; `addresses` is
+/// what the barn said about itself. Reversing that would make a host edited in
+/// the TUI lose to a stale advertisement.
+///
+/// **The first address, not a search.** `ssh_args` builds one destination and
+/// ssh has no "try these in turn" option, so an ordering is a choice that has to
+/// be made somewhere. It is made at the *writing* end instead:
+/// `advertise_this_machine` puts this machine's freshest candidate at the head
+/// of the list and `merge::merge_addresses` preserves that order on every peer,
+/// so the head of the list is the ranch's current best answer everywhere.
+///
+/// Blank entries are skipped: `""` would build `cam@` and ssh would then read
+/// the next argv element as the destination.
+pub fn dial_host(barn: &Barn) -> Option<&str> {
+    if let Some(host) = barn.host.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+        return Some(host);
+    }
+    barn.addresses.iter().map(|a| a.trim()).find(|a| !a.is_empty())
+}
+
 /// Build the full argument vector for an `ssh` invocation against a barn.
 ///
 /// Single source of truth for host-key policy, timeouts, identity, and
 /// multiplexing. Returns the args only — the caller appends the remote command.
 pub fn ssh_args(barn: &Barn, opts: Opts) -> Result<Vec<String>> {
-    let host = barn
-        .host
-        .as_deref()
+    let host = dial_host(barn)
         .ok_or_else(|| anyhow!("barn '{}' has no host configured", barn.name))?;
     let user = barn.user.as_deref().unwrap_or("root");
     let port = barn.port.unwrap_or(22);
@@ -287,6 +325,84 @@ mod tests {
         let mut b = barn(None);
         b.host = None;
         assert!(ssh_args(&b, Opts::default()).is_err());
+    }
+
+    // === the advertised-address fallback ===================================
+    //
+    // A machine's own barn record is written by `migrate::adopt_this_machine`
+    // with `host: None` — from that machine there is nothing to dial. That
+    // record is exactly what every *other* machine receives on sync, and to them
+    // it is remote. `Barn.addresses` is what it advertises instead, and
+    // `dial_host` is the single place that reads it: see its doc comment for why
+    // the fallback lives here and not at each call site.
+
+    /// THE BUG. The iMac's own record arrives on the MacBook with `host: null`,
+    /// so `ssh_args` refused it outright — `yeehaw connect camerons-imac` said
+    /// "barn 'camerons-imac' has no host configured" even though the join that
+    /// created the record had reached that machine over ssh moments earlier.
+    #[test]
+    fn a_hostless_barn_is_dialled_at_the_address_it_advertises() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut b = barn(None);
+        b.host = None;
+        b.user = Some("cam".into());
+        b.port = None;
+        b.addresses = vec!["camerons-imac.local".into()];
+
+        let args = ssh_args(&b, Opts::default()).expect("an advertised address is dialable");
+        assert!(
+            args.contains(&"cam@camerons-imac.local".to_string()),
+            "the advertised address must be dialled: {:?}",
+            args
+        );
+    }
+
+    /// `host` is what a human configured for this barn; `addresses` is what the
+    /// barn said about itself. The configured value wins, or editing a host in
+    /// the TUI would silently keep dialling a stale advertisement.
+    #[test]
+    fn a_configured_host_beats_an_advertised_address() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut b = barn(None);
+        b.addresses = vec!["stale.local".into()];
+
+        assert_eq!(dial_host(&b), Some("172.233.141.59"));
+        let args = ssh_args(&b, Opts::default()).unwrap();
+        assert!(!args.iter().any(|a| a.contains("stale.local")), "{:?}", args);
+    }
+
+    /// The order is the ranch's answer to "which address first", and it is
+    /// deliberate: `migrate::advertise_this_machine` puts this machine's freshest
+    /// candidate at the head of the list and `merge::merge_addresses` preserves
+    /// that order on every peer. Dialling anything but the first would discard
+    /// it.
+    #[test]
+    fn the_first_advertised_address_is_the_one_dialled() {
+        let mut b = barn(None);
+        b.host = None;
+        b.addresses = vec!["fresh.local".into(), "older.local".into()];
+        assert_eq!(dial_host(&b), Some("fresh.local"));
+    }
+
+    /// A k8s-discovered node has neither, and so does a barn record a user
+    /// half-filled. The refusal has to survive the fallback.
+    #[test]
+    fn a_barn_with_neither_a_host_nor_an_address_is_still_refused() {
+        let mut b = barn(None);
+        b.host = None;
+        assert!(b.addresses.is_empty(), "the fixture must advertise nothing");
+        assert_eq!(dial_host(&b), None);
+        assert!(ssh_args(&b, Opts::default()).is_err());
+    }
+
+    /// A blank entry is not an address. Dialled, it would build `cam@` and ssh
+    /// would read the *next* argv element as the destination.
+    #[test]
+    fn a_blank_advertised_address_is_not_dialled() {
+        let mut b = barn(None);
+        b.host = None;
+        b.addresses = vec!["".into(), "  ".into(), "real.local".into()];
+        assert_eq!(dial_host(&b), Some("real.local"));
     }
 
     #[test]

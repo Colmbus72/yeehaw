@@ -11,6 +11,7 @@ use crate::components::panel::Panel;
 use crate::components::path_input::{self, PathInputState, PathInputAction};
 use crate::components::text_input::TextInput;
 use crate::config;
+use crate::ssh;
 use crate::tmux::{self, TmuxWindow};
 use crate::types::*;
 
@@ -627,27 +628,71 @@ fn build_project_items(projects: &[Project], windows: &[TmuxWindow]) -> Vec<List
 ///
 /// No tmux call happens in here: the set is refreshed on the app's idle tick.
 fn build_barn_items(barns: &[Barn], connected: &HashSet<String>) -> Vec<ListItem> {
+    // Once for the panel, not once per row. `this_barn_name` is a single small
+    // read by design, but this runs on every redraw and a ranch has as many rows
+    // as it has machines.
+    let this_machine = config::this_barn_name();
+
     barns.iter().map(|b| {
         let is_connected = connected.contains(&tmux::barn_session_name(&b.name));
-        let base_meta = if config::is_local_barn(b) {
-            Some("this machine".to_string())
-        } else {
-            b.user.as_ref().zip(b.host.as_ref())
-                .map(|(u, h)| format!("{}@{}", u, h))
-        };
-        let meta = match (base_meta, is_connected) {
-            (Some(m), true) => Some(format!("{} · connected", m)),
-            (None, true) => Some("connected".to_string()),
-            (m, false) => m,
-        };
+        // Two different questions, and both answer "this machine".
+        // `is_local_barn` knows only the synthetic `local` row; after adoption
+        // there is *also* a real record — a name, a uuid, a place in the ranch —
+        // and without the second half that row reads as a remote barn with
+        // nothing to dial. The label still distinguishes them: only the
+        // synthetic one is called `local`.
+        let is_this_machine =
+            config::is_local_barn(b) || this_machine.as_deref() == Some(b.name.as_str());
+
+        // Built as parts and joined rather than nested formats: there are four
+        // things a row can now say and every combination occurs — the Ranch
+        // House is exactly the barn most likely to be all four at once.
+        let mut parts: Vec<String> = Vec::new();
+
+        // Identity first: what this row *is*, or where it will be reached.
+        if is_this_machine {
+            parts.push("this machine".to_string());
+        } else if let Some((user, host)) = b.user.as_deref().zip(ssh::dial_host(b)) {
+            // `dial_host`, not `b.host`: a barn record that arrived from the
+            // machine it describes carries no host — that machine had nothing to
+            // dial itself with — only the addresses it advertised, and those are
+            // what ssh will actually use. Reading `b.host` here would leave the
+            // row blank for precisely the barns the ranch just learned about.
+            parts.push(format!("{}@{}", user, host));
+        }
+
+        // Then role, then ranch membership, then live state — least volatile to
+        // most, which leaves `connected` last where it has always been.
+        //
+        // Both new markers are *additive*: a row says "ranch house" or "synced"
+        // when it is one and says nothing extra when it is not. That is what
+        // lets them ride in `meta` at all — the synthetic `local` row still
+        // reads exactly "this machine", and no other view's `ListItem` changes.
+        if b.is_ranch_house == Some(true) {
+            parts.push("ranch house".to_string());
+        }
+        // `Some(true)` only. `Some(false)` is a barn this machine has decided not
+        // to sync, `None` is one nothing has enrolled — different states, neither
+        // of them "in the ranch", and `types.rs` pins that absent is not `false`
+        // dressed up as an answer.
+        if b.synced == Some(true) {
+            parts.push("synced".to_string());
+        }
+        if is_connected {
+            parts.push("connected".to_string());
+        }
+
         ListItem {
             id: b.name.clone(),
             label: if config::is_local_barn(b) { "local".to_string() } else { b.name.clone() },
             // The green dot is the connection: it used to be Active for every
             // barn, which said nothing. Every other panel here already reads its
             // dot as live state (a project with sessions, an enabled worm).
+            // `ItemStatus` has three variants and connectedness already spends
+            // them, so the two ranch indicators had to go somewhere else
+            // regardless of which carrier was cheapest.
             status: Some(if is_connected { ItemStatus::Active } else { ItemStatus::Inactive }),
-            meta,
+            meta: (!parts.is_empty()).then(|| parts.join(" · ")),
             actions: vec![RowAction { key: "s".to_string(), label: "shell".to_string() }],
         }
     }).collect()
@@ -736,6 +781,10 @@ mod tests {
 
     #[test]
     fn a_connected_barn_gets_the_green_dot_and_the_word_connected() {
+        // `build_barn_items` asks `config::this_barn_name()` which row is this
+        // machine, so it reads the config file. Harness only — no assertion below
+        // depends on what is in it.
+        let _ranch = crate::testing::temp_ranch();
         let barns = [barn("guided")];
         let set = connected(&[tmux::barn_session_name("guided")]);
 
@@ -747,6 +796,10 @@ mod tests {
 
     #[test]
     fn a_barn_with_no_session_is_not_marked_connected() {
+        // `build_barn_items` asks `config::this_barn_name()` which row is this
+        // machine, so it reads the config file. Harness only — no assertion below
+        // depends on what is in it.
+        let _ranch = crate::testing::temp_ranch();
         let barns = [barn("guided")];
 
         let items = build_barn_items(&barns, &HashSet::new());
@@ -760,6 +813,10 @@ mod tests {
     /// target-keyed lookup would silently never match.
     #[test]
     fn the_indicator_matches_names_as_tmux_reports_them_not_targets() {
+        // `build_barn_items` asks `config::this_barn_name()` which row is this
+        // machine, so it reads the config file. Harness only — no assertion below
+        // depends on what is in it.
+        let _ranch = crate::testing::temp_ranch();
         let barns = [barn("guided")];
         // Exactly what `tmux list-sessions -F '#{session_name}'` prints, plus
         // unrelated sessions that must not confuse the filter.
@@ -780,6 +837,10 @@ mod tests {
     /// different hosts, and the hash suffix is what keeps their sessions apart.
     #[test]
     fn a_barn_is_not_marked_connected_by_another_barns_session() {
+        // `build_barn_items` asks `config::this_barn_name()` which row is this
+        // machine, so it reads the config file. Harness only — no assertion below
+        // depends on what is in it.
+        let _ranch = crate::testing::temp_ranch();
         let barns = [barn("guided"), barn("guided-2")];
         let set = connected(&[tmux::barn_session_name("guided-2")]);
 
@@ -793,6 +854,7 @@ mod tests {
     /// even though its row still shows "this machine".
     #[test]
     fn the_local_barn_keeps_its_meta_and_never_shows_connected() {
+        let _ranch = crate::testing::temp_ranch();
         let barns = [config::local_barn()];
 
         let items = build_barn_items(&barns, &HashSet::new());
@@ -800,6 +862,141 @@ mod tests {
         assert_eq!(items[0].label, "local");
         assert_eq!(items[0].meta.as_deref(), Some("this machine"));
         assert_eq!(items[0].status, Some(ItemStatus::Inactive));
+    }
+
+    // === ranch membership on the barn rows ==================================
+    //
+    // The user joined a ranch and there was no sign of it anywhere in the TUI.
+    // Both indicators ride in `meta` — see `build_barn_items` for why that
+    // rather than a new `ListItem` field — and both are *additive*: a row says
+    // "ranch house" or "synced" when it is one, and says nothing extra when it
+    // is not. That is what keeps the local barn's row exactly "this machine"
+    // and leaves every other view's `ListItem` construction untouched.
+
+    /// There is exactly one Ranch House per ranch and it is the machine that
+    /// arbitrates every merge. Nothing in the TUI said which one it was.
+    #[test]
+    fn the_ranch_house_is_marked_on_its_row() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut house = barn("camerons-imac");
+        house.is_ranch_house = Some(true);
+
+        let items = build_barn_items(&[house, barn("guided")], &HashSet::new());
+
+        assert!(
+            items[0].meta.as_deref().unwrap().contains("ranch house"),
+            "the house must be identifiable: {:?}",
+            items[0].meta
+        );
+        assert!(
+            !items[1].meta.as_deref().unwrap().contains("ranch house"),
+            "and only the house: {:?}",
+            items[1].meta
+        );
+    }
+
+    /// `synced` is what says this machine actually exchanges entities with a
+    /// barn. A ranch the user just joined looked identical to one they had not.
+    #[test]
+    fn a_barn_in_the_ranch_is_distinguished_from_one_that_is_not() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut enrolled = barn("camerons-imac");
+        enrolled.synced = Some(true);
+        let mut declined = barn("guided");
+        declined.synced = Some(false);
+
+        let items = build_barn_items(&[enrolled, declined, barn("never-asked")], &HashSet::new());
+
+        assert!(items[0].meta.as_deref().unwrap().contains("synced"), "{:?}", items[0].meta);
+        assert!(
+            !items[1].meta.as_deref().unwrap().contains("synced"),
+            "`Some(false)` is a barn this machine does not sync: {:?}",
+            items[1].meta
+        );
+        assert!(
+            !items[2].meta.as_deref().unwrap().contains("synced"),
+            "and absent is not `false` dressed up as an answer: {:?}",
+            items[2].meta
+        );
+    }
+
+    /// The indicators compose with each other and with the connection dot,
+    /// because the Ranch House is exactly the barn most likely to be all three
+    /// at once.
+    #[test]
+    fn the_markers_compose_without_displacing_the_connection() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut house = barn("camerons-imac");
+        house.is_ranch_house = Some(true);
+        house.synced = Some(true);
+        let set = connected(&[tmux::barn_session_name("camerons-imac")]);
+
+        let items = build_barn_items(&[house], &set);
+
+        let meta = items[0].meta.clone().unwrap();
+        for expected in ["forge@172.233.141.59", "ranch house", "synced", "connected"] {
+            assert!(meta.contains(expected), "{:?} missing from {:?}", expected, meta);
+        }
+        assert_eq!(
+            items[0].status,
+            Some(ItemStatus::Active),
+            "the dot is still the connection and nothing else"
+        );
+    }
+
+    /// After adoption this machine has a *real* barn record — a name, a uuid, a
+    /// place in the ranch — and the synthetic `local` row sits above it. Both
+    /// are this machine, and `is_local_barn` only ever knew the synthetic one, so
+    /// the real row used to read as a remote barn with nothing to dial.
+    #[test]
+    fn the_adopted_self_barn_reads_as_this_machine_and_keeps_its_own_name() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut cfg = config::load_config();
+        cfg.this_barn = Some("smashed-air".into());
+        config::save_config(&cfg).unwrap();
+
+        let mut self_barn = Barn {
+            name: "smashed-air".into(),
+            host: None,
+            user: Some("cam".into()),
+            synced: Some(true),
+            ..Default::default()
+        };
+        self_barn.addresses = vec!["smashed-air.local".into()];
+
+        let items =
+            build_barn_items(&[config::local_barn(), self_barn, barn("guided")], &HashSet::new());
+
+        assert_eq!(items[1].label, "smashed-air", "its own name, not the `local` alias");
+        let meta = items[1].meta.clone().unwrap();
+        assert!(
+            meta.starts_with("this machine"),
+            "the user is sitting at it — `cam@smashed-air.local` is telling them their own \
+             address where it used to say `local`: {:?}",
+            meta
+        );
+        assert!(meta.contains("synced"), "and it is in the ranch: {:?}", meta);
+        assert_eq!(items[0].meta.as_deref(), Some("this machine"), "the alias row is unchanged");
+    }
+
+    /// A barn that arrived from the machine it describes carries no `host` — it
+    /// had nothing to dial itself with — only the addresses it advertised. The
+    /// row has to show where it will actually be reached, or the fix to the ssh
+    /// path is invisible in the one place the user looks.
+    #[test]
+    fn a_barn_that_advertises_an_address_shows_where_it_will_be_dialled() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut imac = Barn {
+            name: "camerons-imac".into(),
+            host: None,
+            user: Some("cam".into()),
+            ..Default::default()
+        };
+        imac.addresses = vec!["camerons-imac.local".into()];
+
+        let items = build_barn_items(&[imac], &HashSet::new());
+
+        assert_eq!(items[0].meta.as_deref(), Some("cam@camerons-imac.local"));
     }
 
     /// `C-d` is dispatched from `app.rs`, which can only see the barns panel

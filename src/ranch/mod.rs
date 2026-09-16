@@ -286,6 +286,22 @@ fn serve_session<R: std::io::BufRead, W: std::io::Write>(
     mut input: R,
     mut out: W,
 ) -> anyhow::Result<()> {
+    // Before the greeting, because everything after it describes this ranch and
+    // the manifest is built from the store. A `serve` is this machine's side of
+    // a sync, and this machine is the one whose own record is stalest: written
+    // once by `ranch init` or `ranch join` and untouched since — `host: null`,
+    // `user: null`, no addresses, which is what every peer then holds about it.
+    // This is the repair, and it is why there is no sweep over the store on
+    // startup: a machine fixes its own record when it syncs, and nobody else's,
+    // ever.
+    //
+    // Best effort and never fatal. A peer is blocked on the greeting, and "this
+    // machine could not work out its own hostname" is not a reason to refuse it a
+    // sync. Diagnostics go to stderr — stdout is protocol.
+    if let Err(e) = crate::migrate::advertise_self_barn() {
+        eprintln!("yeehaw: could not refresh this machine's own barn record: {:#}", e);
+    }
+
     send(&mut out, &greeting())?;
 
     // Loaded at most once, and only if the peer asks for something that needs
@@ -590,7 +606,13 @@ pub fn assign_name(
         ));
     }
 
+    // A name already on the roster is not automatically somebody else's. See
+    // [`unbranded`]: a barn carrying no usable brand has never run yeehaw, and a
+    // machine proposing its name is almost always that machine finally running
+    // it. Refusing forces `--as ascend-2` and leaves two barn records for one
+    // physical machine, permanently — a worse outcome than either branch below.
     match barns.iter().find(|b| b.name == proposed) {
+        Some(existing) if unbranded(existing) => Ok(existing.name.clone()),
         Some(taken) => Err(format!(
             "this ranch already has a barn called '{}'{}, and its brand is not yours — so that \
              name is some other machine's. Pass a different one: \
@@ -603,6 +625,39 @@ pub fn assign_name(
         )),
         None => Ok(proposed.to_string()),
     }
+}
+
+/// Whether `barn` carries no brand this ranch could ever recognize.
+///
+/// The predicate behind the claim branch of [`assign_name`], and the one the
+/// join reports itself by — one rule, read from one place, so the message the
+/// user sees and the decision that produced it cannot disagree.
+///
+/// **Keyed by `brand_key`, not by `is_none`.** A brand that does not parse
+/// identifies nobody: the brand match at the top of [`assign_name`] also goes
+/// through `brand_key`, so a barn holding a truncated one can never be
+/// recognized by any machine. Treating it as branded would strand that record
+/// permanently — unclaimable by the machine it describes and unmatchable by
+/// every other.
+///
+/// ## On letting a peer take an existing name
+///
+/// It reads alarming and is not a new grant. A peer only reaches
+/// [`assign_name`] by having run `yeehaw ranch serve` on this machine over ssh,
+/// which means it already holds ssh access to the house — and with it the push
+/// path in [`client::accept_pushed`], which writes entities here outright. A
+/// machine that can rewrite the roster does not need permission to be listed in
+/// it. What this changes is only whether the *user* ends up with one record for
+/// one machine or two.
+///
+/// Claiming is a **merge into the existing entity, never a replacement**: the
+/// name is all that is handed over. The record keeps its host, user, port,
+/// identity file, critters and — the part everything else depends on — its uuid,
+/// because the joining machine adopts the house's entity rather than minting a
+/// rival one. See `merge::pair_up`, which matches these two by name exactly once
+/// and by id forever after.
+fn unbranded(barn: &Barn) -> bool {
+    barn.brand.as_deref().and_then(brand_key).is_none()
 }
 
 /// The part of an ssh public key that identifies it: `(type, base64)`, with the
@@ -890,6 +945,15 @@ pub struct JoinOutcome {
     /// first join.
     pub backup: Option<std::path::PathBuf>,
     pub brand_pushed: bool,
+    /// The name of a barn record the house already held and this machine took
+    /// over, rather than a fresh name — `assign_name`'s claim branch.
+    ///
+    /// Reported rather than silent because the two readings of the same success
+    /// are far apart: either a hand-made barn finally running yeehaw and
+    /// collapsing into one record, or a mistyped `--as` merging this machine
+    /// into a record that describes a different host. The user is the only one
+    /// who can tell them apart, and only if they are told it happened.
+    pub claimed_existing_barn: Option<String>,
     /// Things that went wrong *after* the plan was applied, and so could not be
     /// turned into a refusal. The apply already happened; a failed key push is a
     /// thing to retry, not a reason to pretend the sync did not land.
@@ -1133,6 +1197,25 @@ pub fn join_with(target: &str, name: Option<String>, io: JoinIo) -> Result<JoinO
     // print site renders the chain.
     let adopted = adopt_as(&our_name)?;
 
+    // Here, and not next to `record_our_brand` at the end: the plan below is
+    // built from `client::load_local`, and the push that carries this machine's
+    // own record to the house is computed from that plan. Advertised after the
+    // push, the house would receive a barn it cannot dial and learn the
+    // addresses a whole sync later. `adopt_as` already did this on a first join —
+    // this is what covers a *re*-join, where adoption is a no-op and the record
+    // may well predate the advertisement entirely.
+    //
+    // A machine that cannot work out its own hostname still joins; it is only
+    // harder for the house to reach.
+    let mut warnings: Vec<String> = Vec::new();
+    if let Err(e) = crate::migrate::advertise_self_barn() {
+        warnings.push(format!(
+            "this machine's own barn record was not updated with the addresses it can be \
+             reached at, so the house may not be able to dial back: {:#}",
+            e
+        ));
+    }
+
     let ours = client::load_local()?;
     peer.send(&client::manifest_of(&ours)?)?;
 
@@ -1182,6 +1265,25 @@ pub fn join_with(target: &str, name: Option<String>, io: JoinIo) -> Result<JoinO
     // that adoption is the entire mechanism — `merge::pair_up` matches by uuid
     // first and falls back to name, so the names line the two ranches up exactly
     // once and every sync after that is matched by id.
+    // Did this machine take over a barn record the house already had?
+    //
+    // Read off the house's own entities, which is evidence rather than
+    // inference: the house answered `NameAssigned` with a name it already has a
+    // record for, and that record carries no brand of ours. That is exactly
+    // `assign_name`'s claim branch — a barn the ranch knows about that has never
+    // run yeehaw, like a host created by hand in the TUI — and it is worth
+    // saying out loud, because the alternative reading of the same success is a
+    // mistyped `--as` quietly merging this machine into somebody else's record.
+    //
+    // Computed here rather than after the apply so it survives a declined plan:
+    // the name was claimed at `NameAssigned`, whatever the user then decides
+    // about the entities.
+    let claimed_existing_barn = theirs
+        .barns
+        .iter()
+        .find(|b| b.name == our_name && b.brand.as_deref().and_then(brand_key) != brand_key(&our_brand))
+        .map(|b| b.name.clone());
+
     let plan = client::build_plan(&ours, &theirs, merge::Side::Remote)?;
     let plan_text = client::render_plan(&plan, &peer_name);
 
@@ -1194,7 +1296,8 @@ pub fn join_with(target: &str, name: Option<String>, io: JoinIo) -> Result<JoinO
         pushed: 0,
         backup: None,
         brand_pushed: false,
-        warnings: vec![],
+        claimed_existing_barn,
+        warnings,
     };
 
     if !(io.confirm)(&plan_text)? {
@@ -1312,6 +1415,20 @@ pub fn join_with(target: &str, name: Option<String>, io: JoinIo) -> Result<JoinO
         ));
     }
 
+    // After the apply, because the house's own record only exists here once the
+    // incoming half has landed — and it is the record that says `host: null`,
+    // written on the house where there was nothing to dial. See
+    // `record_peer_address`: the target the user typed is the one address on
+    // this ranch there is proof about, and without it `yeehaw connect <house>`
+    // refuses a machine the join just used.
+    if let Err(e) = record_peer_address(&peer_name, &barn) {
+        outcome.warnings.push(format!(
+            "the address this join reached '{}' at was not recorded on its barn record, so \
+             `yeehaw connect {}` may still have nothing to dial: {:#}",
+            target, peer_name, e
+        ));
+    }
+
     // Every brand on the ranch, not only ours: the managed block is rewritten
     // whole, so writing ours alone would delete every other machine's key from
     // the house. The barn list is re-read after the apply, which is when the
@@ -1366,6 +1483,85 @@ fn adopt_as(name: &str) -> Result<Option<crate::migrate::AdoptionReport>> {
     Ok(Some(report))
 }
 
+/// Records, on `peer`'s barn record, the address this machine just reached it
+/// at.
+///
+/// # Why a join is the one moment worth writing this down
+///
+/// The peer's own record says `host: null` and frequently `user: null`, because
+/// `migrate::adopt_this_machine` wrote it on the machine it describes and from
+/// there there is nothing to dial. That record is what arrives here, and here it
+/// is remote: `yeehaw connect camerons-imac` answered "barn 'camerons-imac' has
+/// no host configured" about a machine that had carried an entire ssh session
+/// moments earlier.
+///
+/// The target the user typed is the one address on this ranch that is *known
+/// good* rather than inferred — ssh authenticated against it and the whole join
+/// ran over it. `migrate::this_machine_addresses` can only guess (see its doc
+/// comment for why it guesses conservatively); this does not have to.
+///
+/// # Where each part goes
+///
+/// - **The address → `addresses`, at the head.** Not `host`: `host` is the slot a
+///   human's own answer occupies, and an empty `host` is what
+///   `adopt_this_machine`, `connect` and [`resolve_target`] all read as "this is
+///   a machine's own record". `addresses` is the field that exists for advertised
+///   reachability, it is `content` in `canonical::SHAPES` so it propagates, and
+///   `merge::merge_addresses` unions it so two machines that each learned a
+///   different address for one barn are both right. At the head because
+///   `ssh::dial_host` dials the first entry and this is the entry there is
+///   evidence for.
+/// - **User and port → their own scalars, only if empty.** They are scalars, so
+///   filling an occupied one is a rewrite rather than an addition — and what the
+///   barn says about itself is an answer somebody gave on purpose, while `forge@`
+///   may be no more than this laptop's ssh config.
+///
+/// Writes nothing when nothing changed: `config::save_barn` stamps `updated_at`,
+/// and a re-join to a known address must not make the peer's record look
+/// modified on every sync.
+fn record_peer_address(peer: &str, dialed: &Barn) -> Result<()> {
+    // A peer that named itself "" is refused long before this by `join_with`,
+    // which will not join a machine that is not a house. Guarded anyway: the
+    // lock and the path below would both be built from an empty name, and
+    // `barns/.yaml` is a dotfile that loads back as a barn called "".
+    if peer.is_empty() {
+        return Ok(());
+    }
+    let Some(address) = crate::ssh::dial_host(dialed).map(str::to_string) else {
+        return Ok(());
+    };
+    let _guard = crate::store::lock_entity(&crate::config::barns_dir(), peer)?;
+    // The peer's record arrives with the incoming half of the plan, so this runs
+    // after the apply. Absent means the user declined that half, or the house
+    // has no record of itself — neither is worth failing a completed join over,
+    // and inventing a barn here would plant one nobody named.
+    let Some(mut record) = load_barn_from_disk(peer)? else {
+        return Ok(());
+    };
+
+    let mut changed = false;
+    if !record.addresses.iter().any(|a| a == &address) {
+        record.addresses.insert(0, address);
+        changed = true;
+    }
+    if record.user.is_none() {
+        if let Some(user) = dialed.user.clone() {
+            record.user = Some(user);
+            changed = true;
+        }
+    }
+    if record.port.is_none() {
+        if let Some(port) = dialed.port {
+            record.port = Some(port);
+            changed = true;
+        }
+    }
+    if changed {
+        crate::config::save_barn(&mut record)?;
+    }
+    Ok(())
+}
+
 /// Records this machine's public brand on its own barn record.
 ///
 /// A no-op, reported as one, on a machine that has never been adopted: there is
@@ -1402,11 +1598,31 @@ fn record_our_brand(brand: &str) -> Result<()> {
 /// guessing which colon the user meant.
 fn resolve_target(target: &str) -> Result<Barn> {
     if let Some(barn) = manifest::barns_from_disk().items.into_iter().find(|b| b.name == target) {
-        if barn.host.is_none() {
+        // Before the reachability question, because it is not one. Since
+        // `advertise_this_machine` started volunteering addresses, this
+        // machine's own record *is* dialable — `dial_host` would answer for it
+        // and the join would ssh to this very machine, get a `serve` that is not
+        // a Ranch House, and refuse several round trips later. `is_local_barn`
+        // is not the test: it only ever knew the synthetic `local`, and after
+        // adoption this machine's record is a real barn with a real name.
+        if crate::config::barn_is_this_machine(&barn) {
             anyhow::bail!(
-                "barn '{}' has no host to reach. That is what this machine's own record looks \
-                 like — and a k8s-discovered node's — so there is nothing to ssh to. Give the \
-                 target as user@host instead",
+                "barn '{}' is this machine, and a join enrolls one machine with another. \
+                 There is nothing here to join to",
+                target
+            );
+        }
+        // `dial_host`, not `barn.host`: a record that arrived from the machine it
+        // describes carries no host — that machine had nothing to dial itself
+        // with — but it does carry the addresses it advertised, and those are
+        // exactly what `ssh_args` will build the destination from. Asking a
+        // different question here than the one ssh asks is how a target gets
+        // refused that ssh could have reached.
+        if crate::ssh::dial_host(&barn).is_none() {
+            anyhow::bail!(
+                "barn '{}' has no host to reach. That is what a k8s-discovered node's record \
+                 looks like — and a machine that has never advertised an address of its own — \
+                 so there is nothing to ssh to. Give the target as user@host instead",
                 target
             );
         }
@@ -2590,6 +2806,304 @@ mod tests {
         );
     }
 
+    /// A barn record, read off a ranch directory by name.
+    fn barn_on(ranch: &std::path::Path, name: &str) -> Barn {
+        let text =
+            std::fs::read_to_string(ranch.join("barns").join(format!("{}.yaml", name))).unwrap();
+        serde_yaml::from_str(&text).unwrap()
+    }
+
+    /// THE BUG, half (a). `ranch join cam@camerons-imac.local:2222` demonstrably
+    /// reached the house at that address as that user — ssh carried the whole
+    /// session. The house's own record, though, is written by
+    /// `adopt_this_machine` with `host: null` and `user: null`, because from the
+    /// house there is nothing to dial; that is the record the joiner receives,
+    /// and to the joiner it is remote and unreachable. So `yeehaw connect
+    /// camerons-imac` answered "has no host configured" about a machine that had
+    /// just been talked to over ssh.
+    ///
+    /// The address is *known good*, not a guess, so the joiner records it.
+    #[test]
+    fn a_join_records_the_address_it_actually_reached_the_house_at() {
+        let dirs = TwoRanches::new();
+        a_house(&dirs.house(), || {});
+
+        testing::with_ranch_env(dirs.joiner(), || {
+            let mut spawn = |_: &Barn| Ok(serve_child_command(&dirs.house()));
+            let mut confirm = |_: &str| Ok(true);
+            let mut push = |_: &Barn, _: &[String]| Ok(());
+            join_with(
+                // Exactly the form the user typed, parts and all.
+                "cam@camerons-imac.local:2222",
+                Some("macbook".into()),
+                JoinIo { spawn: &mut spawn, confirm: &mut confirm, push_brand: &mut push },
+            )
+        })
+        .expect("the join completes");
+
+        let house = barn_on(&dirs.joiner(), "imac");
+        assert!(
+            house.addresses.iter().any(|a| a == "camerons-imac.local"),
+            "the address the join reached the house at must be recorded: {:?}",
+            house
+        );
+        assert_eq!(house.port, Some(2222), "and the port it reached it on: {:?}", house);
+        assert_eq!(
+            crate::ssh::dial_host(&house),
+            Some("camerons-imac.local"),
+            "known good beats inferred, so it goes to the head of the list — that is the one \
+             `ssh_args` dials, and it is the one this machine has proof about"
+        );
+        assert!(
+            house.user.is_some(),
+            "`ssh_args` falls back to root@ without one, which a Mac refuses outright: {:?}",
+            house
+        );
+    }
+
+    /// A barn with no user is dialled as `root@`, which is wrong for every Mac
+    /// on the ranch — so the user a join demonstrably authenticated as fills the
+    /// gap.
+    #[test]
+    fn the_dialled_user_and_port_fill_gaps_on_the_peers_record() {
+        let _ranch = testing::temp_ranch();
+        config::save_barn(&mut Barn { name: "imac".into(), ..Default::default() }).unwrap();
+
+        record_peer_address("imac", &resolve_target("cam@camerons-imac.local:2222").unwrap())
+            .unwrap();
+
+        let imac = config::load_barns().into_iter().find(|b| b.name == "imac").unwrap();
+        assert_eq!(imac.user.as_deref(), Some("cam"));
+        assert_eq!(imac.port, Some(2222));
+        assert_eq!(imac.addresses, vec!["camerons-imac.local".to_string()]);
+        assert_eq!(imac.host, None, "the dialled address is an advertisement, not a config");
+    }
+
+    /// What the barn says about itself wins over how one machine happened to
+    /// reach it. `forge@` may be this laptop's ssh config; the record's `cam` is
+    /// the answer somebody gave on purpose, and clobbering it would rewrite a
+    /// working barn from a single dial.
+    #[test]
+    fn the_dialled_user_never_overwrites_what_the_record_already_says() {
+        let _ranch = testing::temp_ranch();
+        config::save_barn(&mut Barn {
+            name: "imac".into(),
+            user: Some("cam".into()),
+            port: Some(22),
+            ..Default::default()
+        })
+        .unwrap();
+
+        record_peer_address("imac", &resolve_target("forge@camerons-imac.local:2222").unwrap())
+            .unwrap();
+
+        let imac = config::load_barns().into_iter().find(|b| b.name == "imac").unwrap();
+        assert_eq!(imac.user.as_deref(), Some("cam"), "the record's own answer stands");
+        assert_eq!(imac.port, Some(22));
+        assert!(
+            imac.addresses.iter().any(|a| a == "camerons-imac.local"),
+            "the address is still additive — the list is a union, not a scalar: {:?}",
+            imac.addresses
+        );
+    }
+
+    /// `save_barn` stamps, and a stamped entity is one the next sync offers. A
+    /// re-join to the same address must not restamp the house's record every
+    /// time.
+    #[test]
+    fn recording_an_address_already_on_the_record_rewrites_nothing() {
+        let _ranch = testing::temp_ranch();
+        config::save_barn(&mut Barn {
+            name: "imac".into(),
+            user: Some("cam".into()),
+            port: Some(2222),
+            addresses: vec!["camerons-imac.local".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let before = config::load_barns().into_iter().find(|b| b.name == "imac").unwrap();
+
+        record_peer_address("imac", &resolve_target("cam@camerons-imac.local:2222").unwrap())
+            .unwrap();
+
+        let after = config::load_barns().into_iter().find(|b| b.name == "imac").unwrap();
+        assert_eq!(after.updated_at, before.updated_at, "nothing changed, so nothing was written");
+    }
+
+    /// The joiner's own record is the one that travels *to* the house, and it is
+    /// the other half of the same bug: the house received a barn with no address
+    /// on it and could not reach back.
+    #[test]
+    fn the_house_learns_how_to_reach_the_machine_that_joined_it() {
+        let dirs = TwoRanches::new();
+        a_house(&dirs.house(), || {});
+
+        testing::with_ranch_env(dirs.joiner(), || {
+            let mut spawn = |_: &Barn| Ok(serve_child_command(&dirs.house()));
+            let mut confirm = |_: &str| Ok(true);
+            let mut push = |_: &Barn, _: &[String]| Ok(());
+            join_with(
+                "imac",
+                Some("macbook".into()),
+                JoinIo { spawn: &mut spawn, confirm: &mut confirm, push_brand: &mut push },
+            )
+        })
+        .expect("the join completes");
+
+        let arrived = barn_on(&dirs.house(), "macbook");
+        assert!(
+            !arrived.addresses.is_empty(),
+            "a barn with no address is one the house can never dial: {:?}",
+            arrived
+        );
+        assert!(arrived.user.is_some(), "and root@ is not the answer on a Mac: {:?}", arrived);
+        assert!(
+            crate::ssh::dial_host(&arrived).is_some(),
+            "the house has to be able to build an ssh destination for the machine that joined it"
+        );
+    }
+
+    /// A `serve` is the house's side of a sync, and the house is the machine
+    /// whose own record is stalest — it was written by `ranch init` and nothing
+    /// has touched it since. This is the repair path for a ranch that was joined
+    /// before any of this existed, and the reason there is no startup sweep.
+    #[test]
+    fn a_house_advertises_itself_when_it_serves_a_sync() {
+        let dirs = TwoRanches::new();
+        a_house(&dirs.house(), || {});
+
+        // Exactly the live ranch's state: adopted, and unreachable from anywhere.
+        testing::with_ranch_env(dirs.house(), || {
+            let mut stale = barn_on(&dirs.house(), "imac");
+            stale.addresses.clear();
+            stale.user = None;
+            config::save_barn(&mut stale).unwrap();
+        });
+
+        testing::with_ranch_env(dirs.joiner(), || {
+            let mut spawn = |_: &Barn| Ok(serve_child_command(&dirs.house()));
+            let mut confirm = |_: &str| Ok(true);
+            let mut push = |_: &Barn, _: &[String]| Ok(());
+            join_with(
+                "imac",
+                Some("macbook".into()),
+                JoinIo { spawn: &mut spawn, confirm: &mut confirm, push_brand: &mut push },
+            )
+        })
+        .expect("the join completes");
+
+        let repaired = barn_on(&dirs.house(), "imac");
+        assert!(
+            !repaired.addresses.is_empty(),
+            "the house must repair its own record when it syncs: {:?}",
+            repaired
+        );
+        assert!(repaired.user.is_some(), "{:?}", repaired);
+    }
+
+    /// THE CLAIM, end to end. `ascend` is a barn the user created by hand in the
+    /// TUI — a real host with a real user that has never run yeehaw, so it
+    /// carries no brand. That machine now installs yeehaw and joins.
+    ///
+    /// It must come away holding **the existing record**, not a second one:
+    /// `ascend`'s host and user are the only way anything on the ranch reaches
+    /// it, and its uuid is what every synced reference is keyed by. Losing either
+    /// would be worse than the refusal this replaces.
+    #[test]
+    fn a_machine_joining_under_an_unbranded_barns_name_takes_over_that_record() {
+        let dirs = TwoRanches::new();
+        a_house(&dirs.house(), || {
+            config::save_barn(&mut Barn {
+                name: "ascend".into(),
+                host: Some("172.233.129.224".into()),
+                user: Some("forge".into()),
+                port: Some(22),
+                identity_file: Some("~/.ssh/id_ascend".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        });
+        let house_uuid = barn_on(&dirs.house(), "ascend").id.expect("the house stamps its barns");
+
+        let outcome = testing::with_ranch_env(dirs.joiner(), || {
+            let mut spawn = |_: &Barn| Ok(serve_child_command(&dirs.house()));
+            let mut confirm = |_: &str| Ok(true);
+            let mut push = |_: &Barn, _: &[String]| Ok(());
+            join_with(
+                "imac",
+                Some("ascend".into()),
+                JoinIo { spawn: &mut spawn, confirm: &mut confirm, push_brand: &mut push },
+            )
+        })
+        .expect("an unbranded name is claimable, not a refusal");
+
+        assert_eq!(outcome.barn, "ascend", "the house hands over the name it was asked for");
+        assert_eq!(
+            outcome.claimed_existing_barn.as_deref(),
+            Some("ascend"),
+            "a mistyped --as has to be visible immediately, not discovered later"
+        );
+
+        // One record for one machine, on both sides.
+        for ranch in [dirs.joiner(), dirs.house()] {
+            let names: Vec<String> = testing::with_ranch_env(&ranch, || {
+                manifest::barns_from_disk().items.into_iter().map(|b| b.name).collect()
+            });
+            assert_eq!(
+                names.iter().filter(|n| n.starts_with("ascend")).count(),
+                1,
+                "claiming must merge into the record, never mint a rival: {:?}",
+                names
+            );
+        }
+
+        let claimed = barn_on(&dirs.joiner(), "ascend");
+        assert_eq!(
+            claimed.id.as_deref(),
+            Some(house_uuid.as_str()),
+            "the uuid is what every synced reference depends on: {:?}",
+            claimed
+        );
+        assert_eq!(claimed.host.as_deref(), Some("172.233.129.224"), "{:?}", claimed);
+        assert_eq!(claimed.user.as_deref(), Some("forge"), "{:?}", claimed);
+        assert_eq!(claimed.port, Some(22), "{:?}", claimed);
+        assert_eq!(claimed.identity_file.as_deref(), Some("~/.ssh/id_ascend"), "{:?}", claimed);
+        assert!(
+            claimed.brand.is_some(),
+            "and the record gains the brand of the machine that claimed it: {:?}",
+            claimed
+        );
+
+        // The house's own copy keeps everything that made it reachable — the
+        // push must not have flattened it.
+        let on_house = barn_on(&dirs.house(), "ascend");
+        assert_eq!(on_house.id.as_deref(), Some(house_uuid.as_str()));
+        assert_eq!(on_house.host.as_deref(), Some("172.233.129.224"), "{:?}", on_house);
+        assert_eq!(on_house.user.as_deref(), Some("forge"), "{:?}", on_house);
+    }
+
+    /// A join that was given a free name claimed nothing, and must not say it
+    /// did — the line exists so a mistyped `--as` stands out.
+    #[test]
+    fn a_join_that_takes_a_fresh_name_reports_no_claim() {
+        let dirs = TwoRanches::new();
+        a_house(&dirs.house(), || {});
+
+        let outcome = testing::with_ranch_env(dirs.joiner(), || {
+            let mut spawn = |_: &Barn| Ok(serve_child_command(&dirs.house()));
+            let mut confirm = |_: &str| Ok(true);
+            let mut push = |_: &Barn, _: &[String]| Ok(());
+            join_with(
+                "imac",
+                Some("macbook".into()),
+                JoinIo { spawn: &mut spawn, confirm: &mut confirm, push_brand: &mut push },
+            )
+        })
+        .expect("the join completes");
+
+        assert_eq!(outcome.claimed_existing_barn, None, "nothing was claimed");
+    }
+
     /// The user is at the joining machine and the house is unattended, so the one
     /// y/n covers both halves — which means a "no" has to stop the push as
     /// squarely as it stops the apply. A decline that had already written to
@@ -3001,16 +3515,56 @@ mod tests {
     /// taken, which machine has it, and how to pass a different one. No
     /// auto-suffix — a machine called `pi-2` that nobody chose is worse than being
     /// interrupted, because the name is written into every livestock record on it.
+    ///
+    /// DELIBERATE CHANGE: this used to be driven with an *unbranded* `pi`, which
+    /// is now claimed rather than refused — see
+    /// `a_joiner_claims_the_unbranded_barn_that_already_holds_its_name`. A barn
+    /// carrying a brand that is not the claimant's is the case that genuinely is
+    /// another machine, and it is what this drives now. Every assertion is
+    /// otherwise untouched.
     #[test]
     fn a_name_another_machine_already_holds_is_refused_by_name() {
         let mut pi = barn_named("pi");
         pi.host = Some("pi.local".into());
+        pi.brand = Some(format!(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAASomeOtherMachinesKeyEntirely yeehaw-ranch-pi"
+        ));
         let why = assign_name("pi", KEY_MATERIAL, &[pi]).expect_err("that name is taken");
 
         assert!(why.contains("'pi'"), "name what is taken: {}", why);
         assert!(why.contains("pi.local"), "say which machine has it: {}", why);
         assert!(why.contains("--as"), "say what to do instead: {}", why);
         assert!(!why.contains("pi-2"), "no auto-suffix: {}", why);
+    }
+
+    /// A barn with **no brand** is a machine the ranch knows about that has never
+    /// run yeehaw — `ascend`, created by hand in the TUI with a host and a user.
+    /// A joiner proposing that name is almost certainly that machine finally
+    /// running it, and forcing it to `--as ascend-2` leaves two barn records for
+    /// one physical machine, forever.
+    #[test]
+    fn a_joiner_claims_the_unbranded_barn_that_already_holds_its_name() {
+        let mut ascend = barn_named("ascend");
+        ascend.host = Some("172.233.129.224".into());
+        ascend.user = Some("forge".into());
+        assert_eq!(ascend.brand, None, "the fixture is a barn that has never run yeehaw");
+
+        assert_eq!(
+            assign_name("ascend", KEY_MATERIAL, &[ascend]).unwrap(),
+            "ascend",
+            "the machine that has finally installed yeehaw must be able to claim its own record"
+        );
+    }
+
+    /// A brand that cannot be keyed identifies nobody — `brand_key` is what the
+    /// match at the top of `assign_name` uses, so a barn carrying a truncated one
+    /// can never be recognized by any machine. Left unclaimable it would be
+    /// stranded for good.
+    #[test]
+    fn a_barn_whose_brand_does_not_parse_is_claimable_like_an_unbranded_one() {
+        let mut ghost = barn_named("ghost");
+        ghost.brand = Some("ssh-ed25519".into()); // a key type with no key material
+        assert_eq!(assign_name("ghost", KEY_MATERIAL, &[ghost]).unwrap(), "ghost");
     }
 
     /// Everything about the policy rests on the brand being the discriminator, so
@@ -3290,6 +3844,13 @@ mod tests {
     /// Two Raspberry Pis are both `pi`. The second is stopped with the name that
     /// is taken and what to do about it — and *before* anything local is rewritten,
     /// which is the reason the name is claimed before it is adopted.
+    ///
+    /// DELIBERATE CHANGE: the house's `pi` now carries the **first Pi's brand**.
+    /// That is what makes it another machine, and it is what the scenario always
+    /// described — the first Pi had joined, which is how the house came to hold
+    /// the name. An unbranded `pi` is a record nothing has ever run yeehaw
+    /// against, and `assign_name` now lets the machine claim it rather than
+    /// minting a second record for one host. Every assertion below is untouched.
     #[test]
     fn a_clashing_name_refuses_the_join_before_anything_local_is_rewritten() {
         let house_dir = tempfile::tempdir().unwrap();
@@ -3298,6 +3859,9 @@ mod tests {
             config::save_barn(&mut Barn {
                 name: "pi".into(),
                 host: Some("pi.local".into()),
+                brand: Some(
+                    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAATheFirstPisOwnKey yeehaw-ranch-pi".into(),
+                ),
                 ..Default::default()
             })
             .unwrap();
@@ -3438,5 +4002,61 @@ mod tests {
         config::save_barn(&mut Barn { name: "myself".into(), ..Default::default() }).unwrap();
         let why = format!("{:#}", resolve_target("myself").expect_err("nothing to dial"));
         assert!(why.contains("user@host"), "the refusal must say what to pass instead: {}", why);
+    }
+
+    /// A barn record that arrived from the machine it describes carries no
+    /// `host` — that machine had nothing to dial itself with — but it does carry
+    /// the addresses it advertised. Refusing it here would mean `ranch join
+    /// camerons-imac` could not use the name the ranch already knows that
+    /// machine by, only a hand-typed `user@host`.
+    ///
+    /// The question is asked through `ssh::dial_host`, the same function
+    /// `ssh_args` dials with, so a target this accepts is a target ssh can build.
+    #[test]
+    fn a_barn_that_advertises_an_address_can_be_joined_by_name() {
+        let _ranch = testing::temp_ranch();
+        config::save_barn(&mut Barn {
+            name: "camerons-imac".into(),
+            host: None,
+            user: Some("cam".into()),
+            addresses: vec!["camerons-imac.local".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let barn = resolve_target("camerons-imac").expect("an advertised address is dialable");
+        assert_eq!(
+            crate::ssh::dial_host(&barn),
+            Some("camerons-imac.local"),
+            "the resolved barn must be one ssh can build a destination from"
+        );
+        assert_eq!(barn.user.as_deref(), Some("cam"));
+    }
+
+    /// `is_local_barn` only ever knew the synthetic `local`. Once this machine
+    /// has been adopted its own record is a real barn with a real name — and,
+    /// now that it advertises addresses, one `dial_host` would happily answer
+    /// for. Joining yourself is not a thing to do, and the refusal that used to
+    /// come from "no host" has to keep coming from somewhere.
+    #[test]
+    fn this_machine_cannot_join_itself_even_once_it_advertises_an_address() {
+        let _ranch = testing::temp_ranch();
+        config::save_barn(&mut Barn {
+            name: "smashed-air".into(),
+            host: None,
+            addresses: vec!["smashed-air.local".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let mut cfg = config::load_config();
+        cfg.this_barn = Some("smashed-air".into());
+        config::save_config(&cfg).unwrap();
+
+        let why = format!("{:#}", resolve_target("smashed-air").expect_err("that is this machine"));
+        assert!(
+            why.contains("smashed-air"),
+            "the refusal must name the barn: {}",
+            why
+        );
     }
 }

@@ -242,6 +242,19 @@ fn handle_ranch_subcommand(args: &[String]) {
                 // because it is the one thing a join changes about *this*
                 // machine: the name came from the house's roster, not from this
                 // hostname, and every livestock here now names it.
+                // Before everything, and on its own line: the house handed this
+                // machine a record it already had. Almost always right — a barn
+                // made by hand in the TUI, finally running yeehaw — but the other
+                // reading is a mistyped `--as` merging this machine into a record
+                // that describes some other host, and only the user can tell
+                // which. Silence here is what would make that expensive.
+                if let Some(claimed) = &outcome.claimed_existing_barn {
+                    println!(
+                        "\nAdopted the existing barn '{}' — it had no brand, so this machine \
+                         has taken over that record rather than creating a second one.",
+                        claimed
+                    );
+                }
                 if let Some(adoption) = &outcome.adopted {
                     if adoption.barn_created || adoption.livestock_reassigned > 0 {
                         println!("\nThis machine is barn '{}' on that ranch.", outcome.barn);
