@@ -79,8 +79,17 @@ fn get_supervisor_program_name(service: &str) -> &str {
     service.strip_prefix("supervisor:").unwrap_or(service)
 }
 
+/// Run one discovery probe on `barn`.
+///
+/// `barn_is_this_machine`, not `is_local_barn`. The question is "do I run this
+/// here or dial out", and after `migrate::adopt_this_machine` the record for
+/// the machine this process is *on* carries that machine's real name. Asking
+/// only about the synthetic `local` sent every probe aimed at the self-barn
+/// down the ssh branch — to a record that deliberately has no host, because you
+/// do not ssh to yourself — so `ssh_args` refused it, `run` came back `Err`,
+/// and critter discovery on this machine silently found nothing.
 fn run_command(barn: &Barn, cmd: &str) -> Option<String> {
-    if config::is_local_barn(barn) {
+    if config::barn_is_this_machine(barn) {
         Command::new("sh")
             .args(["-c", cmd])
             .output()
@@ -143,8 +152,27 @@ fn parse_supervisor_config(content: &str) -> std::collections::HashMap<String, s
     sections
 }
 
+/// Whether discovery has any way to run a command on `barn` at all.
+///
+/// The bail-out earns its keep — supervisor discovery runs a dozen commands per
+/// config directory, and a barn nothing can reach fails every one of them — but
+/// it has to agree with [`run_command`] about what "reachable" means.
+///
+/// `barn_is_this_machine`, not `is_local_barn`: this machine is always
+/// reachable, and its own record after adoption says `host: null` precisely
+/// *because* there is nothing to dial. Read through `is_local_barn` that looked
+/// identical to a remote barn missing its coordinates, so discovery gave up on
+/// the machine it was running on before issuing a single command.
+///
+/// Named rather than inline so the decision can be asserted on directly: both
+/// answers produce an empty result on a machine with no supervisor installed,
+/// which is every developer machine this suite runs on.
+fn can_run_commands(barn: &Barn) -> bool {
+    config::barn_is_this_machine(barn) || (barn.host.is_some() && barn.user.is_some())
+}
+
 fn discover_supervisor_programs(barn: &Barn) -> Vec<DiscoveredCritter> {
-    if !config::is_local_barn(barn) && (barn.host.is_none() || barn.user.is_none()) {
+    if !can_run_commands(barn) {
         return vec![];
     }
 
@@ -520,4 +548,122 @@ pub fn read_critter_logs(
     };
 
     run_command(barn, &cmd).ok_or_else(|| format!("Failed to read logs for {}", critter.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// This machine's own barn record, as critter discovery receives it after
+    /// `migrate::adopt_this_machine`.
+    ///
+    /// `addresses` is emptied on purpose, and the emptying is what makes the
+    /// tests below safe to run on a live ranch. That list holds what a *peer*
+    /// dials to reach this machine — `ssh::dial_host` falls back to it — so a
+    /// test that took the ssh branch by mistake would open a real ssh
+    /// connection to the developer's own machine and write its host key into
+    /// their `~/.ssh/known_hosts`. Emptied, the ssh branch has nothing to dial
+    /// and fails before spawning anything, which is what lets an assertion
+    /// about *which branch ran* mean something.
+    ///
+    /// The state is not invented: the live ranch's self-barn was exactly this —
+    /// `host: null`, no addresses — until `advertise_this_machine` was added.
+    fn adopted_self_barn(name: &str) -> Barn {
+        crate::migrate::adopt_this_machine(name).unwrap();
+        let mut barn = config::load_barns()
+            .into_iter()
+            .find(|b| b.name == name)
+            .expect("adoption mints this machine's record");
+        barn.addresses.clear();
+        barn
+    }
+
+    /// THE BUG. Critter discovery runs its probes through `run_command`, and
+    /// after adoption the barn for the machine it is probing carries that
+    /// machine's real name. `is_local_barn` only ever knew the synthetic
+    /// `local`, so every probe aimed at this machine took the ssh branch — at a
+    /// record that deliberately has no host, because you do not ssh to
+    /// yourself. Discovery on the self-barn found nothing at all.
+    #[test]
+    fn a_probe_at_this_machines_own_barn_runs_here_instead_of_ssh_to_itself() {
+        let _ranch = crate::testing::temp_ranch();
+        let imac = adopted_self_barn("imac");
+        // Both halves of the control. The first says this barn *is* the ssh
+        // branch under the old rule; the second says that branch has nothing to
+        // dial, so it cannot accidentally succeed.
+        assert!(!config::is_local_barn(&imac), "control: not the synthetic placeholder");
+        assert!(crate::ssh::dial_host(&imac).is_none(), "control: nothing to dial");
+
+        let out = run_command(&imac, "echo yeehaw-ran-here")
+            .expect("a probe at this machine has to run on this machine");
+        assert_eq!(out.trim(), "yeehaw-ran-here");
+    }
+
+    /// The synthetic row is still this machine on a ranch nobody has adopted,
+    /// which is the only state it survives into.
+    #[test]
+    fn a_probe_at_the_synthetic_local_barn_still_runs_here() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let out = run_command(&config::local_barn(), "echo yeehaw-ran-here")
+            .expect("`local` has always meant this machine");
+        assert_eq!(out.trim(), "yeehaw-ran-here");
+    }
+
+    /// And another machine's barn still goes over ssh, or discovery would
+    /// report this machine's services as some remote host's.
+    ///
+    /// The barn has nothing to dial, so "took the ssh branch" is observable as
+    /// `None` without a network round trip — had the command run here instead,
+    /// it would have come back `Some("not-here")`.
+    #[test]
+    fn a_probe_at_another_machine_still_goes_over_ssh() {
+        let _ranch = crate::testing::temp_ranch();
+        let _imac = adopted_self_barn("imac");
+
+        let pi = Barn { name: "pi".into(), ..Default::default() };
+        assert!(
+            run_command(&pi, "echo not-here").is_none(),
+            "a probe aimed at another machine must not run on this one"
+        );
+    }
+
+    /// The same bug one layer up. Supervisor discovery bails early when it has
+    /// no way in, and it read "no way in" as "no host" — which is precisely
+    /// what this machine's own record says about itself. Discovery of local
+    /// supervisor programs stopped before it ran a single command.
+    #[test]
+    fn discovery_still_has_a_way_into_this_machines_own_barn() {
+        let _ranch = crate::testing::temp_ranch();
+        let imac = adopted_self_barn("imac");
+        assert!(!config::is_local_barn(&imac), "control: not the synthetic placeholder");
+        assert!(imac.host.is_none(), "control: a self-barn has no host to bail on");
+
+        assert!(
+            can_run_commands(&imac),
+            "discovery gave up on the machine it is running on"
+        );
+    }
+
+    /// And the bail-out still bails where it was meant to: a remote barn with
+    /// no coordinates cannot be probed, and running a dozen commands that will
+    /// each fail is worse than returning nothing.
+    #[test]
+    fn a_remote_barn_with_no_way_in_is_still_skipped() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let unreachable = Barn { name: "pi".into(), ..Default::default() };
+        assert!(!can_run_commands(&unreachable));
+
+        let half = Barn { name: "pi".into(), host: Some("pi.local".into()), ..Default::default() };
+        assert!(!can_run_commands(&half), "a host with no user is still no way in");
+
+        let reachable = Barn {
+            name: "pi".into(),
+            host: Some("pi.local".into()),
+            user: Some("cam".into()),
+            ..Default::default()
+        };
+        assert!(can_run_commands(&reachable));
+    }
 }

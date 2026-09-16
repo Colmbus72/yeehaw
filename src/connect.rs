@@ -58,24 +58,48 @@ fn describe(b: Blocker) -> String {
     }
 }
 
+/// Why `barn` cannot be connected to, or `None` when it can.
+///
+/// One copy of the wording, shared with the TUI's `c` binding
+/// (`app::connect_barn`): the same barn must not produce two different messages
+/// depending on which side noticed.
+///
+/// `barn_is_this_machine`, not `is_local_barn`. Connecting means opening an ssh
+/// session to a remote yeehaw, and after `migrate::adopt_this_machine` the barn
+/// that is *this* machine is a real record under the machine's own name.
+/// Answering only about the synthetic `local` let the user try to ssh to the
+/// machine they were already sitting at.
+pub fn refusal(barn: &Barn) -> Option<String> {
+    if config::barn_is_this_machine(barn) {
+        return Some(format!(
+            "'{}' is the local barn — not connectable, just run yeehaw",
+            barn.name
+        ));
+    }
+    if barn.connectable == Some(false) {
+        return Some(format!("barn '{}' is not connectable over SSH", barn.name));
+    }
+    None
+}
+
 /// Entry point for `yeehaw connect <barn>`. Runs inside its own tmux session,
 /// never inside the TUI — a 10s ConnectTimeout here would otherwise freeze the
 /// 250ms app loop.
 pub fn run(barn_name: &str) -> Result<()> {
-    let barn = config::load_barns()
-        .into_iter()
-        .find(|b| b.name == barn_name)
-        .ok_or_else(|| anyhow!("no barn named '{}'", barn_name))?;
+    let found = config::load_barns().into_iter().find(|b| b.name == barn_name);
+    let barn = match found {
+        Some(barn) => barn,
+        // `local` is a spelling of this machine, and it stops appearing in
+        // `load_barns()` the moment the machine is adopted — its real record
+        // has taken the row. Standing the synthetic one back up here keeps
+        // `yeehaw connect local` explaining *why* it is not connectable rather
+        // than answering "no barn named 'local'".
+        None if config::barn_name_is_this_machine(barn_name) => config::local_barn(),
+        None => return Err(anyhow!("no barn named '{}'", barn_name)),
+    };
 
-    if config::is_local_barn(&barn) {
-        return Err(anyhow!(
-            "'{}' is the local barn — not connectable, just run yeehaw",
-            barn_name
-        ));
-    }
-
-    if barn.connectable == Some(false) {
-        return Err(anyhow!("barn '{}' is not connectable over SSH", barn_name));
+    if let Some(why) = refusal(&barn) {
+        return Err(anyhow!(why));
     }
 
     loop {
@@ -394,6 +418,63 @@ mod tests {
         assert_eq!(
             blocker(&Probe { has_tmux: true, has_yeehaw: true, session_live: false }),
             None
+        );
+    }
+
+    /// Connecting opens an ssh session to a remote yeehaw. After adoption the
+    /// barn record for *this* machine carries this machine's real name, and the
+    /// refusal has to name that for what it is — "you are already here" — not
+    /// report it as some remote barn that happens to be unreachable.
+    #[test]
+    fn the_adopted_self_barn_is_refused_as_this_machine() {
+        let _ranch = crate::testing::temp_ranch();
+        crate::migrate::adopt_this_machine("imac").unwrap();
+
+        let imac = config::load_barns()
+            .into_iter()
+            .find(|b| b.name == "imac")
+            .expect("adoption mints the record");
+        assert!(!config::is_local_barn(&imac), "control: not the synthetic placeholder");
+
+        let why = refusal(&imac).expect("the machine you are sitting at is never connectable");
+        assert!(
+            why.contains("just run yeehaw"),
+            "refused as an unreachable remote instead of as this machine: {:?}",
+            why
+        );
+    }
+
+    /// The synthetic row is still this machine on a ranch that was never
+    /// adopted, which is the only state it survives into.
+    #[test]
+    fn the_synthetic_local_barn_is_still_refused() {
+        let _ranch = crate::testing::temp_ranch();
+
+        let why = refusal(&config::local_barn()).expect("`local` is never connectable");
+        assert!(why.contains("just run yeehaw"), "{:?}", why);
+    }
+
+    /// And a real remote barn is still offered, or `yeehaw connect` would have
+    /// nothing left to do.
+    #[test]
+    fn a_reachable_remote_barn_is_not_refused() {
+        let _ranch = crate::testing::temp_ranch();
+        crate::migrate::adopt_this_machine("imac").unwrap();
+
+        let pi = Barn {
+            name: "pi".into(),
+            host: Some("pi.local".into()),
+            user: Some("cam".into()),
+            ..Default::default()
+        };
+        assert_eq!(refusal(&pi), None);
+
+        let mut managed = pi.clone();
+        managed.name = "terraform-managed".into();
+        managed.connectable = Some(false);
+        assert!(
+            refusal(&managed).is_some_and(|why| why.contains("not connectable over SSH")),
+            "a barn that declared itself unreachable still says so"
         );
     }
 }

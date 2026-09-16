@@ -5,8 +5,8 @@ use ratatui::widgets::Paragraph;
 use crate::components::critter_header;
 use crate::components::header;
 use crate::components::text_input::TextInput;
-use crate::config;
 use crate::types::*;
+use crate::views::barn_context::barn_subtitle;
 
 const BRAND_COLOR: Color = Color::Rgb(212, 160, 32);
 
@@ -171,7 +171,7 @@ impl CritterDetailView {
             return;
         }
 
-        let barn_name = if config::is_local_barn(barn) { "local" } else { barn.host.as_deref().unwrap_or("unknown") };
+        let barn_name = barn_subtitle(barn);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -251,7 +251,7 @@ impl CritterDetailView {
             ])
             .split(area);
 
-        let subtitle = if config::is_local_barn(barn) { "local" } else { barn.host.as_deref().unwrap_or("unknown") };
+        let subtitle = barn_subtitle(barn);
         header::render_simple_header(
             frame,
             chunks[0],

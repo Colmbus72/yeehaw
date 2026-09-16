@@ -38,6 +38,18 @@ impl TrailProvider for NativeProvider {
         let run_dir = ctx.run_dir;
         let base_env = ctx.env_vars;
 
+        // `barn_is_this_machine`, not `is_local_barn`: the target is a `Barn`
+        // record, and after `migrate::adopt_this_machine` the record for the
+        // machine this runner is *on* carries that machine's real name. Asking
+        // only about the synthetic `local` sent every step of every trail
+        // targeting the self-barn down the ssh branch — to a record that
+        // deliberately has no host, because you do not ssh to yourself.
+        //
+        // Hoisted out of the thread below on purpose. It reads the config file,
+        // and doing that once per step re-asked a question that cannot change
+        // mid-run.
+        let run_here = config::barn_is_this_machine(&barn);
+
         std::thread::spawn(move || {
             for (i, step) in job.steps.iter().enumerate() {
                 if cancelled.load(Ordering::SeqCst) {
@@ -92,7 +104,7 @@ impl TrailProvider for NativeProvider {
                 };
 
                 // Build command — local or SSH
-                let mut cmd = if config::is_local_barn(&barn) {
+                let mut cmd = if run_here {
                     let repo_path = base_env.iter()
                         .find(|(k, _)| k == "REPO_PATH")
                         .map(|(_, v)| v.as_str())
@@ -227,5 +239,114 @@ impl TrailProvider for NativeProvider {
     fn cancel(&self) -> Result<()> {
         self.cancelled.store(true, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trails::{Trail, TrailJob, TrailStep};
+    use crate::types::{Barn, Livestock};
+    use std::path::Path;
+
+    /// A one-step trail that runs `command` with `repo_path` as `REPO_PATH`.
+    fn context(barn: Barn, repo_path: &Path, run_dir: &Path, command: &str) -> TrailContext {
+        TrailContext {
+            livestock: Livestock {
+                name: "web".into(),
+                path: repo_path.display().to_string(),
+                barn: None,
+                repo: None,
+                branch: None,
+                log_path: None,
+                env_path: None,
+                source: None,
+                k8s_metadata: None,
+                trails: vec![],
+            },
+            barn,
+            trail: Trail {
+                name: "deploy".into(),
+                on: None,
+                env: None,
+                jobs: Default::default(),
+                id: None,
+                created_at: None,
+                updated_at: None,
+            },
+            job: TrailJob {
+                runs_on: "native".into(),
+                env: None,
+                steps: vec![TrailStep {
+                    name: "run".into(),
+                    run: command.into(),
+                    env: None,
+                    timeout_minutes: Some(1),
+                }],
+            },
+            run_dir: run_dir.to_path_buf(),
+            env_vars: vec![("REPO_PATH".into(), repo_path.display().to_string())],
+            run_id: "run-1".into(),
+            run_number: 1,
+            project_name: Some("api".into()),
+        }
+    }
+
+    /// Every update the run produced. The runner streams from a thread it owns,
+    /// so the end of the channel is the end of the run.
+    fn drain(mut rx: mpsc::Receiver<StepUpdate>) -> Vec<StepUpdate> {
+        let mut updates = Vec::new();
+        while let Some(update) = rx.blocking_recv() {
+            updates.push(update);
+        }
+        updates
+    }
+
+    /// THE BUG. A trail targeting this machine's own barn has to run *here*.
+    ///
+    /// Before adoption the target was the synthetic `local` and `is_local_barn`
+    /// said so. Adoption replaces it with a real record under the machine's real
+    /// name — which `is_local_barn` calls `false` — so the runner took the ssh
+    /// branch and tried to ssh to the machine it was already running on. That
+    /// record deliberately carries no `host`, so every step of every trail on an
+    /// adopted machine failed with "has no host configured" instead of running.
+    #[test]
+    fn a_trail_on_the_adopted_self_barn_runs_here_instead_of_ssh_to_itself() {
+        let ranch = crate::testing::temp_ranch();
+        crate::migrate::adopt_this_machine("imac").unwrap();
+
+        let imac = config::load_barns()
+            .into_iter()
+            .find(|b| b.name == "imac")
+            .expect("adoption mints the record");
+        // Both halves of the control. Without them a pass proves nothing: the
+        // first says this barn *is* the ssh branch under the old rule, the
+        // second says the ssh branch has nothing to dial and so cannot
+        // accidentally succeed.
+        assert!(!config::is_local_barn(&imac), "control: not the synthetic placeholder");
+        assert!(imac.host.is_none(), "control: a self-barn has nothing to dial");
+
+        let run_dir = ranch.dir.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let rx = NativeProvider::new()
+            .execute(context(imac, ranch.dir.path(), &run_dir, "echo yeehaw-ran-here"))
+            .unwrap();
+        let updates = drain(rx);
+
+        let transcript: Vec<_> =
+            updates.iter().map(|u| (&u.status, u.output_line.as_deref())).collect();
+        assert!(
+            updates
+                .iter()
+                .any(|u| u.output_line.as_deref().is_some_and(|l| l.contains("yeehaw-ran-here"))),
+            "the step never ran on this machine: {:?}",
+            transcript
+        );
+        assert!(
+            updates.iter().any(|u| u.status == StepStatus::Success),
+            "the run did not finish: {:?}",
+            transcript
+        );
     }
 }

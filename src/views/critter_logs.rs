@@ -8,6 +8,7 @@ use crate::components::header;
 use crate::config;
 use crate::ssh;
 use crate::types::*;
+use crate::views::barn_context::barn_subtitle;
 
 pub struct CritterLogsView {
     lines: Vec<String>,
@@ -26,8 +27,16 @@ impl CritterLogsView {
         view
     }
 
+    /// `barn_is_this_machine`, not `is_local_barn`. The question is whether the
+    /// critter's logs live on some other machine, and after
+    /// `migrate::adopt_this_machine` the barn for the machine this pane is
+    /// *running on* carries that machine's real name. Asking only about the
+    /// synthetic `local` sent the read over ssh to a record that deliberately
+    /// has no host, because you do not ssh to yourself, and every critter on
+    /// this machine showed "SSH error: ... has no host configured" instead of
+    /// its logs.
     fn load_logs(&mut self, barn: &Barn, critter: &Critter) {
-        if config::is_local_barn(barn) {
+        if config::barn_is_this_machine(barn) {
             self.load_local_logs(critter);
         } else {
             self.load_remote_logs(barn, critter);
@@ -147,11 +156,7 @@ impl CritterLogsView {
             ])
             .split(area);
 
-        let subtitle = if config::is_local_barn(barn) {
-            "local"
-        } else {
-            barn.host.as_deref().unwrap_or("?")
-        };
+        let subtitle = barn_subtitle(barn);
         header::render_simple_header(
             frame,
             chunks[0],
@@ -191,5 +196,115 @@ impl CritterLogsView {
             let ind_text = Paragraph::new(indicator).style(Style::default().fg(Color::DarkGray));
             frame.render_widget(ind_text, chunks[2]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// This machine's own barn record, as the critter log pane receives it
+    /// after `migrate::adopt_this_machine`.
+    ///
+    /// `addresses` is emptied on purpose, and that is what makes these tests
+    /// safe to run against a live ranch. The list holds what a *peer* dials to
+    /// reach this machine — `ssh::dial_host` falls back to it — so a test that
+    /// took the ssh branch by mistake would open a real connection to the
+    /// developer's own machine and write its host key into `~/.ssh/known_hosts`.
+    /// Emptied, the ssh branch fails before spawning anything, which is what
+    /// lets an assertion about *which branch ran* mean something.
+    fn adopted_self_barn(name: &str) -> Barn {
+        crate::migrate::adopt_this_machine(name).unwrap();
+        let mut barn = config::load_barns()
+            .into_iter()
+            .find(|b| b.name == name)
+            .expect("adoption mints this machine's record");
+        barn.addresses.clear();
+        barn
+    }
+
+    /// A critter that logs to a file rather than journald — the only shape this
+    /// suite can assert on, since the machines it runs on have no journald and
+    /// the local branch would fail on `journalctl` for reasons unrelated to the
+    /// branch it took.
+    fn critter_logging_to(log_path: &std::path::Path) -> Critter {
+        Critter {
+            name: "mysql".into(),
+            service: "mysql.service".into(),
+            service_path: None,
+            config_path: None,
+            log_path: Some(log_path.to_string_lossy().to_string()),
+            use_journald: Some(false),
+            source: None,
+            endpoint: None,
+            port: None,
+            k8s_metadata: None,
+            tf_metadata: None,
+        }
+    }
+
+    /// THE BUG. A critter on this machine's own barn has its log file right
+    /// here. After adoption that barn carries this machine's real name, which
+    /// `is_local_barn` calls `false`, so the pane went out over ssh — to a
+    /// record that deliberately has no host, because you do not ssh to yourself
+    /// — and showed "SSH error: barn 'imac' has no host configured" for a file
+    /// it could have opened.
+    #[test]
+    fn critter_logs_on_the_adopted_self_barn_are_read_here_instead_of_ssh_to_itself() {
+        let ranch = crate::testing::temp_ranch();
+        let imac = adopted_self_barn("imac");
+        // Both halves of the control. The first says this barn *is* the ssh
+        // branch under the old rule; the second says that branch has nothing to
+        // dial, so it cannot accidentally succeed.
+        assert!(!config::is_local_barn(&imac), "control: not the synthetic placeholder");
+        assert!(ssh::dial_host(&imac).is_none(), "control: nothing to dial");
+
+        let log = ranch.dir.path().join("mysql.log");
+        std::fs::write(&log, "yeehaw-critter-line\n").unwrap();
+
+        let view = CritterLogsView::new(&imac, &critter_logging_to(&log));
+
+        assert!(view.error.is_none(), "reading a local file failed: {:?}", view.error);
+        assert_eq!(view.lines, vec!["yeehaw-critter-line".to_string()]);
+    }
+
+    /// The synthetic row is still this machine on a ranch nobody has adopted.
+    #[test]
+    fn critter_logs_on_the_synthetic_local_barn_are_still_read_here() {
+        let ranch = crate::testing::temp_ranch();
+
+        let log = ranch.dir.path().join("mysql.log");
+        std::fs::write(&log, "yeehaw-critter-line\n").unwrap();
+
+        let view = CritterLogsView::new(&config::local_barn(), &critter_logging_to(&log));
+
+        assert!(view.error.is_none(), "{:?}", view.error);
+        assert_eq!(view.lines, vec!["yeehaw-critter-line".to_string()]);
+    }
+
+    /// And a critter on another machine still reads its logs over ssh, or the
+    /// pane would quietly show this machine's file in place of the barn's.
+    ///
+    /// The remote barn has nothing to dial, so "took the ssh branch" is
+    /// observable as an SSH error without a network round trip — and the log
+    /// file does exist here, so a wrong branch would have produced content.
+    #[test]
+    fn critter_logs_on_another_machine_still_go_over_ssh() {
+        let ranch = crate::testing::temp_ranch();
+        let _imac = adopted_self_barn("imac");
+
+        let log = ranch.dir.path().join("mysql.log");
+        std::fs::write(&log, "yeehaw-critter-line\n").unwrap();
+
+        let pi = Barn { name: "pi".into(), ..Default::default() };
+        let view = CritterLogsView::new(&pi, &critter_logging_to(&log));
+
+        assert!(
+            view.error.as_deref().is_some_and(|e| e.starts_with("SSH error")),
+            "another machine's critter logs were read from this one: {:?} {:?}",
+            view.error,
+            view.lines
+        );
+        assert!(view.lines.is_empty());
     }
 }

@@ -1026,7 +1026,12 @@ fn apply_dashboard_action(app: &mut App, action: DashboardAction) {
         DashboardAction::SshToBarn(barn_idx) => {
             if let Some(barn) = app.barns.get(barn_idx).cloned() {
                 let barn = &barn;
-                if config::is_local_barn(barn) {
+                // "Is this the machine I am running on?" — a plain shell here,
+                // or ssh to somewhere else. After adoption that machine's row is
+                // its real record, which has no host to dial, so asking only
+                // about the synthetic `local` turned `s` on the user's own row
+                // into a failed ssh.
+                if config::barn_is_this_machine(barn) {
                     let home = dirs::home_dir().unwrap_or_default();
                     let window_name = format!("barn-{}", barn.name);
                     if let Ok(idx) = tmux::create_shell_window(home.to_str().unwrap_or("~"), &window_name) {
@@ -1130,7 +1135,14 @@ fn apply_dashboard_action(app: &mut App, action: DashboardAction) {
         }
         DashboardAction::RequestDeleteBarn(idx) => {
             if let Some(barn) = app.barns.get(idx) {
-                if !config::is_local_barn(barn) {
+                // "Is this the machine I am running on?" — it is the one row
+                // that is never a barn the user can drop. The synthetic `local`
+                // has no file to delete (`config::delete_barn` refuses the name
+                // outright); the adopted self-barn does, and deleting it is
+                // worse than a no-op — it strands `config.this_barn` on a
+                // record that no longer exists and tombstones this machine out
+                // of every peer's ranch on the next sync.
+                if !config::barn_is_this_machine(barn) {
                     app.confirm_dialog = Some(ConfirmDialog::delete_barn(&barn.name));
                 }
             }
@@ -1258,7 +1270,11 @@ fn apply_project_action(app: &mut App, project: Project, action: ProjectAction) 
                     let barn = barn_for_livestock(ls, &app.barns, None);
                     let window_name = format!("{}-{}", project.name, ls.name);
                     if let Some(barn) = barn {
-                        if !config::is_local_barn(&barn) {
+                        // "Is this the machine I am running on?" — the same
+                        // question `barn_for_livestock` already answered on the
+                        // way in, and it has to be answered the same way here or
+                        // the two disagree the moment the machine is adopted.
+                        if !config::barn_is_this_machine(&barn) {
                             match tmux::create_ssh_window(&window_name, &barn, &ls.path) {
                                 Ok(idx) => {
                                     tmux::set_window_scope(idx, &project.name, config::resolve_livestock_barn(ls));
@@ -1382,18 +1398,13 @@ fn apply_project_action(app: &mut App, project: Project, action: ProjectAction) 
 }
 
 /// Shared by the `c` binding on the dashboard's barns panel and on the barn
-/// view. Rejects exactly the barns `connect::run` rejects, using its wording
-/// verbatim — the same barn must not produce two different messages depending
-/// on which side noticed. `connect::run` re-checks both: it is the entry point
-/// for `yeehaw connect` from a shell, where the TUI never ran.
+/// view. Rejects exactly the barns `connect::run` rejects, by calling the same
+/// function — the same barn must not produce two different messages depending
+/// on which side noticed. `connect::run` re-checks: it is the entry point for
+/// `yeehaw connect` from a shell, where the TUI never ran.
 fn connect_barn(app: &mut App, barn: &Barn) {
-    if config::is_local_barn(barn) {
-        app.error = Some(format!(
-            "'{}' is the local barn — not connectable, just run yeehaw",
-            barn.name
-        ));
-    } else if barn.connectable == Some(false) {
-        app.error = Some(format!("barn '{}' is not connectable over SSH", barn.name));
+    if let Some(why) = crate::connect::refusal(barn) {
+        app.error = Some(why);
     } else if let Err(e) = tmux::connect_to_barn(barn) {
         // `{:#}`, not `{}`: connect failures are context chains ("failed to write
         // ~/.yeehaw/tmux.conf: permission denied"), and plain Display shows only
@@ -1457,7 +1468,9 @@ fn handle_barn_context_input(app: &mut App, key: KeyCode) {
                 }
             }
             BarnAction::SshToBarn => {
-                if config::is_local_barn(&barn) {
+                // "Is this the machine I am running on?" — the barn view's copy
+                // of the dashboard's `s`, and it has to answer identically.
+                if config::barn_is_this_machine(&barn) {
                     let home = dirs::home_dir().unwrap_or_default();
                     let window_name = format!("barn-{}", barn.name);
                     if let Ok(idx) = tmux::create_shell_window(home.to_str().unwrap_or("~"), &window_name) {
@@ -1645,7 +1658,12 @@ fn apply_livestock_action(
                 let barn = barn_for_livestock(&livestock, &app.barns, source_barn.as_ref());
                 let window_name = format!("{}-{}", project.name, livestock.name);
                 if let Some(barn) = barn {
-                    if !config::is_local_barn(&barn) {
+                    // "Is this the machine I am running on?" — and here it can
+                    // genuinely be: `source_barn` is the barn the user reached
+                    // this livestock *through*, so browsing into the adopted
+                    // self-barn and opening a shell arrived with a real record
+                    // for this machine in hand.
+                    if !config::barn_is_this_machine(&barn) {
                         match tmux::create_ssh_window(&window_name, &barn, &livestock.path) {
                             Ok(idx) => {
                                 tmux::set_window_scope(idx, &project.name, config::resolve_livestock_barn(&livestock));

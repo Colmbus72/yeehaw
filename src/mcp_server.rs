@@ -907,7 +907,12 @@ impl YeehawServer {
             return err_text("No log source configured");
         };
 
-        if config::is_local_barn(&barn) {
+        // "Is this the machine I am running on?" — run the log command here, or
+        // over ssh. The same question `read_livestock_logs` above already asks
+        // with `barn_is_this_machine`; asking only about the synthetic `local`
+        // sent a critter on this machine's own adopted barn over ssh to a record
+        // with no host.
+        if config::barn_is_this_machine(&barn) {
             let output = std::process::Command::new("sh").args(["-c", &cmd]).output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                 .unwrap_or_else(|e| format!("Failed: {}", e));

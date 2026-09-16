@@ -13,6 +13,40 @@ use crate::types::*;
 
 const BRAND_COLOR: Color = Color::Rgb(212, 160, 32);
 
+/// What the wizard headers put under "Barn: <name>": where this barn is
+/// reached.
+///
+/// `ssh::dial_host`, not `barn.host`. A barn record that arrived from the
+/// machine it describes carries no `host` — that machine had nothing to dial
+/// itself with — only the addresses it advertised, and those are what ssh will
+/// actually use. Reading `host` here left every barn the ranch had just learned
+/// about, the Ranch House included, reporting its address as "unknown".
+fn header_subtitle(barn: &Barn) -> &str {
+    crate::ssh::dial_host(barn).unwrap_or("unknown")
+}
+
+/// The subtitle any barn-bearing header shows: the word `local` for the
+/// synthetic placeholder, otherwise where the barn is actually reached.
+///
+/// Shared with the critter detail page and the critter log pane
+/// (`views::critter_detail`, `views::critter_logs`), which ask the same
+/// question about the same barn and had drifted into three answers — two of
+/// them wrong.
+///
+/// `is_local_barn`, not `barn_is_this_machine`: this asks whether the row is
+/// the synthetic placeholder, which has no host, no uuid and no file, so there
+/// is nothing to show but the word. The adopted self-barn *does* advertise
+/// somewhere it is reached, and wants the real subtitle.
+///
+/// And [`header_subtitle`], not `barn.host`: a barn record that arrived from
+/// the machine it describes carries no `host` — that machine had nothing to
+/// dial itself with — only the addresses it advertised, which are what ssh
+/// actually uses. Reading `host` left every such barn, the Ranch House
+/// included, reporting its address as "unknown".
+pub(crate) fn barn_subtitle(barn: &Barn) -> &str {
+    if config::is_local_barn(barn) { "local" } else { header_subtitle(barn) }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FocusedPanel {
     Livestock,
@@ -354,7 +388,7 @@ impl BarnContextView {
             ])
             .split(area);
 
-        let subtitle = barn.host.as_deref().unwrap_or("unknown");
+        let subtitle = header_subtitle(barn);
         header::render_simple_header(
             frame,
             chunks[0],
@@ -434,7 +468,7 @@ impl BarnContextView {
             ])
             .split(area);
 
-        let subtitle = if config::is_local_barn(barn) { "local" } else { barn.host.as_deref().unwrap_or("unknown") };
+        let subtitle = barn_subtitle(barn);
         header::render_simple_header(
             frame,
             chunks[0],
@@ -523,5 +557,74 @@ mod tests {
         assert_eq!(updated.last_seen, original.last_seen);
         assert_eq!(updated.addresses, original.addresses);
         assert_eq!(updated.id, original.id, "and the identity, as before");
+    }
+
+    /// A barn record that arrived from the machine it describes carries no
+    /// `host` — that machine had nothing to dial itself with — only the
+    /// addresses it advertised, which are what ssh will actually use. Reading
+    /// `barn.host` here left every such barn's detail page saying its address
+    /// was "unknown", including the Ranch House.
+    #[test]
+    fn a_self_advertised_barn_shows_where_it_will_be_dialled() {
+        let mut imac = Barn {
+            name: "camerons-imac".into(),
+            host: None,
+            user: Some("cam".into()),
+            ..Default::default()
+        };
+        imac.addresses = vec!["camerons-imac.local".into()];
+
+        assert_eq!(header_subtitle(&imac), "camerons-imac.local");
+    }
+
+    /// `host` still wins where there is one — an explicitly configured address
+    /// is the one the user typed.
+    #[test]
+    fn a_configured_host_is_still_what_the_header_shows() {
+        let pi = Barn {
+            name: "pi".into(),
+            host: Some("10.0.0.2".into()),
+            ..Default::default()
+        };
+        assert_eq!(header_subtitle(&pi), "10.0.0.2");
+
+        let nothing = Barn { name: "ghost".into(), ..Default::default() };
+        assert_eq!(header_subtitle(&nothing), "unknown", "and nowhere to dial still says so");
+    }
+
+    /// What every barn-bearing header shows, and the reason it is one function:
+    /// the barn detail page, the critter detail page and the critter log pane
+    /// all answer "where is this barn" and must not answer it three ways.
+    ///
+    /// `is_local_barn` is the right question *here* — it asks whether the row is
+    /// the synthetic placeholder, which has no host, no uuid and no file, so
+    /// there is nothing to show but the word. Every other barn, the adopted
+    /// self-barn included, has somewhere it is reached and wants to say so.
+    #[test]
+    fn the_synthetic_placeholder_is_the_only_barn_that_reads_local() {
+        let _ranch = crate::testing::temp_ranch();
+        assert_eq!(barn_subtitle(&config::local_barn()), "local");
+
+        let mut imac = Barn { name: "camerons-imac".into(), host: None, ..Default::default() };
+        imac.addresses = vec!["camerons-imac.local".into()];
+        crate::migrate::adopt_this_machine("camerons-imac").unwrap();
+        assert!(!config::is_local_barn(&imac), "control: not the synthetic placeholder");
+        assert_eq!(
+            barn_subtitle(&imac),
+            "camerons-imac.local",
+            "a self-advertised barn knows where it is reached; it is not 'unknown'"
+        );
+    }
+
+    /// A configured host still wins, and a barn with nowhere to dial still says
+    /// so rather than inventing an address.
+    #[test]
+    fn a_barn_header_shows_the_address_it_will_be_dialled_at() {
+        let _ranch = crate::testing::temp_ranch();
+        let pi = Barn { name: "pi".into(), host: Some("10.0.0.2".into()), ..Default::default() };
+        assert_eq!(barn_subtitle(&pi), "10.0.0.2");
+
+        let ghost = Barn { name: "ghost".into(), ..Default::default() };
+        assert_eq!(barn_subtitle(&ghost), "unknown");
     }
 }

@@ -530,12 +530,25 @@ pub fn is_local_barn(barn: &Barn) -> bool {
 pub fn load_barns_checked() -> LoadResult<Barn> {
     ensure_config_dirs();
     let mut result: LoadResult<Barn> = load_dir(&barns_dir());
-    // `local` is synthetic and belongs at the head of every listing. A file
-    // that claims the name is dropped rather than shown: two barns spelled
-    // `local` would be indistinguishable in the UI, and only one of them is
-    // the machine the user is sitting at.
+    // A file that claims the name is dropped rather than shown: two barns
+    // spelled `local` would be indistinguishable in the UI, and only one of
+    // them is the machine the user is sitting at.
     result.items.retain(|barn| barn.name != LOCAL_BARN_NAME);
-    result.items.insert(0, local_barn());
+    // `local` is synthetic and stands in for this machine only while nothing
+    // else does. Adoption persists a *real* record for the machine, and
+    // injecting the placeholder above it listed the same machine twice —
+    // `local` on one line and `camerons-imac` on the next.
+    //
+    // Keyed on that record actually being on disk rather than on `this_barn`
+    // holding a value: a config naming a barn no file backs — a half-finished
+    // adoption, a record deleted by hand — would otherwise leave this machine
+    // absent from its own barns list, which is worse than a duplicate row.
+    let adopted =
+        this_barn_name().is_some_and(|name| result.items.iter().any(|b| b.name == name));
+    if !adopted {
+        // At the head: it is the machine the user is sitting at.
+        result.items.insert(0, local_barn());
+    }
     result
 }
 
@@ -2484,6 +2497,57 @@ jobs:
             );
             assert!(result.items.iter().any(|b| b.name == "pi"));
             assert!(result.errors.is_empty());
+        });
+    }
+
+    /// The duplicate row. Adoption persists a *real* barn record for this
+    /// machine and the synthetic `local` kept being injected above it, so the
+    /// barns list showed the same machine twice — `local` on one line and
+    /// `camerons-imac` on the next.
+    #[test]
+    fn the_synthetic_local_row_goes_away_once_this_machine_has_a_record() {
+        crate::testing::with_temp_ranch(|_| {
+            let mut pi = bare_barn("pi");
+            save_barn(&mut pi).unwrap();
+
+            assert!(
+                load_barns().iter().any(is_local_barn),
+                "control: before adoption `local` is the only sign of this machine"
+            );
+
+            crate::migrate::adopt_this_machine("imac").unwrap();
+
+            let names: Vec<String> = load_barns().into_iter().map(|b| b.name).collect();
+            assert!(
+                !names.iter().any(|n| n == LOCAL_BARN_NAME),
+                "this machine is listed twice, as `local` and as `imac`: {:?}",
+                names
+            );
+            assert!(
+                names.iter().any(|n| n == "imac"),
+                "and it must still be listed under its own name: {:?}",
+                names
+            );
+            assert!(names.iter().any(|n| n == "pi"), "other barns are untouched: {:?}", names);
+        });
+    }
+
+    /// The row is dropped because a real record has *taken its place*, not
+    /// merely because `this_barn` holds a value. A config naming a barn no file
+    /// backs — a half-finished adoption, a record deleted by hand — would
+    /// otherwise leave this machine absent from its own barns list entirely,
+    /// which is a worse answer than a duplicate row.
+    #[test]
+    fn the_synthetic_local_row_survives_a_this_barn_that_names_no_record() {
+        crate::testing::with_temp_ranch(|_| {
+            let mut cfg = load_config();
+            cfg.this_barn = Some("ghost".into());
+            save_config(&cfg).unwrap();
+
+            assert!(
+                load_barns().iter().any(is_local_barn),
+                "with no `ghost` record on disk, `local` is the only row this machine has"
+            );
         });
     }
 

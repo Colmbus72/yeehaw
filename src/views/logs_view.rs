@@ -40,9 +40,18 @@ impl LogsView {
             format!("{}/{}", livestock.path, log_path)
         };
 
-        // If remote barn, use SSH to read logs
+        // If remote barn, use SSH to read logs.
+        //
+        // `barn_is_this_machine`, not `is_local_barn`. The question is whether
+        // the file is on some other machine, and after
+        // `migrate::adopt_this_machine` the barn a local livestock is reached
+        // through carries *this* machine's real name. Asking only about the
+        // synthetic `local` sent the read over ssh to a record that
+        // deliberately has no host, because you do not ssh to yourself, and the
+        // pane showed "SSH error: ... has no host configured" for a file it
+        // could have opened directly.
         if let Some(barn) = source_barn {
-            if !config::is_local_barn(barn) {
+            if !config::barn_is_this_machine(barn) {
                 self.load_remote_logs(barn, &full_path);
                 return;
             }
@@ -206,4 +215,132 @@ fn expand_path(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// This machine's own barn record, as the logs view receives it after
+    /// `migrate::adopt_this_machine`.
+    ///
+    /// `addresses` is emptied on purpose, and that is what makes these tests
+    /// safe to run against a live ranch. The list holds what a *peer* dials to
+    /// reach this machine — `ssh::dial_host` falls back to it — so a test that
+    /// took the ssh branch by mistake would open a real connection to the
+    /// developer's own machine and write its host key into `~/.ssh/known_hosts`.
+    /// Emptied, the ssh branch fails before spawning anything, which is what
+    /// lets an assertion about *which branch ran* mean something.
+    fn adopted_self_barn(name: &str) -> Barn {
+        crate::migrate::adopt_this_machine(name).unwrap();
+        let mut barn = config::load_barns()
+            .into_iter()
+            .find(|b| b.name == name)
+            .expect("adoption mints this machine's record");
+        barn.addresses.clear();
+        barn
+    }
+
+    fn project() -> Project {
+        Project {
+            name: "acme".into(),
+            path: "/tmp/acme".into(),
+            summary: None,
+            color: None,
+            gradient_spread: None,
+            gradient_inverted: None,
+            livestock: vec![],
+            herds: vec![],
+            wiki: vec![],
+            issue_provider: None,
+            wiki_provider: None,
+            id: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn livestock_logging_to(log_path: &std::path::Path) -> Livestock {
+        Livestock {
+            name: "api".into(),
+            path: "/tmp/acme/api".into(),
+            barn: None,
+            repo: None,
+            branch: None,
+            log_path: Some(log_path.to_string_lossy().to_string()),
+            env_path: None,
+            source: None,
+            k8s_metadata: None,
+            trails: vec![],
+        }
+    }
+
+    /// THE BUG. A livestock reached through this machine's own barn has its log
+    /// file right here. After adoption that barn carries this machine's real
+    /// name, which `is_local_barn` calls `false`, so the view went out over ssh
+    /// — to a record that deliberately has no host, because you do not ssh to
+    /// yourself. The pane showed "SSH error: barn 'imac' has no host configured"
+    /// for a file it could have opened.
+    #[test]
+    fn logs_on_the_adopted_self_barn_are_read_here_instead_of_ssh_to_itself() {
+        let ranch = crate::testing::temp_ranch();
+        let imac = adopted_self_barn("imac");
+        // Both halves of the control. The first says this barn *is* the ssh
+        // branch under the old rule; the second says that branch has nothing to
+        // dial, so it cannot accidentally succeed.
+        assert!(!config::is_local_barn(&imac), "control: not the synthetic placeholder");
+        assert!(crate::ssh::dial_host(&imac).is_none(), "control: nothing to dial");
+
+        let log = ranch.dir.path().join("api.log");
+        std::fs::write(&log, "yeehaw-log-line\n").unwrap();
+
+        let view = LogsView::new(&project(), &livestock_logging_to(&log), Some(&imac));
+
+        assert!(view.error.is_none(), "reading a local file failed: {:?}", view.error);
+        assert_eq!(view.lines, vec!["yeehaw-log-line".to_string()]);
+    }
+
+    /// The synthetic row is still this machine on a ranch nobody has adopted.
+    #[test]
+    fn logs_on_the_synthetic_local_barn_are_still_read_here() {
+        let ranch = crate::testing::temp_ranch();
+
+        let log = ranch.dir.path().join("api.log");
+        std::fs::write(&log, "yeehaw-log-line\n").unwrap();
+
+        let view = LogsView::new(
+            &project(),
+            &livestock_logging_to(&log),
+            Some(&config::local_barn()),
+        );
+
+        assert!(view.error.is_none(), "{:?}", view.error);
+        assert_eq!(view.lines, vec!["yeehaw-log-line".to_string()]);
+    }
+
+    /// And a livestock on another machine still reads its logs over ssh, or the
+    /// pane would quietly show this machine's file in place of the barn's.
+    ///
+    /// The remote barn has nothing to dial, so "took the ssh branch" is
+    /// observable as an SSH error without a network round trip — and the log
+    /// file does exist here, so a wrong branch would have produced content.
+    #[test]
+    fn logs_on_another_machine_still_go_over_ssh() {
+        let ranch = crate::testing::temp_ranch();
+        let _imac = adopted_self_barn("imac");
+
+        let log = ranch.dir.path().join("api.log");
+        std::fs::write(&log, "yeehaw-log-line\n").unwrap();
+
+        let pi = Barn { name: "pi".into(), ..Default::default() };
+        let view = LogsView::new(&project(), &livestock_logging_to(&log), Some(&pi));
+
+        assert!(
+            view.error.as_deref().is_some_and(|e| e.starts_with("SSH error")),
+            "another machine's logs were read from this one: {:?} {:?}",
+            view.error,
+            view.lines
+        );
+        assert!(view.lines.is_empty());
+    }
 }
