@@ -18,6 +18,23 @@ pub const BARN_SESSION_PREFIX: &str = "yh-barn-";
 /// (it is a raw string literal containing `#{...}` tmux formats).
 pub const REMOTE_KEY_TABLE: &str = "yeehaw-remote";
 
+/// tmux key table a **viewer** session runs in, on the barn.
+///
+/// Deliberately a table nothing ever binds into: `generate_tmux_config` names
+/// only [`REMOTE_KEY_TABLE`], and a name tmux has never heard of is created
+/// empty on first use (`server_client_set_key_table` passes `create = 1`). Empty
+/// is the whole point — every key the user types has to reach the remote pane,
+/// and the one binding [`REMOTE_KEY_TABLE`] carries would be resolved by the
+/// *barn's* server. See [`viewer_script`].
+pub const VIEWER_KEY_TABLE: &str = "yeehaw-viewer";
+
+/// `@yeehaw_type` a local window that is a viewer onto a barn's session wears.
+///
+/// Not one of [`crate::views::session_grid::WINDOW_TYPES`], and that is what
+/// keeps the grid from drawing this window as a local cell beside the remote
+/// cell for the very session it is showing. See [`open_barn_window`].
+pub const VIEWER_WINDOW_TYPE: &str = "barn-view";
+
 #[derive(Debug, Clone)]
 pub struct TmuxWindow {
     pub index: u32,
@@ -1072,6 +1089,157 @@ pub(crate) fn barn_session_options(barn: &Barn) -> Vec<BarnSessionOption> {
     ]
 }
 
+/// The script a viewer runs **on the barn**: build a session grouped with the
+/// barn's `yeehaw`, make it inert, point it at `window_index`, and attach.
+///
+/// Grouped (`new-session -t`), never `attach-session -t =yeehaw`. A plain attach
+/// makes the viewer and whoever is already sitting on the barn two clients of
+/// one session, which has exactly one current window: every window the viewer
+/// moved to would drag the barn's own view along with it, and vice versa. A
+/// group shares the *windows* and keeps the current window per session —
+/// measured on tmux 3.6a: selecting window 2 in the group member left the source
+/// session on window 1.
+///
+/// `=yeehaw`, for the reason [`crate::remote_grid::select_window_target`] spells
+/// out: a bare `-t` target is a prefix pattern, so on a barn with no `yeehaw`
+/// session and a `yeehaw-scratch` present it would silently group onto the
+/// scratch session.
+///
+/// **The three isolation options are what make the inner tmux inert**, and all
+/// three are per-session, so a user attached to the barn's own `yeehaw` sees
+/// none of them:
+///
+/// - `key-table` is the table the barn's client looks every key up in. What the
+///   *local* server binds — C-b, and the `-n` C-y/C-h/C-l/C-p — is consumed on
+///   this machine and never leaves it, which is why the local rotation still
+///   works inside a viewer window; everything else travels. On the barn the
+///   default table is `root`, and `root` is not empty there: a barn runs a
+///   yeehaw ranch too, so its own generated config has bound those same keys
+///   into it, and tmux's mouse bindings live there as well. An empty table is
+///   what makes a viewer a *view* — nothing is interpreted, everything is
+///   delivered to the pane. The table named is [`VIEWER_KEY_TABLE`], which
+///   nothing binds into: **not** [`REMOTE_KEY_TABLE`], whose single binding is
+///   `C-q switch-client -t =yeehaw` and which is resolved by whichever server
+///   the client is on — here the barn, so C-q would mean *that barn's* ranch
+///   session, not the home the user pressed it for.
+/// - `prefix None`, because a key table does not disable the prefix:
+///   `server_client_is_default_key_table()` compares the client's current table
+///   with the *session's* `key-table` option and returns true when they match,
+///   so C-b would go on acting — on the barn, against the session being viewed.
+/// - `status off`, or the barn's status bar stacks under the local ranch's
+///   inside one window.
+///
+/// `destroy-unattached on` rides the **attach**, as a second command in the same
+/// tmux command list, and that ordering is not a style choice: measured on tmux
+/// 3.6a, setting it on a session with no client collects the session
+/// immediately, and the attach that followed failed with "can't find session".
+/// Set after the client is in place, it collects the viewer the moment the local
+/// window closes, so a barn does not accumulate one session per jump.
+///
+/// A session that is created and then abandoned — an option that failed, a
+/// window that vanished between the frame and the keypress — cannot be collected
+/// that way, because nothing ever attached to it. Hence the explicit
+/// `kill-session` on the failure path, the same discipline `connect_to_barn`
+/// applies to a barn session it could not isolate.
+///
+/// The viewer's own `select-window` is what lands the jump. A grouped session
+/// does **not** inherit the source session's current window — measured: with the
+/// barn's `yeehaw` on window 1, a fresh group member came up on window 0, the
+/// dashboard.
+///
+/// `$$` is the remote shell's pid, so two viewers onto one barn cannot collide
+/// on a session name. The script holds no single quote, so
+/// [`viewer_remote_command`] nests it with no escaping beyond the wrapper.
+fn viewer_script(window_index: u32) -> String {
+    format!(
+        "V=yh-view-$$; \
+         tmux new-session -d -t {group} -s \"$V\" || exit 1; \
+         {{ tmux set-option -t \"=$V:\" key-table {table} \
+         && tmux set-option -t \"=$V:\" prefix None \
+         && tmux set-option -t \"=$V:\" status off \
+         && tmux select-window -t \"=$V:{index}\"; }} \
+         || {{ tmux kill-session -t \"=$V\"; exit 1; }}; \
+         exec tmux attach-session -t \"=$V\" \\; \
+         set-option -t \"=$V:\" destroy-unattached on",
+        group = exact_target(YEEHAW_SESSION),
+        table = VIEWER_KEY_TABLE,
+        index = window_index,
+    )
+}
+
+/// [`viewer_script`] as the single argv element to hand `ssh`.
+///
+/// `bash -lc`, matching [`crate::ssh`]'s probe, [`crate::connect`]'s attach and
+/// [`crate::remote_grid::frame_command`]. sshd hands a remote command to a
+/// non-login, non-interactive shell whose PATH has neither Homebrew nor
+/// `~/.local/bin`, so `tmux` is simply absent on exactly the barns whose cells
+/// are streaming happily — bug B of the barn-connect work.
+fn viewer_remote_command(window_index: u32) -> String {
+    format!("bash -lc {}", single_quote(&viewer_script(window_index)))
+}
+
+/// The local shell command a viewer window runs: one `ssh`, one remote script.
+///
+/// Built as a string rather than a `Command` because tmux runs a window's
+/// command through a shell. Every argv element is quoted exactly once by
+/// `shell_escape`, which quotes unconditionally, so a barn whose host, user or
+/// identity file holds `;`, `|`, `&` or a newline is inert here — those values
+/// arrive from MCP callers, k8s node addresses and terraform state.
+///
+/// `tty`, because a viewer renders. **Not** `batch`, unlike
+/// [`crate::remote_grid`]'s one-shot select: that one runs behind a full-screen
+/// TUI where a passphrase prompt is invisible and unanswerable, while this runs
+/// in a window of its own where the user can see it and type the answer —
+/// the same reasoning as [`crate::connect`]'s attach.
+fn viewer_window_command(barn: &Barn, window_index: u32) -> Result<String> {
+    let mut parts = vec!["ssh".to_string()];
+    parts.extend(crate::ssh::ssh_args(barn, crate::ssh::Opts { tty: true, ..Default::default() })?);
+    parts.push(viewer_remote_command(window_index));
+    Ok(parts.iter().map(|p| shell_escape(p)).collect::<Vec<_>>().join(" "))
+}
+
+/// Open a **local** window onto window `window_index` of the barn's ranch.
+///
+/// This is what a number key on a barn's cell does. The user stays in the local
+/// yeehaw session, so C-h/C-l/C-y keep meaning the local rotation and the remote
+/// session sits in it beside local work — where [`connect_to_barn`] instead
+/// hands the whole terminal to a sibling session running the barn's own TUI, and
+/// every key from then on belongs to the remote.
+///
+/// Tagged [`VIEWER_WINDOW_TYPE`], not `ssh`, and scoped to the barn. Without the
+/// tag the grid would draw this window as a local cell showing the very session
+/// it already draws as that barn's remote cell — the same work, twice, under two
+/// numbers. [`VIEWER_WINDOW_TYPE`] is not one of
+/// [`crate::views::session_grid::WINDOW_TYPES`], so the grid's type filter
+/// leaves it out.
+///
+/// No `-d`: the window is the thing the user just asked for, so it opens
+/// selected. Failure returns before anything is tagged — a window that opened
+/// but could not be identified is worse than no window.
+pub fn open_barn_window(barn: &Barn, window_index: u32) -> Result<()> {
+    let cmd = viewer_window_command(barn, window_index)?;
+    let name = format!("{}-{}", barn.name, window_index);
+
+    crate::ssh::ensure_control_dir();
+
+    let output = Command::new("tmux")
+        .args([
+            "new-window", "-a",
+            "-P", "-F", "#{window_index}",
+            "-t", YEEHAW_SESSION,
+            "-n", &name,
+            &cmd,
+        ])
+        .output()
+        .context("failed to run tmux new-window")?;
+
+    let idx = parse_new_window_index(&output, "barn view")?;
+
+    set_window_type(idx, VIEWER_WINDOW_TYPE);
+    set_window_scope(idx, "", Some(&barn.name));
+    Ok(())
+}
+
 /// Tear down a barn's local session. The remote ranch is unaffected.
 pub fn disconnect_barn(barn_name: &str) {
     let target = barn_session_target(barn_name);
@@ -1650,6 +1818,237 @@ mod tests {
         // exists. If the constant and the config literal ever drift apart, that
         // check fails at connect time instead of here.
         assert!(generate_tmux_config().contains(&format!("bind-key -T {} ", REMOTE_KEY_TABLE)));
+    }
+
+    // === the barn viewer window =========================================
+    //
+    // A jump to a barn's cell opens a *local* window that ssh's into a session
+    // grouped with the barn's `yeehaw`. Every property below was measured on
+    // tmux 3.6a against an isolated server (`tmux -L`), never the ranch.
+    //
+    // Nothing here runs tmux or ssh: the assertions are on the generated
+    // command, exactly as `remote_grid`'s `frame_command` and
+    // `select_window_command` are tested. Running `open_barn_window` in a test
+    // would open a window in whatever tmux the developer is sitting in.
+
+    /// A barn for the viewer tests: TEST-NET-1 (RFC 5737, unroutable),
+    /// advertising nothing.
+    ///
+    /// `addresses` is empty *deliberately*. [`crate::ssh::dial_host`] falls back
+    /// to it when `host` is absent, so a fixture carrying a real address is one
+    /// stray `.output()` away from opening an ssh to a machine on the user's
+    /// actual ranch.
+    fn viewer_barn(name: &str) -> Barn {
+        Barn {
+            name: name.into(),
+            host: Some("192.0.2.1".into()),
+            user: Some("cam".into()),
+            port: Some(22),
+            identity_file: None,
+            critters: vec![],
+            addresses: vec![],
+            ..Default::default()
+        }
+    }
+
+    /// The control for every test below: the fixture cannot reach anything real,
+    /// with or without the `addresses` fallback.
+    #[test]
+    fn the_viewer_fixture_dials_test_net_and_advertises_nothing() {
+        let b = viewer_barn("guided");
+        assert!(b.addresses.is_empty(), "the fixture must advertise nothing");
+        assert_eq!(crate::ssh::dial_host(&b), Some("192.0.2.1"));
+
+        let mut hostless = viewer_barn("guided");
+        hostless.host = None;
+        assert_eq!(
+            crate::ssh::dial_host(&hostless),
+            None,
+            "with no host and no addresses there must be nothing to dial"
+        );
+    }
+
+    #[test]
+    fn a_viewer_groups_a_new_session_rather_than_attaching_to_the_barns_own() {
+        // The behavioural core. A plain `attach -t =yeehaw` makes the viewer and
+        // whoever is sitting on the barn two clients of *one* session with one
+        // current window, so every window the viewer moves to drags the barn's
+        // own view along with it. `new-session -t` shares the windows and keeps
+        // the current window per session — measured: selecting window 2 in the
+        // group member left the source session on window 1.
+        let script = viewer_script(3);
+        assert!(
+            script.contains(&format!("new-session -d -t {} -s \"$V\"", exact_target(YEEHAW_SESSION))),
+            "the viewer must be a grouped session: {script}"
+        );
+        assert!(
+            !script.contains(&format!("attach-session -t {}", exact_target(YEEHAW_SESSION))),
+            "the viewer attached to the barn's own session: {script}"
+        );
+    }
+
+    #[test]
+    fn the_group_target_is_anchored_so_a_scratch_session_cannot_win() {
+        // Same rule `select_window_target` and `barn_session_target` document: a
+        // bare `-t yeehaw` is a prefix pattern, so on a barn with no `yeehaw`
+        // session and a `yeehaw-scratch` present it groups onto the scratch
+        // session and the user views someone else's windows.
+        let script = viewer_script(3);
+        assert!(script.contains("-t =yeehaw "), "{script}");
+        assert!(
+            !script.contains("-t yeehaw"),
+            "an unanchored session target is a prefix match: {script}"
+        );
+    }
+
+    #[test]
+    fn the_viewer_session_is_inert_so_the_keys_reach_the_remote_pane() {
+        // Three per-session options, and each one is load-bearing:
+        //
+        // `key-table` moves the viewer's client off `root`, which on a barn is
+        // not empty: a barn is a yeehaw ranch too, so its own config has bound
+        // C-y/C-h/C-l/C-p there, and tmux's mouse bindings live there as well.
+        // Whatever the local server does not consume is looked up in this table,
+        // and a viewer promises delivery, not interpretation.
+        //
+        // `prefix None` because a key table does not disable the prefix:
+        // server_client_is_default_key_table() compares the current table with
+        // the *session's* key-table option and returns true when they match, so
+        // C-b still acts, on the barn, against the session the user is viewing.
+        //
+        // `status off` or two status bars stack — the barn's and the local
+        // ranch's — inside one local window.
+        let script = viewer_script(3);
+        for (opt, value) in [
+            ("key-table", VIEWER_KEY_TABLE),
+            ("prefix", "None"),
+            ("status", "off"),
+        ] {
+            assert!(
+                script.contains(&format!("set-option -t \"=$V:\" {} {}", opt, value)),
+                "the viewer session must set {opt} {value}, per session: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_viewer_key_table_is_not_the_one_a_barn_session_runs_in() {
+        // `yeehaw-remote` holds exactly one binding, `C-q switch-client -t
+        // =yeehaw`, and it is resolved by whichever server the client is on. In
+        // a viewer that server is the *barn*, so C-q — the key the user has
+        // learned means "home" — would switch them to the barn's own ranch
+        // session instead. An empty table is the only table with nothing to get
+        // wrong.
+        assert_ne!(VIEWER_KEY_TABLE, REMOTE_KEY_TABLE);
+        let script = viewer_script(3);
+        assert!(
+            !script.contains(REMOTE_KEY_TABLE),
+            "the viewer reused the barn session's key table: {script}"
+        );
+        assert!(
+            !generate_tmux_config().contains(&format!("-T {} ", VIEWER_KEY_TABLE)),
+            "the viewer's table must stay empty — a binding in it is a key the \
+             remote never sees"
+        );
+    }
+
+    #[test]
+    fn the_viewer_is_told_to_destroy_itself_only_once_a_client_has_attached() {
+        // Order, not presence. Measured on tmux 3.6a: `destroy-unattached on`
+        // set on a session with no client collects it *immediately* — the
+        // session was gone before the next command ran, and the attach then
+        // failed with "can't find session". So it rides the attach itself, as a
+        // second command in the same tmux command list, which runs with the
+        // client already in place.
+        let script = viewer_script(3);
+        let attach = script
+            .find("attach-session")
+            .expect("a viewer has to attach to something");
+        let destroy = script
+            .find("destroy-unattached on")
+            .unwrap_or_else(|| panic!("viewer sessions would accumulate on the barn: {script}"));
+        assert!(
+            destroy > attach,
+            "destroy-unattached is set before the attach; the session is collected \
+             before anyone can reach it: {script}"
+        );
+    }
+
+    #[test]
+    fn the_viewer_selects_the_jumped_to_window_in_its_own_session() {
+        // A grouped session does **not** inherit the source session's current
+        // window — measured: with the barn's `yeehaw` on window 1, a fresh group
+        // member came up on window 0, the dashboard. The caller's pre-flight
+        // select on the barn cannot land this; only this one does.
+        let script = viewer_script(7);
+        assert!(
+            script.contains("select-window -t \"=$V:7\""),
+            "the viewer must select the target window in its own session: {script}"
+        );
+    }
+
+    #[test]
+    fn a_viewer_that_cannot_be_isolated_leaves_no_session_behind_on_the_barn() {
+        // The leak this shape exists to prevent: `destroy-unattached` cannot be
+        // set until the attach, so a session created and then abandoned — an
+        // option that failed, a window that vanished between the frame and the
+        // jump — would sit on the user's production box forever, one per
+        // keypress. Same discipline as `connect_to_barn`, which tears its own
+        // session down rather than reuse an unsafe one.
+        let script = viewer_script(3);
+        assert!(
+            script.contains("kill-session -t \"=$V\""),
+            "a half-built viewer is never cleaned up: {script}"
+        );
+    }
+
+    #[test]
+    fn the_remote_half_runs_under_a_login_shell() {
+        // Bug B of the barn-connect work, and the reason `ssh::PROBE_CMD`,
+        // `connect`'s attach and `remote_grid::frame_command` all say `bash -lc`:
+        // sshd hands a remote command to a non-login, non-interactive shell whose
+        // PATH has neither Homebrew nor ~/.local/bin, so `tmux` is simply absent
+        // on exactly the barns whose cells are streaming happily.
+        let cmd = viewer_remote_command(3);
+        assert!(cmd.starts_with("bash -lc '"), "{cmd}");
+        assert!(cmd.ends_with('\''), "the script must be one quoted word: {cmd}");
+    }
+
+    #[test]
+    fn the_local_window_runs_one_ssh_with_a_tty_and_the_script_as_one_word() {
+        let _ranch = crate::testing::temp_ranch();
+        let cmd = viewer_window_command(&viewer_barn("guided"), 3).expect("a dialable barn");
+
+        // `shell_escape` quotes unconditionally, `ssh` itself included.
+        assert!(cmd.starts_with("'ssh' "), "{cmd}");
+        assert!(
+            cmd.split(' ').any(|w| w == "'-t'"),
+            "a viewer renders, so ssh needs a remote tty: {cmd}"
+        );
+        // tmux runs this string through a shell, so the whole `bash -lc '...'`
+        // has to arrive as a single argv element. Quoted once by `shell_escape`,
+        // the inner quotes come back as `'\''`.
+        assert!(
+            cmd.contains(r#"'bash -lc '\''"#),
+            "the remote command is not one shell word: {cmd}"
+        );
+        assert!(
+            cmd.contains("'cam@192.0.2.1'"),
+            "the destination is not the fixture's: {cmd}"
+        );
+    }
+
+    #[test]
+    fn a_viewer_for_a_barn_with_nothing_to_dial_is_an_error_not_a_window() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut barn = viewer_barn("guided");
+        barn.host = None;
+        assert_eq!(crate::ssh::dial_host(&barn), None, "control: nothing to dial");
+
+        assert!(
+            viewer_window_command(&barn, 3).is_err(),
+            "a barn with no host must fail before a local window is opened"
+        );
     }
 
     // === shell_escape ===================================================

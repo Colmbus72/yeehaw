@@ -256,6 +256,20 @@ pub struct Barn {
     pub connectable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced: Option<bool>,
+    /// Whether *this* machine wants the barn's sessions streamed into the
+    /// session grid.
+    ///
+    /// Machine-local, and `canonical::SHAPES` classifies it so. Wanting to see
+    /// a barn's sessions is a preference of the laptop in front of the user, not
+    /// a property of the barn — the same shape as `synced`. Synced, the Ranch
+    /// House's answer would arrive and switch a laptop's grid on or off behind
+    /// the user's back.
+    ///
+    /// `None` and `Some(false)` mean the same thing to the grid and are kept
+    /// apart for the same reason `synced` keeps them apart: never asked is not
+    /// the same answer as declined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunneled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brand: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,6 +341,7 @@ impl Default for Barn {
             connection_config: None,
             connectable: None,
             synced: None,
+            tunneled: None,
             brand: None,
             is_ranch_house: None,
             tunnel_port: None,

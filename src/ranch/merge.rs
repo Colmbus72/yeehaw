@@ -1117,6 +1117,7 @@ impl Mergeable for crate::types::Barn {
             // `take_machine_local_from`.
             connectable: ours.connectable,
             synced: ours.synced,
+            tunneled: ours.tunneled,
             tunnel_port: ours.tunnel_port,
             last_seen: ours.last_seen.clone(),
             id: ours.id.clone(),
@@ -1128,6 +1129,7 @@ impl Mergeable for crate::types::Barn {
     fn take_machine_local_from(&mut self, source: &Self) {
         self.connectable = source.connectable;
         self.synced = source.synced;
+        self.tunneled = source.tunneled;
         self.tunnel_port = source.tunnel_port;
         self.last_seen = source.last_seen.clone();
     }
@@ -1135,6 +1137,7 @@ impl Mergeable for crate::types::Barn {
     fn clear_machine_local(&mut self) {
         self.connectable = None;
         self.synced = None;
+        self.tunneled = None;
         self.tunnel_port = None;
         self.last_seen = None;
     }
@@ -2918,6 +2921,7 @@ mod tests {
 
         let mut ours = base.clone();
         ours.synced = Some(true);
+        ours.tunneled = Some(true);
         ours.tunnel_port = Some(2222);
         ours.last_seen = Some("2026-09-10T09:00:00+00:00".into());
 
@@ -2925,6 +2929,7 @@ mod tests {
         theirs.brand = Some("ssh-ed25519 PEERKEY yeehaw-ranch-pi".into());
         theirs.is_ranch_house = Some(true);
         theirs.synced = Some(false);
+        theirs.tunneled = Some(false);
         theirs.tunnel_port = Some(9999);
         theirs.last_seen = Some("2026-09-10T11:11:11+00:00".into());
 
@@ -2949,6 +2954,10 @@ mod tests {
             "a machine that cannot learn who the house is cannot use the house-wins tie-break"
         );
         assert_eq!(arrived.synced, ours.synced, "our sync relationship is ours");
+        assert_eq!(
+            arrived.tunneled, ours.tunneled,
+            "their preference must not switch this machine's grid off"
+        );
         assert_eq!(arrived.tunnel_port, ours.tunnel_port, "our forwarded port is ours");
         assert_eq!(
             arrived.last_seen, ours.last_seen,
@@ -2966,6 +2975,7 @@ mod tests {
         let mut theirs = barn("pi");
         theirs.brand = Some("ssh-ed25519 PEERKEY".into());
         theirs.synced = Some(true);
+        theirs.tunneled = Some(true);
         theirs.tunnel_port = Some(2222);
         theirs.last_seen = Some("2026-09-10T11:11:11+00:00".into());
 
@@ -2974,6 +2984,10 @@ mod tests {
 
         assert!(arrived.brand.is_some(), "the brand is content and must still arrive");
         assert_eq!(arrived.synced, None, "we have not enrolled a barn we just heard of");
+        assert_eq!(
+            arrived.tunneled, None,
+            "a peer cannot decide that this machine wants a barn on its grid"
+        );
         assert_eq!(arrived.tunnel_port, None, "we have allocated no port for it");
         assert_eq!(arrived.last_seen, None, "we have never reached it, so we never saw it");
     }

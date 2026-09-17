@@ -238,6 +238,11 @@ impl GlobalDashboard {
                     KeyCode::Enter => return DashboardAction::SelectBarn(self.barns_state.selected),
                     KeyCode::Char('s') => return DashboardAction::SshToBarn(self.barns_state.selected),
                     KeyCode::Char('c') => return DashboardAction::ConnectBarn(self.barns_state.selected),
+                    // The third verb, next to shell and connect. `c` opens a
+                    // barn's whole TUI; this asks only for its sessions on the
+                    // grid, which is a different question with a different
+                    // answer for most barns.
+                    KeyCode::Char('t') => return DashboardAction::ToggleTunnel(self.barns_state.selected),
                     KeyCode::Char('d') => return DashboardAction::RequestDeleteBarn(self.barns_state.selected),
                     _ => {}
                 }
@@ -678,6 +683,16 @@ fn build_barn_items(barns: &[Barn], connected: &HashSet<String>) -> Vec<ListItem
         if b.synced == Some(true) {
             parts.push("synced".to_string());
         }
+        // Additive and `Some(true)`-only for the same reason `synced` is: a barn
+        // switched off is not a barn never asked about. It sits before
+        // `connected` because it is a standing preference of this machine, where
+        // `connected` is whether a session exists this second — and since
+        // `tunneled` is now what decides whether a barn's sessions reach the
+        // grid, a user who cannot see it cannot tell an empty grid from a barn
+        // they never switched on.
+        if b.tunneled == Some(true) {
+            parts.push("tunneled".to_string());
+        }
         if is_connected {
             parts.push("connected".to_string());
         }
@@ -997,6 +1012,102 @@ mod tests {
         let items = build_barn_items(&[imac], &HashSet::new());
 
         assert_eq!(items[0].meta.as_deref(), Some("cam@camerons-imac.local"));
+    }
+
+    // === the tunnel toggle ==================================================
+    //
+    // Streaming a barn's sessions into the grid used to require having run
+    // `connect` on it, which conflates "I opened that machine's whole TUI" with
+    // "I want to see its sessions". `t` is the second question, asked on its own.
+
+    /// `t` is the barns panel's third verb, next to `s` (shell) and `c`
+    /// (connect). Without a key there is no way to want a barn's sessions
+    /// without opening its whole TUI.
+    #[test]
+    fn t_on_the_barns_panel_asks_to_toggle_the_selected_barns_tunnel() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut dash = GlobalDashboard::new();
+        let barns = [barn("guided"), barn("smash-mac")];
+
+        // Tab cycles Projects -> Sessions -> Barns.
+        dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[]);
+        dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[]);
+        dash.handle_input(KeyCode::Char('j'), &[], &barns, &[], &[]);
+
+        let action = dash.handle_input(KeyCode::Char('t'), &[], &barns, &[], &[]);
+
+        assert!(
+            matches!(action, DashboardAction::ToggleTunnel(1)),
+            "`t` must toggle the *selected* barn"
+        );
+    }
+
+    /// `t` anywhere else must not reach the barns panel, the same discipline
+    /// every other panel-scoped verb keeps.
+    #[test]
+    fn t_outside_the_barns_panel_is_not_a_tunnel_toggle() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut dash = GlobalDashboard::new();
+        let barns = [barn("guided")];
+
+        // Focus starts on Projects.
+        let action = dash.handle_input(KeyCode::Char('t'), &[], &barns, &[], &[]);
+
+        assert!(
+            !matches!(action, DashboardAction::ToggleTunnel(_)),
+            "the projects panel toggled a barn's tunnel"
+        );
+    }
+
+    /// The toggle is invisible unless the row says so — and `tunneled` is now
+    /// what decides whether a barn's sessions reach the grid, so a user who
+    /// cannot see the state cannot tell an empty grid from a barn they never
+    /// switched on.
+    #[test]
+    fn a_tunneled_barn_says_so_on_its_row() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut wanted = barn("guided");
+        wanted.tunneled = Some(true);
+        let mut declined = barn("smash-mac");
+        declined.tunneled = Some(false);
+
+        let items = build_barn_items(&[wanted, declined, barn("never-asked")], &HashSet::new());
+
+        assert!(items[0].meta.as_deref().unwrap().contains("tunneled"), "{:?}", items[0].meta);
+        assert!(
+            !items[1].meta.as_deref().unwrap().contains("tunneled"),
+            "`Some(false)` is a barn this machine has switched off: {:?}",
+            items[1].meta
+        );
+        assert!(
+            !items[2].meta.as_deref().unwrap().contains("tunneled"),
+            "and absent is not `false` dressed up as an answer: {:?}",
+            items[2].meta
+        );
+    }
+
+    /// The marker is additive like `ranch house` and `synced`, and it must not
+    /// displace them or the connection.
+    #[test]
+    fn the_tunnel_marker_composes_with_the_others() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut house = barn("camerons-imac");
+        house.is_ranch_house = Some(true);
+        house.synced = Some(true);
+        house.tunneled = Some(true);
+        let set = connected(&[tmux::barn_session_name("camerons-imac")]);
+
+        let items = build_barn_items(&[house], &set);
+
+        let meta = items[0].meta.clone().unwrap();
+        for expected in ["forge@172.233.141.59", "ranch house", "synced", "tunneled", "connected"] {
+            assert!(meta.contains(expected), "{:?} missing from {:?}", expected, meta);
+        }
+        assert_eq!(
+            items[0].status,
+            Some(ItemStatus::Active),
+            "the dot is still the connection and nothing else"
+        );
     }
 
     /// `C-d` is dispatched from `app.rs`, which can only see the barns panel

@@ -164,6 +164,7 @@ impl BarnContextView {
             // dropping `is_ranch_house` would leave the ranch with no house.
             // Editing a host must not do any of that.
             synced: original.synced,
+            tunneled: original.tunneled,
             brand: original.brand.clone(),
             is_ranch_house: original.is_ranch_house,
             tunnel_port: original.tunnel_port,

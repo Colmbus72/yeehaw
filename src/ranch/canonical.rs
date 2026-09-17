@@ -234,6 +234,15 @@ pub const SHAPES: [KindShape; 5] = [
             // that is actively syncing, switching its sync off. Same shape of
             // loss as `connectable`.
             "synced",
+            // Whether this machine wants the barn's sessions on its own session
+            // grid. `synced` one line up with a different question: a preference
+            // held by the laptop in front of the user, not a property of the
+            // barn, and two machines can hold opposite ones without either being
+            // wrong. Hashed, that is a permanent conflict — and the merge's
+            // "they changed it, we did not" branch would push a peer's
+            // `Some(false)` onto a machine that is actively streaming, emptying
+            // its grid.
+            "tunneled",
             // A local forwarded port. Whatever is free on the iMac is taken on
             // the Pi, so the value differs per machine by construction, and
             // adopting a peer's could collide with something already bound here.
@@ -528,6 +537,7 @@ mod tests {
             }),
             connectable: Some(true),
             synced: Some(true),
+            tunneled: Some(true),
             brand: Some("ssh-ed25519 AAAAC3Nz... yeehaw-ranch-pi".into()),
             is_ranch_house: Some(false),
             tunnel_port: Some(2222),
@@ -827,6 +837,33 @@ mod tests {
             hash_entity("barn", &here).unwrap(),
             hash_entity("barn", &there).unwrap(),
             "`synced` is this machine's relationship to the barn, not the barn's own state"
+        );
+    }
+
+    /// Whether this laptop wants a barn's sessions on its grid is a preference
+    /// of the machine in front of the user, not a property of the barn — the
+    /// same shape as `synced`. Hashed, the two sides disagree permanently on a
+    /// field neither is wrong about, and the merge's "they changed it, we did
+    /// not" branch would then push a peer's `Some(false)` onto a machine that is
+    /// actively streaming, emptying its grid.
+    #[test]
+    fn whether_this_machine_tunnels_to_a_barn_is_not_content() {
+        let mut here: Barn = parse(BARN_YAML);
+        let mut there = here.clone();
+        here.tunneled = Some(true);
+        there.tunneled = Some(false);
+
+        assert_eq!(
+            hash_entity("barn", &here).unwrap(),
+            hash_entity("barn", &there).unwrap(),
+            "`tunneled` is this machine's preference about the barn, not the barn's own state"
+        );
+
+        there.host = Some("pi2.local".into());
+        assert_ne!(
+            hash_entity("barn", &here).unwrap(),
+            hash_entity("barn", &there).unwrap(),
+            "a real content change to a barn must still move the hash"
         );
     }
 

@@ -2324,6 +2324,40 @@ mod tests {
     }
 
     #[test]
+    fn a_viewer_window_is_not_a_second_cell_for_the_session_it_is_showing() {
+        // A jump to a barn's cell opens a *local* window that ssh's into a
+        // session grouped with that barn's yeehaw (`tmux::open_barn_window`).
+        // Both halves are on the grid's inputs at once: the barn's frame still
+        // carries the window, and the viewer is now a local window rendering the
+        // very same screen. Untagged — or tagged `ssh`, which is what it looks
+        // like from outside — the grid would draw that work twice, under two
+        // numbers, and a jump to the local copy would be a jump into a window
+        // the user is already in.
+        //
+        // `VIEWER_WINDOW_TYPE` is deliberately not in `WINDOW_TYPES`, so it is
+        // in no filter row and in no `active_types`, and `shows()` drops it.
+        let v = SessionGridView::new(GridScope::All);
+        let local = vec![
+            win(1, "claude", "P", "local"),
+            win(2, crate::tmux::VIEWER_WINDOW_TYPE, "P", "guided"),
+        ];
+        let remote = barns(vec![frame_of("guided", vec![rwin(3, "api", "%3", "claude")])]);
+
+        let cells = v.cells(&local, &remote);
+        let names: Vec<&str> = cells.iter().map(|c| c.window.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["w1", "api"],
+            "the viewer window was drawn beside the session it is a view of"
+        );
+        assert!(
+            !WINDOW_TYPES.contains(&crate::tmux::VIEWER_WINDOW_TYPE),
+            "a viewer type in WINDOW_TYPES is a filter row that turns the \
+             duplicate cell back on"
+        );
+    }
+
+    #[test]
     fn a_remote_window_with_no_capture_renders_empty_rather_than_borrowing_one() {
         // Remote captures arrive in a HashMap with no promise that every window
         // is in it — unlike `tmux::capture_panes`, which contracts to one entry
