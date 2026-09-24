@@ -608,6 +608,7 @@ impl ProjectContextView {
                 status: Some(if w.active { ItemStatus::Active } else { ItemStatus::Inactive }),
                 meta: Some(status_info.text),
                 actions: vec![],
+                ..Default::default()
             }
         }).collect();
         list::render_list(
@@ -633,6 +634,7 @@ impl ProjectContextView {
                 status: Some(if rh.last_sync.is_some() { ItemStatus::Active } else { ItemStatus::Inactive }),
                 meta: Some(meta),
                 actions: vec![],
+                ..Default::default()
             }
         }).collect();
         list::render_list(
@@ -879,6 +881,7 @@ fn build_livestock_items(livestock: &[Livestock]) -> Vec<ListItem> {
                 RowAction { key: "c".to_string(), label: "claude".to_string() },
                 RowAction { key: "s".to_string(), label: "shell".to_string() },
             ],
+            ..Default::default()
         }
     }).collect()
 }
@@ -892,6 +895,7 @@ fn build_herd_items(herds: &[Herd]) -> Vec<ListItem> {
             status: Some(ItemStatus::Active),
             meta: Some(meta),
             actions: vec![],
+            ..Default::default()
         }
     }).collect()
 }

@@ -35,7 +35,7 @@ pub const VIEWER_KEY_TABLE: &str = "yeehaw-viewer";
 /// cell for the very session it is showing. See [`open_barn_window`].
 pub const VIEWER_WINDOW_TYPE: &str = "barn-view";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TmuxWindow {
     pub index: u32,
     pub name: String,
@@ -49,6 +49,20 @@ pub struct TmuxWindow {
     pub project: String,
     /// Barn this window runs on (`@yeehaw_barn`). Empty if untagged.
     pub barn: String,
+    /// For a [`VIEWER_WINDOW_TYPE`] window only: **which** window on
+    /// [`Self::barn`] it is a view of (`@yeehaw_remote_window`).
+    ///
+    /// `@yeehaw_barn` alone says a window points at a barn — an `ssh` window
+    /// and a shell on the ranch house carry it too — and that is not enough to
+    /// recognise the one remote session a viewer is showing. Without this, the
+    /// dashboard cannot tell the barn-view of `guided:4` from the barn-view of
+    /// `guided:7`, and every remote row of that barn would read as open the
+    /// moment any one of them was.
+    ///
+    /// `None` for every window that is not a viewer, and for viewers opened
+    /// before the tag existed — those degrade to "not open here", which greys
+    /// a row that is in fact open rather than claiming a window that is not.
+    pub remote_window: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -332,7 +346,14 @@ pub fn ensure_correct_status_bar() {
 /// shifts every remote field silently, which
 /// `remote_grid::tests::the_remote_window_format_is_byte_identical_to_the_local_one`
 /// catches.
-pub(crate) const WINDOW_LIST_FORMAT: &str = "#{window_index}\t#{window_name}\t#{window_active}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{window_activity}\t#{@yeehaw_type}\t#{@yeehaw_project}\t#{@yeehaw_barn}";
+pub(crate) const WINDOW_LIST_FORMAT: &str = "#{window_index}\t#{window_name}\t#{window_active}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{window_activity}\t#{@yeehaw_type}\t#{@yeehaw_project}\t#{@yeehaw_barn}\t#{@yeehaw_remote_window}";
+
+/// The window option [`TmuxWindow::remote_window`] is read from.
+///
+/// Appended to the **end** of [`WINDOW_LIST_FORMAT`], which is the only place a
+/// field may be added: every existing field keeps its position, so a barn
+/// running the frame script cannot shift one tag into another's slot.
+pub(crate) const REMOTE_WINDOW_OPTION: &str = "@yeehaw_remote_window";
 
 /// Parse one `list-windows -F WINDOW_LIST_FORMAT` line.
 ///
@@ -358,6 +379,10 @@ pub(crate) fn parse_window_line(line: &str) -> Option<TmuxWindow> {
         window_type: parts.get(7).unwrap_or(&"").to_string(),
         project: parts.get(8).unwrap_or(&"").to_string(),
         barn: parts.get(9).unwrap_or(&"").to_string(),
+        // Unset, empty, or anything that is not a number is `None`: a viewer
+        // opened before the tag existed must read as "not open here", never as
+        // a claim on window 0.
+        remote_window: parts.get(10).and_then(|s| s.trim().parse().ok()),
     })
 }
 
@@ -550,14 +575,37 @@ pub fn create_ssh_window(window_name: &str, barn: &Barn, remote_path: &str) -> R
     Ok(idx)
 }
 
+/// The `claude` invocation every Yeehaw-launched session starts from, before
+/// each caller appends its own tail (`-p <prompt>`, `--system-prompt <ctx>`).
+///
+/// Every claude window has to go through here. `--settings` is what tells
+/// Claude Code to run the status hook, and a window launched without it reports
+/// nothing: `signals::read_signal` finds no file, and the dashboard falls back
+/// to a relative timestamp for the life of the session.
+fn claude_base_command() -> String {
+    compose_claude_command(
+        &build_mcp_config(),
+        &build_allowed_tools(),
+        &crate::hooks::claude_settings_json(),
+    )
+}
+
+/// Split from [`claude_base_command`] so the quoting can be tested against a
+/// real shell without `build_mcp_config` going out to `which yeehaw` first.
+fn compose_claude_command(mcp_config: &str, allowed_tools: &str, settings: &str) -> String {
+    format!(
+        "claude --mcp-config {} --allowedTools {} --settings {}",
+        shell_escape(mcp_config),
+        shell_escape(allowed_tools),
+        // `single_quote`, not `shell_escape`: the settings blob is JSON, not a
+        // path, so the leading-`~` expansion `shell_escape` performs has no
+        // business anywhere near it.
+        single_quote(settings),
+    )
+}
+
 pub fn create_claude_window(working_dir: &str, window_name: &str) -> Result<u32> {
-    let mcp_config = build_mcp_config();
-    let allowed_tools = build_allowed_tools();
-    let claude_cmd = format!(
-        "claude --mcp-config {} --allowedTools {}",
-        shell_escape(&mcp_config),
-        shell_escape(&allowed_tools),
-    );
+    let claude_cmd = claude_base_command();
 
     let output = Command::new("tmux")
         .args([
@@ -582,20 +630,12 @@ pub fn create_claude_window_with_context(
     window_name: &str,
     context: &str,
 ) -> Result<u32> {
-    let mcp_config = build_mcp_config();
-    let allowed_tools = build_allowed_tools();
-
     let claude_cmd = if context.is_empty() {
-        format!(
-            "claude --mcp-config {} --allowedTools {}",
-            shell_escape(&mcp_config),
-            shell_escape(&allowed_tools),
-        )
+        claude_base_command()
     } else {
         format!(
-            "claude --mcp-config {} --allowedTools {} --system-prompt {}",
-            shell_escape(&mcp_config),
-            shell_escape(&allowed_tools),
+            "{} --system-prompt {}",
+            claude_base_command(),
             shell_escape(context),
         )
     };
@@ -656,12 +696,9 @@ pub fn create_claude_worm_window(
     prompt: &str,
     working_dir: &str,
 ) -> Result<u32> {
-    let mcp_config = build_mcp_config();
-    let allowed_tools = build_allowed_tools();
     let claude_cmd = format!(
-        "claude --mcp-config {} --allowedTools {} -p {}",
-        shell_escape(&mcp_config),
-        shell_escape(&allowed_tools),
+        "{} -p {}",
+        claude_base_command(),
         shell_escape(prompt),
     );
 
@@ -1235,9 +1272,43 @@ pub fn open_barn_window(barn: &Barn, window_index: u32) -> Result<()> {
 
     let idx = parse_new_window_index(&output, "barn view")?;
 
-    set_window_type(idx, VIEWER_WINDOW_TYPE);
-    set_window_scope(idx, "", Some(&barn.name));
+    for (option, value) in viewer_window_tags(&barn.name, window_index) {
+        set_window_option(idx, option, &value);
+    }
     Ok(())
+}
+
+/// Every window option a viewer window is tagged with.
+///
+/// One list rather than three calls at the open site, because the tags and the
+/// thing that reads them back ([`views_remote_window`]) have to agree exactly,
+/// and a test can hold both ends of that at once — where the `set-option` calls
+/// themselves cannot be run in a test at all without touching the tmux session
+/// the developer is sitting in.
+pub(crate) fn viewer_window_tags(barn: &str, window_index: u32) -> Vec<(&'static str, String)> {
+    vec![
+        ("@yeehaw_type", VIEWER_WINDOW_TYPE.to_string()),
+        ("@yeehaw_barn", window_barn_tag(Some(barn)).to_string()),
+        (REMOTE_WINDOW_OPTION, window_index.to_string()),
+    ]
+}
+
+/// Is this local window a viewer onto window `window_index` of `barn`?
+///
+/// All three parts are asked. The type alone would match a viewer onto a
+/// different barn; the barn alone would match an `ssh` window or a shell; and
+/// the pair without the index would mark every one of a barn's rows open as
+/// soon as any one of them was.
+pub fn views_remote_window(window: &TmuxWindow, barn: &str, window_index: u32) -> bool {
+    window.window_type == VIEWER_WINDOW_TYPE
+        && window.barn == barn
+        && window.remote_window == Some(window_index)
+}
+
+/// Is this local window a view onto some barn's session rather than work of its
+/// own?
+pub fn is_barn_view(window: &TmuxWindow) -> bool {
+    window.window_type == VIEWER_WINDOW_TYPE
 }
 
 /// Tear down a barn's local session. The remote ranch is unaffected.
@@ -1500,6 +1571,110 @@ mod tests {
         assert_eq!(w.window_type, "claude");
         assert_eq!(w.project, "Guided Pages");
         assert_eq!(w.barn, "local");
+    }
+
+    // === which remote window a viewer is showing ============================
+    //
+    // `@yeehaw_barn` says a window *points at* a barn — an `ssh` window and a
+    // shell on the ranch house carry it too. Recognising the one remote session
+    // a viewer is showing needs the window index as well, or the dashboard
+    // cannot tell a view of `guided:4` from a view of `guided:7`.
+
+    /// The tag has to be the **last** field. Every other position is already
+    /// spoken for on both sides of `crate::remote_grid`'s wire, and inserting
+    /// anywhere else shifts a barn's tags into the wrong slots silently.
+    #[test]
+    fn the_remote_window_tag_is_asked_for_last_so_no_field_shifts() {
+        assert!(
+            WINDOW_LIST_FORMAT.ends_with(&format!("#{{{}}}", REMOTE_WINDOW_OPTION)),
+            "{WINDOW_LIST_FORMAT}"
+        );
+        assert_eq!(
+            WINDOW_LIST_FORMAT.matches(REMOTE_WINDOW_OPTION).count(),
+            1,
+            "asked for twice is a shifted field somewhere"
+        );
+    }
+
+    #[test]
+    fn a_viewer_window_line_says_which_remote_window_it_shows() {
+        let w = parse_window_line(&line(&[
+            "9", "guided-4", "0", "%21", "", "ssh", "1700", VIEWER_WINDOW_TYPE, "", "guided", "4",
+        ]))
+        .expect("should parse");
+
+        assert_eq!(w.remote_window, Some(4));
+        assert_eq!(w.barn, "guided");
+        assert!(is_barn_view(&w));
+    }
+
+    /// Everything that is not a viewer, and every viewer opened before the tag
+    /// existed. Absent must read as "not open here" rather than as window 0.
+    #[test]
+    fn a_window_with_no_remote_tag_claims_no_remote_window() {
+        let w = parse_window_line(&line(&[
+            "2", "api-claude", "0", "%3", "", "node", "1700", "claude", "api", "local",
+        ]))
+        .expect("should parse");
+
+        assert_eq!(w.remote_window, None);
+        assert!(!is_barn_view(&w));
+    }
+
+    /// The write side and the read side, held together. Tagging a window and
+    /// then listing it has to come back out as the same claim — the one thing a
+    /// test can check without running tmux.
+    #[test]
+    fn a_viewer_tagged_by_the_open_path_is_recognised_by_the_read_path() {
+        let tags = viewer_window_tags("guided", 4);
+        let value = |k: &str| {
+            tags.iter().find(|(o, _)| *o == k).map(|(_, v)| v.clone())
+        };
+
+        // Exactly what `list-windows` would print back for a window carrying
+        // those options, in WINDOW_LIST_FORMAT order.
+        let w = parse_window_line(&line(&[
+            "9",
+            "guided-4",
+            "0",
+            "%21",
+            "",
+            "ssh",
+            "1700",
+            &value("@yeehaw_type").unwrap_or_default(),
+            "",
+            &value("@yeehaw_barn").unwrap_or_default(),
+            &value(REMOTE_WINDOW_OPTION).unwrap_or_default(),
+        ]))
+        .expect("should parse");
+
+        assert!(views_remote_window(&w, "guided", 4), "{w:?}");
+    }
+
+    /// The whole point of carrying the index: a barn's other rows must not read
+    /// as open because one of them is.
+    #[test]
+    fn a_viewer_onto_one_window_is_not_a_viewer_onto_its_neighbours() {
+        let w = parse_window_line(&line(&[
+            "9", "guided-4", "0", "%21", "", "ssh", "1700", VIEWER_WINDOW_TYPE, "", "guided", "4",
+        ]))
+        .expect("should parse");
+
+        assert!(views_remote_window(&w, "guided", 4));
+        assert!(!views_remote_window(&w, "guided", 7), "one viewer opened the whole barn");
+        assert!(!views_remote_window(&w, "smash-mac", 4), "the barn was not checked");
+    }
+
+    /// An `ssh` window into a barn is tagged with that barn and is *not* a view
+    /// of any of its sessions.
+    #[test]
+    fn an_ssh_window_into_a_barn_is_not_a_view_of_one_of_its_sessions() {
+        let w = parse_window_line(&line(&[
+            "3", "barn-guided", "0", "%8", "", "ssh", "1700", "ssh", "", "guided", "4",
+        ]))
+        .expect("should parse");
+
+        assert!(!views_remote_window(&w, "guided", 4), "an ssh window read as a viewer");
     }
 
     #[test]
@@ -2150,6 +2325,74 @@ mod tests {
         assert_sh_roundtrip(
             r#"{"mcpServers":{"yeehaw":{"command":"/usr/local/bin/yeehaw","args":["mcp-server"]}}}"#,
         );
+    }
+
+    /// tmux hands the window command to a shell, so what `claude` actually
+    /// receives is whatever that shell splits the string into. Quoting the
+    /// settings JSON wrong does not fail loudly — `claude -p` "silently
+    /// ignores" settings it cannot parse — so the only way to know is to run
+    /// the real thing through a real shell and read back the argv.
+    #[test]
+    fn the_claude_command_reaches_claude_as_three_intact_arguments() {
+        let mcp = r#"{"mcpServers":{"yeehaw":{"command":"/usr/local/bin/yeehaw","args":["mcp-server"]}}}"#;
+        let tools = "mcp__yeehaw__list_projects,mcp__yeehaw__get_project";
+        // A hook path with a space and an apostrophe in it: both are legal in a
+        // macOS home directory, and both are what would split this into extra
+        // words if the JSON were interpolated bare.
+        let settings = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"'/Users/o'\''brien/my ranch/bin/claude-hook' waiting"}]}]}}"#;
+
+        assert_eq!(
+            sh_argv(&compose_claude_command(mcp, tools, settings)),
+            vec!["--mcp-config", mcp, "--allowedTools", tools, "--settings", settings],
+        );
+    }
+
+    /// Split a window command the way tmux's shell will, and hand back the
+    /// argv `claude` itself would see (its own name dropped).
+    ///
+    /// Reading the quoting back out of the string by hand is not good enough
+    /// here: the settings JSON *contains* single quotes — it quotes the hook
+    /// path inside the command it asks Claude to run — so the outer layer is
+    /// full of `'\''` seams that only a shell unpicks correctly.
+    fn sh_argv(cmd: &str) -> Vec<String> {
+        let args = cmd.strip_prefix("claude ").expect("command starts with claude");
+        let out = std::process::Command::new("sh")
+            .args(["-c", &format!("set -- {}; printf '%s\\n' \"$@\"", args)])
+            .output()
+            .expect("sh should be runnable");
+        String::from_utf8_lossy(&out.stdout)
+            .trim_end_matches('\n')
+            .split('\n')
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// The point of the flag is the hook, and the hook is only reachable if the
+    /// config names the script inside *this* ranch. A launched window that
+    /// carries no `--settings` writes no signal file, which the dashboard
+    /// cannot tell apart from a session that never started.
+    #[test]
+    fn a_launched_claude_session_is_told_to_run_this_ranchs_status_hook() {
+        crate::testing::with_temp_ranch(|ranch| {
+            let argv = sh_argv(&claude_base_command());
+            let at = argv
+                .iter()
+                .position(|a| a == "--settings")
+                .expect("the launch command carries --settings");
+            let settings = argv.get(at + 1).expect("--settings has a value");
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(settings).expect("the settings argument is JSON");
+            let command = parsed["hooks"]["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .expect("a Stop hook with a command");
+
+            let expected = ranch.dir.path().join("bin").join("claude-hook");
+            assert!(
+                command.contains(&expected.to_string_lossy().to_string()),
+                "the hook points outside this ranch: {command}",
+            );
+        });
     }
 
     #[test]

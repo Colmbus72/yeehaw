@@ -755,6 +755,7 @@ impl IssuesView {
                 status,
                 meta,
                 actions: vec![],
+                ..Default::default()
             }
         }).collect();
 

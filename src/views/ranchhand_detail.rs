@@ -276,6 +276,7 @@ impl RanchHandDetailView {
                     status: Some(if r.active { ItemStatus::Active } else { ItemStatus::Inactive }),
                     meta: Some(r.meta.clone()),
                     actions: vec![],
+                    ..Default::default()
                 }
             }).collect();
 

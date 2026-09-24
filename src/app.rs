@@ -325,19 +325,25 @@ impl App {
 
 /// Whether the remote frame streams should be running while `view` is on screen.
 ///
-/// Exactly one view wants them, and that is the entire cost argument for the
-/// feature: a stream is a live ssh channel to a barn, emitting a rendered frame
-/// every second. A dashboard parked anywhere else with streams open is paying
-/// that for a grid nobody is looking at.
+/// Two views want them, and every other one is still off — that is the cost
+/// argument for the feature: a stream is a live ssh channel to a barn, emitting
+/// a rendered frame every second. A view parked somewhere else with streams
+/// open is paying that for sessions nobody is looking at.
+///
+/// `Global` is the second one because the dashboard's sessions panel is a list
+/// of the *whole ranch*, not of this machine — each tunneled barn's windows sit
+/// under a heading of their own, and those rows come out of the same frames the
+/// grid draws its cells from. The cost stays proportional to what the user
+/// asked for: a barn streams only once `t` has been pressed on it, one barn at
+/// a time, and a ranch with nothing tunneled opens no channel at all.
 ///
 /// Written as an exhaustive `match` rather than `matches!`, deliberately. A new
 /// `AppView` variant then fails to compile here instead of silently inheriting
 /// whichever answer a `_` arm happened to give.
 pub(crate) fn streams_wanted(view: &AppView) -> bool {
     match view {
-        AppView::SessionGrid => true,
-        AppView::Global
-        | AppView::Project { .. }
+        AppView::SessionGrid | AppView::Global => true,
+        AppView::Project { .. }
         | AppView::Barn { .. }
         | AppView::Wiki { .. }
         | AppView::Issues { .. }
@@ -954,7 +960,22 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
 // ============================================================================
 
 fn handle_global_dashboard_input(app: &mut App, key: KeyCode) {
-    let action = app.global_dashboard.handle_input(key, &app.projects, &app.barns, &app.worms, &app.windows);
+    // The frames and the stale set go in for the same reason they go into the
+    // grid's handler: the sessions panel now lists every tunneled barn's
+    // windows, so a capital-letter key has to resolve against the exact list,
+    // in the exact order, that `render` drew.
+    let action = {
+        let stale = app.remote_grid.stale();
+        app.global_dashboard.handle_input(
+            key,
+            &app.projects,
+            &app.barns,
+            &app.worms,
+            &app.windows,
+            app.remote_grid.frames(),
+            &stale,
+        )
+    };
     apply_dashboard_action(app, action);
 }
 
@@ -982,11 +1003,25 @@ fn apply_dashboard_action(app: &mut App, action: DashboardAction) {
                 app.navigate(AppView::Worm { worm });
             }
         }
-        DashboardAction::SelectWindow(idx) => {
-            let session_windows: Vec<_> = app.windows.iter().filter(|w| w.index > 0).collect();
-            if let Some(window) = session_windows.get(idx) {
-                tmux::switch_to_window(window.index);
-            }
+        DashboardAction::SelectWindow(window_index) => {
+            tmux::switch_to_window(window_index);
+        }
+        DashboardAction::OpenBarnWindow { barn, window_index } => {
+            // `jump_to_cell`, not a bare `open_barn_window`: it is the one place
+            // that knows a jump to a barn is a pre-flight `select-window` on the
+            // barn *then* a local viewer, that a barn deleted out from under a
+            // still-drawn row must be reported rather than half-followed, and
+            // that a stale barn skips the pre-flight rather than freezing the
+            // TUI in `ConnectTimeout`. A second copy of that here is a second
+            // copy that drifts.
+            jump_to_cell(
+                app,
+                Origin::Barn(barn),
+                window_index,
+                tmux::switch_to_window,
+                remote_grid::select_window,
+                tmux::open_barn_window,
+            );
         }
         DashboardAction::NewClaude(project_idx) => {
             if let Some(project) = app.projects.get(project_idx) {
@@ -2244,7 +2279,15 @@ pub enum DashboardAction {
     SelectProject(usize),
     SelectBarn(usize),
     SelectWorm(usize),
-    SelectWindow(usize),
+    /// A window of this machine's yeehaw session, by **tmux window index**.
+    ///
+    /// Not a position in the sessions list any more: a `barn-view` window is
+    /// listed under the barn it views rather than as local work, so the list
+    /// and `tmux list-windows` no longer agree on positions.
+    SelectWindow(u32),
+    /// A window on a barn, opened as a local viewer window onto that barn's
+    /// session — the same path a number key on the session grid takes.
+    OpenBarnWindow { barn: String, window_index: u32 },
     NewClaude(usize),
     SshToBarn(usize),
     ConnectBarn(usize),
@@ -2370,7 +2413,18 @@ fn draw(frame: &mut Frame, app: &mut App) {
 fn render_view(frame: &mut Frame, app: &mut App, area: Rect) {
     match &app.view {
         AppView::Global => {
-            app.global_dashboard.render(frame, area, &app.projects, &app.barns, &app.worms, &app.windows, &app.connected_barns);
+            let stale = app.remote_grid.stale();
+            app.global_dashboard.render(
+                frame,
+                area,
+                &app.projects,
+                &app.barns,
+                &app.worms,
+                &app.windows,
+                &app.connected_barns,
+                app.remote_grid.frames(),
+                &stale,
+            );
         }
         AppView::Project { project } => {
             let project = project.clone();
@@ -2890,17 +2944,20 @@ mod tests {
         serde_json::from_str(json).expect("fixture should deserialize")
     }
 
-    /// Every view the grid is actually left *for*.
+    /// Every view the grid is left *for* that has no use for a stream.
     ///
     /// `go_back` is only one of the three routes. The vault trigger file and a
     /// worm/poll trigger both navigate straight out of `SessionGrid` from the
     /// main loop without going anywhere near `go_back`, so `Vault` and `Trail`
     /// are in this list on purpose and not for symmetry.
+    ///
+    /// `Global` is deliberately **not** here any more: the dashboard's sessions
+    /// panel is now a view of the whole ranch, so it reads the same frames the
+    /// grid does. `the_dashboard_keeps_the_streams_the_grid_opened` covers that
+    /// route instead.
     fn views_off_the_grid() -> Vec<AppView> {
         let project: Project = fixture(r#"{"name":"proj","path":"/tmp/proj"}"#);
         vec![
-            // `go_back` with no previous view.
-            AppView::Global,
             // `go_back` to wherever `v` was pressed.
             AppView::Project { project: project.clone() },
             AppView::Barn { barn: barn("guided") },
@@ -2937,11 +2994,42 @@ mod tests {
     }
 
     #[test]
-    fn only_the_session_grid_wants_streams() {
+    fn only_the_grid_and_the_dashboard_want_streams() {
         assert!(streams_wanted(&AppView::SessionGrid));
+        // The dashboard's sessions panel lists every tunneled barn's windows,
+        // so it needs frames exactly as much as the grid does. Nothing else
+        // renders one.
+        assert!(
+            streams_wanted(&AppView::Global),
+            "the dashboard's sessions panel has no frames to list"
+        );
         for view in views_off_the_grid() {
             assert!(!streams_wanted(&view), "{view:?} wants ssh channels open");
         }
+    }
+
+    /// The grid and the dashboard are one route apart in both directions — `v`
+    /// and `Esc` — and both read frames. Tearing the streams down between them
+    /// would cost a handshake per barn and blank the sessions panel until the
+    /// next frame landed, every single time.
+    #[test]
+    fn the_dashboard_keeps_the_streams_the_grid_opened() {
+        let barns = [tunneled_barn("guided")];
+        let log = RefCell::new(Vec::new());
+        let (mut streams, _guards) = streaming(&barns, &log);
+        let pid = child_pid(&streams, "guided").expect("streaming");
+
+        sync_streams_for_view(&mut streams, &AppView::SessionGrid, &AppView::Global);
+        assert_eq!(
+            child_pid(&streams, "guided"),
+            Some(pid),
+            "Esc off the grid killed the streams the dashboard is about to list"
+        );
+
+        sync_streams_for_view(&mut streams, &AppView::Global, &AppView::SessionGrid);
+        assert_eq!(child_pid(&streams, "guided"), Some(pid), "and `v` killed them coming back");
+
+        streams.shutdown();
     }
 
     #[test]
@@ -3214,6 +3302,31 @@ mod tests {
         app.barns = names.iter().map(|n| barn(n)).collect();
         app.error = None;
         app
+    }
+
+    /// A capital letter on the dashboard and a number key on the grid are the
+    /// same act — open a local viewer onto a barn's session — and they must
+    /// take the same route. `jump_to_cell` is what knows a barn deleted out
+    /// from under a still-drawn row has to be reported rather than half
+    /// followed; a second copy of that reasoning is a second copy that drifts.
+    ///
+    /// Driven through a barn the ranch does not have, which is the one branch
+    /// of that route that returns before anything leaves the process.
+    #[test]
+    fn a_barn_row_on_the_dashboard_opens_through_the_same_jump_the_grid_uses() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut app = ranch(&[]);
+
+        apply_dashboard_action(
+            &mut app,
+            DashboardAction::OpenBarnWindow { barn: "guided".into(), window_index: 4 },
+        );
+
+        assert_eq!(
+            app.error.as_deref(),
+            Some("barn 'guided' is no longer on the ranch"),
+            "the dashboard's barn row does not go through `jump_to_cell`"
+        );
     }
 
     #[test]

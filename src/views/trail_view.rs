@@ -299,6 +299,7 @@ impl TrailView {
                 status: Some(ItemStatus::Inactive),
                 meta: None,
                 actions: vec![],
+                ..Default::default()
             });
         }
 
@@ -324,6 +325,7 @@ impl TrailView {
                 }),
                 meta: None,
                 actions: vec![],
+                ..Default::default()
             });
         }
 

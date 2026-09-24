@@ -1273,6 +1273,7 @@ mod tests {
             window_type: ty.to_string(),
             project: project.to_string(),
             barn: barn.to_string(),
+            ..Default::default()
         }
     }
 
@@ -1798,6 +1799,7 @@ mod tests {
             window_type: ty.to_string(),
             project: "P".to_string(),
             barn: "local".to_string(),
+            ..Default::default()
         }
     }
 

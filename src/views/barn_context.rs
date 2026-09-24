@@ -329,6 +329,7 @@ impl BarnContextView {
                 status: Some(ItemStatus::Active),
                 meta: Some(ls.path.clone()),
                 actions: vec![],
+                ..Default::default()
             }
         }).collect();
         list::render_list(
@@ -352,6 +353,7 @@ impl BarnContextView {
                 status: Some(ItemStatus::Active),
                 meta: Some(c.service.clone()),
                 actions: vec![],
+                ..Default::default()
             }
         }).collect();
         list::render_list(

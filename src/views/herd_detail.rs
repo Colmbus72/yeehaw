@@ -118,6 +118,7 @@ impl HerdDetailView {
                 status: Some(ItemStatus::Active),
                 meta,
                 actions: vec![],
+                ..Default::default()
             }
         }).collect();
 
@@ -145,6 +146,7 @@ impl HerdDetailView {
                 status: Some(ItemStatus::Active),
                 meta: Some(cr.barn.clone()),
                 actions: vec![],
+                ..Default::default()
             }
         }).collect();
 

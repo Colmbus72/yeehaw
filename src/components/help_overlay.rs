@@ -136,7 +136,10 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
                     ("k / ↑", "Move up"),
                     ("Tab", "Switch panel"),
                     ("Enter", "Select item"),
-                    ("1-9", "Switch to session"),
+                    ("1-9", "Switch to a session on this machine"),
+                    // Two namespaces, deliberately: a barn waking up must never
+                    // renumber a local session under the user's fingers.
+                    ("A-Z", "Open a session on a barn"),
                 ],
             });
             groups.push(HotkeyGroup {
@@ -145,6 +148,9 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
                     ("c", "Open Claude / connect to barn"),
                     ("Ctrl+D", "Disconnect from barn"),
                     ("s", "SSH to barn / open shell"),
+                    // What puts a barn's sessions in the panel at all, and so
+                    // what makes A-Z mean anything.
+                    ("t", "Stream a barn's sessions"),
                     ("n", "Create new item"),
                     ("d", "Delete item"),
                     ("v", "Live session grid"),
@@ -334,6 +340,22 @@ mod tests {
                 rows.iter().any(|r| r.contains("Press ? or Esc to close")),
                 "scope {scope:?} clipped the last row of the overlay:\n{}",
                 rows.join("\n")
+            );
+        }
+    }
+
+    /// The sessions panel lists the whole ranch now, and the two halves are
+    /// reached by two different namespaces. A capital letter that opens a barn's
+    /// session is a key nobody would ever guess.
+    #[test]
+    fn the_dashboard_help_names_both_session_namespaces() {
+        let rows = screen("global", 120, 40);
+        let text = rows.join("\n");
+        for key in ["1-9", "A-Z", "t"] {
+            let needle = format!("{:>12}  ", key);
+            assert!(
+                rows.iter().any(|r| r.contains(&needle)),
+                "the dashboard's help never mentions {key:?}:\n{text}"
             );
         }
     }

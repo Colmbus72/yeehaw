@@ -350,6 +350,7 @@ impl LivestockDetailView {
                     }),
                     meta: Some(status_info.text),
                     actions: vec![],
+                    ..Default::default()
                 }
             })
             .collect();
@@ -411,6 +412,7 @@ impl LivestockDetailView {
                     status,
                     meta,
                     actions: vec![],
+                    ..Default::default()
                 }
             })
             .collect();

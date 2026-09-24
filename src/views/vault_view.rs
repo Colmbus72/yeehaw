@@ -671,6 +671,7 @@ impl VaultView {
                     status: None,
                     meta: Some(meta),
                     actions: vec![],
+                    ..Default::default()
                 }
             })
             .collect();

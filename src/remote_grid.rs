@@ -92,7 +92,7 @@ pub(crate) const FRAME_SENTINEL: &str = "\u{1}\u{2}YHFRAME\u{2}\u{1}";
 /// The script holds no single quote, so [`frame_command`] nests it in `bash -lc
 /// '...'` with no escaping beyond the wrapper.
 const FRAME_SCRIPT: &str = "\
-    FMT=\"#{window_index}\t#{window_name}\t#{window_active}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{window_activity}\t#{@yeehaw_type}\t#{@yeehaw_project}\t#{@yeehaw_barn}\"; \
+    FMT=\"#{window_index}\t#{window_name}\t#{window_active}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{window_activity}\t#{@yeehaw_type}\t#{@yeehaw_project}\t#{@yeehaw_barn}\t#{@yeehaw_remote_window}\"; \
     T=$(printf \"\\t\"); \
     while :; do \
     W=$(tmux list-windows -t \"=yeehaw\" -F \"$FMT\" 2>/dev/null); \

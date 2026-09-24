@@ -123,6 +123,7 @@ impl WikiView {
                 status: Some(ItemStatus::Active),
                 meta: None,
                 actions: vec![],
+                ..Default::default()
             }
         }).collect();
 

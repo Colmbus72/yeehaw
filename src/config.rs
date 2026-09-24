@@ -182,6 +182,19 @@ pub fn ensure_config_dirs() {
     if !crate::hooks::skill_installed() {
         let _ = crate::hooks::install_skill();
     }
+
+    // Same treatment for the claude status hook, and for the same reason the
+    // skill gets it: a session launched from Yeehaw points its hook config at
+    // `bin/claude-hook`, so if the script is not there the session runs with a
+    // hook that silently execs nothing. Nothing writes a signal, every claude
+    // window falls back to a relative timestamp, and the working/waiting/idle
+    // display looks like it was never built rather than like a missing file.
+    //
+    // `yeehaw hooks install` was the only installer, and it is a command a user
+    // has no reason to run until they notice the thing it fixes.
+    if !crate::hooks::hook_script_exists() {
+        let _ = crate::hooks::install_hook_script();
+    }
 }
 
 pub fn skills_dir() -> PathBuf {
@@ -549,6 +562,32 @@ pub fn load_barns_checked() -> LoadResult<Barn> {
         // At the head: it is the machine the user is sitting at.
         result.items.insert(0, local_barn());
     }
+
+    // Ranch house, then this machine, then everything else by name.
+    //
+    // The two barns a user orients by are the one that arbitrates the ranch and
+    // the one they are sitting at; `read_dir` order put them wherever the
+    // filesystem felt like. Sorting here rather than in the barns panel is
+    // deliberate: `s`, `c`, `t` and `d` all index into this list, so a display
+    // that sorted on its own would act on a different barn than the one under
+    // the cursor.
+    //
+    // The synthetic `local` row, when present, is this machine by definition
+    // and sorts second — there is no adopted record competing for the slot.
+    let this_machine = this_barn_name();
+    result.items.sort_by_key(|b| {
+        let rank = if b.is_ranch_house == Some(true) {
+            0
+        } else if b.name == LOCAL_BARN_NAME
+            || this_machine.as_deref() == Some(b.name.as_str())
+        {
+            1
+        } else {
+            2
+        };
+        (rank, b.name.to_lowercase())
+    });
+
     result
 }
 
@@ -2391,6 +2430,68 @@ jobs:
 
     /// The whole point of the change: a file that fails to parse used to
     /// disappear from the UI with no error at all.
+    /// The two barns a user orients by are the one that arbitrates the ranch
+    /// and the one they are sitting at. `read_dir` put them wherever the
+    /// filesystem felt like.
+    #[test]
+    fn the_ranch_house_leads_the_list_and_this_machine_follows_it() {
+        crate::testing::with_temp_ranch(|_| {
+            let mut mk = |name: &str, house: bool| {
+                let mut b = Barn { name: name.into(), ..Default::default() };
+                if house {
+                    b.is_ranch_house = Some(true);
+                }
+                save_barn(&mut b).unwrap();
+            };
+            mk("zulu", false);
+            mk("alpha", false);
+            mk("smashed-air", false);
+            mk("camerons-imac", true);
+
+            let mut cfg = load_config();
+            cfg.this_barn = Some("smashed-air".into());
+            save_config(&cfg).unwrap();
+
+            let names: Vec<String> =
+                load_barns().into_iter().map(|b| b.name).collect();
+            assert_eq!(
+                names,
+                vec![
+                    "camerons-imac".to_string(),
+                    "smashed-air".to_string(),
+                    "alpha".to_string(),
+                    "zulu".to_string(),
+                ],
+                "house first, this machine second, the rest by name"
+            );
+        });
+    }
+
+    /// Before adoption the synthetic row *is* this machine, so it takes the
+    /// same slot rather than sorting in with the ordinary barns.
+    #[test]
+    fn the_synthetic_row_takes_this_machines_slot_when_nothing_else_does() {
+        crate::testing::with_temp_ranch(|_| {
+            let mut mk = |name: &str, house: bool| {
+                let mut b = Barn { name: name.into(), ..Default::default() };
+                if house {
+                    b.is_ranch_house = Some(true);
+                }
+                save_barn(&mut b).unwrap();
+            };
+            mk("alpha", false);
+            mk("pi", true);
+
+            let names: Vec<String> =
+                load_barns().into_iter().map(|b| b.name).collect();
+            assert_eq!(
+                names,
+                vec!["pi".to_string(), LOCAL_BARN_NAME.to_string(), "alpha".to_string()],
+                "the placeholder is this machine and sorts second"
+            );
+        });
+    }
+
     #[test]
     fn a_broken_project_file_is_reported_rather_than_hidden() {
         crate::testing::with_temp_ranch(|ranch| {

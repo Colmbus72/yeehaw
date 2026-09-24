@@ -137,8 +137,10 @@ fn handle_hooks_subcommand(args: &[String]) {
             Ok(path) => {
                 println!("\x1b[32m✓\x1b[0m Hook script installed: {}", path.display());
                 println!();
-                println!("\x1b[33mNote:\x1b[0m Claude sessions started from Yeehaw already have hooks enabled.");
-                println!("This command is only needed for Claude sessions started outside Yeehaw.");
+                println!("\x1b[33mNote:\x1b[0m Sessions Yeehaw launches pass this config to");
+                println!("`claude --settings` themselves, so they need nothing else — and nothing");
+                println!("in ~/.claude/settings.json. This command is for Claude sessions you start");
+                println!("yourself in a terminal, which Yeehaw has no hand in launching.");
 
                 if hooks::check_claude_hooks_installed() {
                     println!("\n\x1b[32m✓\x1b[0m Claude hooks already configured in ~/.claude/settings.json");
@@ -158,8 +160,8 @@ fn handle_hooks_subcommand(args: &[String]) {
         println!("Usage: yeehaw hooks install");
         println!();
         println!("Install Claude hooks for session status tracking.");
-        println!("Note: Sessions started from Yeehaw already have hooks enabled automatically.");
-        println!("This is only needed for Claude sessions started outside Yeehaw.");
+        println!("Note: Sessions Yeehaw launches already pass these hooks to `claude --settings`");
+        println!("on the command line. This is only for Claude sessions you start yourself.");
     }
 }
 
