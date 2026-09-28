@@ -90,23 +90,35 @@
 //!   "remote changed, we did not" branch would clobber the local kubeconfig
 //!   path with the peer's.
 //!
-//! Slice D added three more, all on `barn`, and all argued at the point of
-//! classification rather than here — see the comments in [`SHAPES`]:
+//! The ranch slices added three more, all on `barn`, and all argued at the point
+//! of classification rather than here — see the comments in [`SHAPES`]:
 //!
 //! - **`Barn.last_seen`** — `RanchHand.last_sync` under another name. Written on
 //!   every reachability check, so two machines holding the same barn never agree.
 //! - **`Barn.synced`** — whether *this* machine syncs the barn. Enrolment is a
 //!   relationship, not a property of the barn, and a peer's `Some(false)` landing
 //!   here would switch off a sync this machine is actively running.
-//! - **`Barn.tunnel_port`** — a port forwarded on *this* machine. What is free on
-//!   the iMac is taken on the Pi.
+//! - **`Barn.tunneled`** — whether *this* machine wants the barn's sessions on
+//!   its own grid. A preference of the laptop in front of the user, and two
+//!   machines can hold opposite ones without either being wrong.
 //!
-//! The other three ranch fields — `brand`, `is_ranch_house`, `addresses` — are
-//! content, and have to be: each exists in order to reach the other machine.
+//! The other four ranch fields — `brand`, `is_ranch_house`, `addresses` and
+//! `tunnel_port` — are content, and have to be: each exists in order to reach
+//! the other machine.
+//!
+//! `tunnel_port` is the one that changed sides. Slice D classified it
+//! machine-local as "a port forwarded on *this* machine", and recorded in
+//! [`SHAPES`] the condition for re-opening it: if the field ever meant the port
+//! a *reverse* tunnel binds rather than the local end of a forward, it would be
+//! a property of the barn. Slice E made it exactly that — the barn runs
+//! `ssh -N -R <port>:localhost:22 <house>`, so the port is bound on the Ranch
+//! House's loopback, there is one answer per barn for the whole ranch, and every
+//! machine needs it to build `ssh -J <house> -p <port> <user>@localhost`. See
+//! [`SHAPES`] and `ranch::assign_tunnel_port`.
 //!
 //! So the not-content list is **per kind**, not flat: identity applies to all
 //! five, `path` only to `project`, `connectable`/`last_seen`/`synced`/
-//! `tunnel_port` only to `barn`, `last_sync` and `config` only to `ranchhand`.
+//! `tunneled` only to `barn`, `last_sync` and `config` only to `ranchhand`.
 //! See [`SHAPES`].
 //!
 //! ## Adding a field is a decision, not a default
@@ -243,16 +255,6 @@ pub const SHAPES: [KindShape; 5] = [
             // `Some(false)` onto a machine that is actively streaming, emptying
             // its grid.
             "tunneled",
-            // A local forwarded port. Whatever is free on the iMac is taken on
-            // the Pi, so the value differs per machine by construction, and
-            // adopting a peer's could collide with something already bound here.
-            // The barn's own advertised reachability lives in `addresses`, which
-            // is content — this is only how *this* machine tunnels to it.
-            //
-            // Re-open this if Slice E turns out to mean "the port the barn
-            // listens on for a reverse tunnel" rather than "the local end of the
-            // forward": that reading would make it a property of the barn.
-            "tunnel_port",
         ],
         content: &[
             "name",
@@ -295,6 +297,26 @@ pub const SHAPES: [KindShape; 5] = [
             // Being unioned, it owes this hash a deterministic order; see the
             // module docs' last section. `merge::merge_addresses` pays that debt.
             "addresses",
+            // RECLASSIFIED, Slice E. This was `machine_local`, justified as "a
+            // port forwarded on *this* machine — what is free on the iMac is
+            // taken on the Pi", with the caveat recorded right here: *re-open it
+            // if the field ever means the port a reverse tunnel binds rather
+            // than the local end of a forward.* It does now, so it moved.
+            //
+            // The barn holds `ssh -N -R <port>:localhost:22 <house>`, which
+            // binds `<port>` on the **Ranch House's** loopback. So the port is
+            // not a fact about the machine holding the file at all — it is one
+            // number, chosen once by the house (`ranch::assign_tunnel_port`),
+            // unique across the ranch, and every machine needs it in order to
+            // route: `ssh::route` turns it into
+            // `-J <house> -p <port> <user>@localhost`. Stripped from the hash it
+            // never propagates and no peer can reach the barn — the same failure
+            // `brand` would have if it were stripped.
+            //
+            // Contrast `tunneled` one entry up, which stayed machine-local: that
+            // is whether *this* laptop wants the barn on its grid. Wanting the
+            // sessions and knowing where to get them are different questions.
+            "tunnel_port",
         ],
     },
     KindShape {
@@ -867,19 +889,31 @@ mod tests {
         );
     }
 
-    /// A local forwarded port: whatever is free on the iMac is taken on the Pi.
-    /// The barn's own advertised reachability is `addresses`, which *is* content.
+    /// DELIBERATE REVERSAL. This test used to be
+    /// `a_barns_local_tunnel_port_is_not_content`, asserting the two hashes
+    /// *equal* on the grounds that "whatever is free on the iMac is taken on the
+    /// Pi". That was the **local-forward** reading of the field, and [`SHAPES`]
+    /// recorded the condition for re-opening it: *if the field ever means the
+    /// port a reverse tunnel binds, it is a property of the barn.* It does now.
+    ///
+    /// The port is bound on the **Ranch House's** loopback by the barn's own
+    /// `ssh -N -R <port>:localhost:22 <house>`, so there is exactly one answer
+    /// per barn for the whole ranch, and every machine needs it: `ssh::route`
+    /// builds `-J <house> -p <port> <user>@localhost` out of it. Stripped from
+    /// the hash it never propagates, and a peer that cannot learn barn X's port
+    /// cannot reach barn X at all.
     #[test]
-    fn a_barns_local_tunnel_port_is_not_content() {
+    fn a_barns_tunnel_port_is_content() {
         let mut here: Barn = parse(BARN_YAML);
         let mut there = here.clone();
-        here.tunnel_port = Some(2222);
-        there.tunnel_port = Some(2223);
+        here.tunnel_port = Some(23000);
+        there.tunnel_port = Some(23001);
 
-        assert_eq!(
+        assert_ne!(
             hash_entity("barn", &here).unwrap(),
             hash_entity("barn", &there).unwrap(),
-            "a port allocated on this machine cannot be a fact about the barn"
+            "the house binds one port per barn, so two ports are two different barns — \
+             a hash that cannot tell them apart never ships the port to a peer"
         );
     }
 

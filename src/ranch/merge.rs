@@ -1100,6 +1100,17 @@ impl Mergeable for crate::types::Barn {
                 &theirs.is_ranch_house,
             ),
             addresses: merge_addresses(ours, theirs, f),
+            // Content as of Slice E, and no longer the "local forwarded port"
+            // this used to be — see `canonical::SHAPES`. The house binds one port
+            // per barn on its own loopback, so a peer that never learns it cannot
+            // build `ssh::route`'s ProxyJump. Not a plain `pick`: see
+            // `merge_tunnel_port`.
+            tunnel_port: merge_tunnel_port(
+                base.map(|b| &b.tunnel_port),
+                &ours.tunnel_port,
+                &theirs.tunnel_port,
+                f,
+            ),
             source: f.pick("source", base.map(|b| &b.source), &ours.source, &theirs.source),
             connection_type: f.pick(
                 "connection_type",
@@ -1118,7 +1129,6 @@ impl Mergeable for crate::types::Barn {
             connectable: ours.connectable,
             synced: ours.synced,
             tunneled: ours.tunneled,
-            tunnel_port: ours.tunnel_port,
             last_seen: ours.last_seen.clone(),
             id: ours.id.clone(),
             created_at: ours.created_at.clone(),
@@ -1130,7 +1140,6 @@ impl Mergeable for crate::types::Barn {
         self.connectable = source.connectable;
         self.synced = source.synced;
         self.tunneled = source.tunneled;
-        self.tunnel_port = source.tunnel_port;
         self.last_seen = source.last_seen.clone();
     }
 
@@ -1138,8 +1147,53 @@ impl Mergeable for crate::types::Barn {
         self.connectable = None;
         self.synced = None;
         self.tunneled = None;
-        self.tunnel_port = None;
         self.last_seen = None;
+    }
+}
+
+/// A barn's `tunnel_port`: an assignment beats the absence of one, and two
+/// different assignments go to the house.
+///
+/// Content, so it cannot simply be `ours` — but it is not a plain
+/// [`Fields::pick`] either, and the difference is the case a **first join**
+/// produces. `ranch::assign_tunnel_port` runs on the house and the answer is
+/// written down by the *joiner*; the house's own copy of that barn record does
+/// not carry it until the joiner's push lands. So the sides legitimately read
+/// `Some(23007)` and `None`, with no base to tell them apart — which `pick` calls
+/// a conflict and settles in favour of the house, i.e. in favour of `None`. The
+/// assignment would be wiped off the one machine that had it, and on every
+/// subsequent sync too.
+///
+/// `None` is not a competing answer. It means "nobody has assigned this barn a
+/// port", and there is only ever one assigner. So:
+///
+/// - **Both the same** → that port, and nothing to report.
+/// - **One side has one, the other does not** → the port, from whichever side
+///   holds it. No conflict: the two sides do not disagree, one of them simply
+///   has not heard yet.
+/// - **Two different ports** → a real disagreement, because one of the two
+///   tunnels would silently shadow the other. Down the normal path: reported as
+///   a conflict, settled by the house.
+///
+/// The cost, stated: clearing the field is not a change that propagates, the
+/// same property `merge_addresses` documents for removals. Unsetting a port by
+/// hand on one machine has it restored from the other on the next sync; the way
+/// to move a barn's port is to set the new one, which *is* a value and does
+/// travel.
+fn merge_tunnel_port(
+    base: Option<&Option<u16>>,
+    ours: &Option<u16>,
+    theirs: &Option<u16>,
+    f: &mut Fields,
+) -> Option<u16> {
+    match (ours, theirs) {
+        (Some(a), Some(b)) if a == b => Some(*a),
+        (Some(port), None) | (None, Some(port)) => Some(*port),
+        (None, None) => None,
+        // Two ports, and they differ. The house owns the assignment, so the
+        // house's number is the one that stands — and the user is told, because
+        // the losing machine's tunnel is about to stop being reachable.
+        _ => f.pick("tunnel_port", base, ours, theirs),
     }
 }
 
@@ -2915,6 +2969,13 @@ mod tests {
     /// three machine-local ones must not. The two halves are one test because
     /// the failure mode is getting the split wrong, and either direction alone
     /// would pass with the split inverted for the other.
+    ///
+    /// SLICE E: `tunnel_port` left this test's cast. It used to be one of the
+    /// machine-local three and is now content — the house binds one port per
+    /// barn on its own loopback, so there is one answer for the whole ranch. It
+    /// is set identically on both sides here only so that it cannot be the thing
+    /// that fills `plan.conflicts`; the port's own behaviour is pinned by the
+    /// three tests below.
     #[test]
     fn a_barns_brand_travels_while_its_local_bookkeeping_stays_home() {
         let base = barn("pi");
@@ -2922,7 +2983,7 @@ mod tests {
         let mut ours = base.clone();
         ours.synced = Some(true);
         ours.tunneled = Some(true);
-        ours.tunnel_port = Some(2222);
+        ours.tunnel_port = Some(23000);
         ours.last_seen = Some("2026-09-10T09:00:00+00:00".into());
 
         let mut theirs = base.clone();
@@ -2930,7 +2991,7 @@ mod tests {
         theirs.is_ranch_house = Some(true);
         theirs.synced = Some(false);
         theirs.tunneled = Some(false);
-        theirs.tunnel_port = Some(9999);
+        theirs.tunnel_port = Some(23000);
         theirs.last_seen = Some("2026-09-10T11:11:11+00:00".into());
 
         let plan =
@@ -2958,7 +3019,6 @@ mod tests {
             arrived.tunneled, ours.tunneled,
             "their preference must not switch this machine's grid off"
         );
-        assert_eq!(arrived.tunnel_port, ours.tunnel_port, "our forwarded port is ours");
         assert_eq!(
             arrived.last_seen, ours.last_seen,
             "their clock must not overwrite when *we* last reached the barn"
@@ -2966,17 +3026,24 @@ mod tests {
     }
 
     /// A barn this machine has never tried arrives with no local bookkeeping at
-    /// all — the same reasoning as `connectable`, extended to the three Slice D
+    /// all — the same reasoning as `connectable`, extended to the Slice D
     /// fields. `last_seen` from the peer would claim we had reached a host we
     /// have never contacted; `synced: Some(true)` would claim an enrolment this
     /// machine never made.
+    ///
+    /// SLICE E, and the assertion that used to say the opposite: `tunnel_port`
+    /// **must** arrive. `clear_machine_local` blanked it on the grounds that "we
+    /// have allocated no port for it" — but nothing on this machine allocates it
+    /// any more. The Ranch House does, once, and a barn that arrives without its
+    /// port is a barn `ssh::route` cannot reach: this is a *newly heard of* barn,
+    /// which is exactly the case the routing exists for.
     #[test]
-    fn a_new_barn_arrives_with_none_of_the_peers_local_bookkeeping() {
+    fn a_new_barn_arrives_with_the_port_it_is_reachable_at_and_nothing_else_local() {
         let mut theirs = barn("pi");
         theirs.brand = Some("ssh-ed25519 PEERKEY".into());
         theirs.synced = Some(true);
         theirs.tunneled = Some(true);
-        theirs.tunnel_port = Some(2222);
+        theirs.tunnel_port = Some(23004);
         theirs.last_seen = Some("2026-09-10T11:11:11+00:00".into());
 
         let plan = plan_kind(&[], &[theirs], no_base, &[], &[], Side::Remote).unwrap();
@@ -2988,8 +3055,78 @@ mod tests {
             arrived.tunneled, None,
             "a peer cannot decide that this machine wants a barn on its grid"
         );
-        assert_eq!(arrived.tunnel_port, None, "we have allocated no port for it");
+        assert_eq!(
+            arrived.tunnel_port,
+            Some(23004),
+            "a barn whose port does not arrive is a barn nothing can ProxyJump to"
+        );
         assert_eq!(arrived.last_seen, None, "we have never reached it, so we never saw it");
+    }
+
+    /// The asymmetric case, and the one a first join actually produces: the house
+    /// assigned the port, the joiner wrote it down, and the house's own copy of
+    /// that barn record does not have it yet.
+    ///
+    /// A plain `Fields::pick` would report a conflict and hand it to the house —
+    /// whose value is `None` — wiping the assignment off the only machine that
+    /// had it. `None` is not an answer anybody chose; it is "not assigned yet".
+    /// So an assignment beats the absence of one, in whichever direction it
+    /// sits, and no conflict is raised. Both halves in one test: a rule that only
+    /// works in the direction the fixture happens to use is not the rule.
+    #[test]
+    fn an_assigned_tunnel_port_beats_a_side_that_has_none() {
+        for house in [Side::Local, Side::Remote] {
+            let mut ours = barn("pi");
+            ours.tunnel_port = Some(23007);
+            let theirs = barn("pi"); // no port
+
+            let plan =
+                plan_kind(&[ours.clone()], &[theirs.clone()], no_base, &[], &[], house).unwrap();
+            assert!(
+                plan.conflicts.is_empty(),
+                "an absent port is not a competing answer: {:#?}",
+                plan.conflicts
+            );
+            let sent: Barn = only_outgoing(&plan);
+            assert_eq!(
+                sent.tunnel_port,
+                Some(23007),
+                "the peer has to learn the port or it cannot route to the barn (house {:?})",
+                house
+            );
+
+            // And the same fact arriving from the other side.
+            let plan = plan_kind(&[theirs], &[ours], no_base, &[], &[], house).unwrap();
+            assert!(plan.conflicts.is_empty(), "{:#?}", plan.conflicts);
+            let arrived: Barn = only_incoming(&plan);
+            assert_eq!(arrived.tunnel_port, Some(23007), "house {:?}", house);
+        }
+    }
+
+    /// Two *different* ports is a real disagreement — one tunnel would silently
+    /// shadow the other — so it goes down the normal conflict path and the house
+    /// settles it, exactly like two hosts for one barn name.
+    #[test]
+    fn two_different_tunnel_ports_are_a_conflict_the_house_settles() {
+        let mut ours = barn("pi");
+        ours.tunnel_port = Some(23000);
+        let mut theirs = barn("pi");
+        theirs.tunnel_port = Some(23009);
+
+        let plan =
+            plan_kind(&[ours.clone()], &[theirs.clone()], no_base, &[], &[], Side::Remote).unwrap();
+
+        assert!(
+            plan.conflicts.iter().any(|c| c.field == "tunnel_port"),
+            "a port the two sides disagree about must be reported, not quietly picked: {:#?}",
+            plan.conflicts
+        );
+        let arrived: Barn = only_incoming(&plan);
+        assert_eq!(
+            arrived.tunnel_port,
+            Some(23009),
+            "the house owns the assignment, so the house's number is the one that stands"
+        );
     }
 
     /// Addresses union rather than pick, and the order is the house's first.

@@ -79,9 +79,39 @@ pub enum Message {
     /// See [`super::assign_name`] for the policy it answers with.
     ClaimName { proposed: String, brand: String },
     /// The house's answer to [`Message::ClaimName`]: the name the joining
-    /// machine is to adopt itself under. A refusal is an [`Message::Error`]
-    /// carrying what is taken and what to do instead, not a name.
-    NameAssigned { name: String },
+    /// machine is to adopt itself under, and the port its reverse tunnel is to
+    /// bind on the house. A refusal is an [`Message::Error`] carrying what is
+    /// taken and what to do instead, not a name.
+    ///
+    /// # Why the port rides on this frame
+    ///
+    /// It is the same act of enrollment as the name, decided from the same
+    /// roster by the same authority, and a joiner that had to ask twice could be
+    /// answered by a house whose roster changed in between. See
+    /// [`super::assign_tunnel_port`] for why the *house* has to be the one
+    /// choosing: the port is bound on the house's loopback, so two machines
+    /// picking independently collide.
+    ///
+    /// # `Option`, and `#[serde(default)]`, on purpose
+    ///
+    /// Not a version bump, and it must not become one. `#[serde(default)]` is
+    /// what keeps this compatible in **both** directions across the skew a
+    /// `brew upgrade` on one machine produces: a frame from an older house
+    /// carries no `tunnel_port` key and still decodes here, and a newer house's
+    /// frame decodes on an older joiner because serde ignores keys it does not
+    /// know. Drop the attribute and a missing field becomes corruption — see
+    /// `a_corrupt_line_is_an_error_not_a_panic` — which is exactly the flag day
+    /// [`super::MIN_COMPATIBLE_PROTOCOL`] exists to avoid.
+    ///
+    /// `None` therefore means "this house assigned no port": an older build, or
+    /// a ranch whose range is full. The joiner records nothing and is reachable
+    /// only at its direct addresses, which is the behaviour every build had
+    /// before this field existed.
+    NameAssigned {
+        name: String,
+        #[serde(default)]
+        tunnel_port: Option<u16>,
+    },
     Manifest { entries: Vec<ManifestEntry>, tombstones: Vec<WireTombstone> },
     /// `"kind/id"`, or `"kind/name"` for an entity with no uuid yet.
     Want { keys: Vec<String> },
@@ -219,7 +249,10 @@ mod tests {
                 // what `assign_name` compares on.
                 brand: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBq macbook".into(),
             },
-            Message::NameAssigned { name: "macbook".into() },
+            Message::NameAssigned { name: "macbook".into(), tunnel_port: Some(23000) },
+            // And the shape an older house sends, which has to survive the trip
+            // unchanged rather than becoming `Some(0)`.
+            Message::NameAssigned { name: "macbook".into(), tunnel_port: None },
             Message::Want { keys: vec!["project/abc".into()] },
             Message::Entity {
                 kind: "project".into(),
@@ -306,7 +339,7 @@ mod tests {
         let msgs = vec![
             Message::Hello { protocol: 1, barn: "imac".into(), is_ranch_house: false },
             Message::ClaimName { proposed: "macbook".into(), brand: "ssh-ed25519 AAAA x".into() },
-            Message::NameAssigned { name: "macbook".into() },
+            Message::NameAssigned { name: "macbook".into(), tunnel_port: Some(23000) },
             Message::Manifest { entries: vec![], tombstones: vec![] },
             Message::Want { keys: vec![] },
             Message::Entity { kind: "project".into(), name: "api".into(), yaml: String::new() },
@@ -399,6 +432,30 @@ mod tests {
         assert!(
             encode(&Message::Unknown).is_err(),
             "encoding `Unknown` would invent a message type; it must be refused"
+        );
+    }
+
+    /// `NameAssigned` grew a field in Slice E, and the whole point of it being
+    /// `#[serde(default)]` is that this stays true: a frame from a house on an
+    /// older build has no `tunnel_port` key at all, and it has to decode as "no
+    /// port assigned" rather than as the corruption a missing required field is.
+    /// Without this the field would be a breaking protocol change and
+    /// `PROTOCOL_VERSION` would have to be bumped — the flag day
+    /// `MIN_COMPATIBLE_PROTOCOL` exists to avoid.
+    #[test]
+    fn a_name_assigned_from_a_house_that_knows_no_tunnel_ports_still_decodes() {
+        assert_eq!(
+            decode(r#"{"msg":"name_assigned","name":"macbook"}"#).unwrap(),
+            Message::NameAssigned { name: "macbook".into(), tunnel_port: None },
+            "an older house's answer must still name the machine"
+        );
+        // And the other direction: an older joiner parses a newer house's frame
+        // because serde drops keys it does not know. Asserted through the field
+        // being absent from the struct's older shape is impossible here, so the
+        // proxy is that the extra key is what it is and nothing else moved.
+        assert_eq!(
+            decode(r#"{"msg":"name_assigned","name":"macbook","tunnel_port":23007}"#).unwrap(),
+            Message::NameAssigned { name: "macbook".into(), tunnel_port: Some(23007) }
         );
     }
 

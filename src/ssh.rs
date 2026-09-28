@@ -9,6 +9,19 @@ use crate::types::Barn;
 const CONNECT_TIMEOUT_SECS: u32 = 10;
 const CONTROL_PERSIST: &str = "10m";
 
+/// How often ssh asks the far end whether it is still there, and how many
+/// unanswered asks end the connection.
+///
+/// Hoisted out of [`ssh_args`]'s literal list so [`tunnel_args`] uses the same
+/// numbers rather than a second opinion about them. Without keepalives a
+/// connection whose network went away does not fail, it *hangs* — the local end
+/// has nothing to notice, so it sits with the channel open forever. For a probe
+/// that is a stuck TUI; for the reverse tunnel it is worse, because a hung
+/// tunnel is indistinguishable from a working one and nothing ever reconnects
+/// it. 15 × 3 is 45 seconds to a verdict.
+pub const SERVER_ALIVE_INTERVAL_SECS: u32 = 15;
+pub const SERVER_ALIVE_COUNT_MAX: u32 = 3;
+
 /// Per-call SSH behavior. Defaults are the safe interactive case.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Opts {
@@ -66,6 +79,14 @@ fn control_path() -> PathBuf {
 ///
 /// Blank entries are skipped: `""` would build `cam@` and ssh would then read
 /// the next argv element as the destination.
+///
+/// `None` is not the end of the line, and neither is `Some` a decision.
+/// [`route`] asks this question *second*: a barn with a `tunnel_port` goes
+/// through the Ranch House whatever this answers, and this is consulted for the
+/// barns that have no tunnel. So this function still answers exactly one
+/// question, "what direct address does the barn have", and the priority between
+/// that and the switchboard is decided one level up where the whole of it is
+/// visible.
 pub fn dial_host(barn: &Barn) -> Option<&str> {
     if let Some(host) = barn.host.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
         return Some(host);
@@ -73,15 +94,173 @@ pub fn dial_host(barn: &Barn) -> Option<&str> {
     barn.addresses.iter().map(|a| a.trim()).find(|a| !a.is_empty())
 }
 
+/// How this machine reaches a barn.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Route {
+    /// Straight at an address the barn has: [`dial_host`]'s answer, on the
+    /// barn's own ssh port.
+    Direct { host: String, port: u16 },
+    /// ProxyJump through the Ranch House, to the port the barn's reverse tunnel
+    /// binds there. `jump` is `[user@]host[:port]` for the house, ready for
+    /// `-J`.
+    ViaHouse { jump: String, port: u16 },
+}
+
+/// How to reach `barn`, given the Ranch House if the ranch has one.
+///
+/// Pure, and the single place the decision is made — [`ssh_args`] is the only
+/// caller, so the same answer governs the host-key policy, the `ConnectTimeout`,
+/// the `ControlMaster` and the identity file rather than each of them being
+/// decided again at a call site.
+///
+/// # The house wins
+///
+/// **A barn with a `tunnel_port`, on a ranch whose house has an address, routes
+/// through the house.** Direct is for the barns with no tunnel: a plain remote
+/// host somebody typed a hostname for, a k8s-discovered node.
+///
+/// This is the reverse of how the fallback was first written, and the reversal is
+/// the point of the design rather than a tuning choice. What a barn advertises
+/// about itself is `<hostname>.local` ([`crate::migrate::advertise_this_machine`]),
+/// and that is mDNS: it resolves on the LAN and nowhere else. Preferring it meant
+/// that from anywhere but the LAN, every connect spent the whole of
+/// `ConnectTimeout` on a name that was never going to resolve and then gave up —
+/// while the house, reachable the entire time, was never tried. Worse, it is the
+/// *silent* failure of the two: a barn that is genuinely off looks exactly the
+/// same.
+///
+/// The house is not a fallback, it is the switchboard. Every barn dials out to it
+/// and it forwards back down those tunnels, so "reachable" is a property of the
+/// house being up rather than of where the user's laptop happens to be sitting —
+/// which is the only way a ranch spread across a LAN, a NAT and a datacenter has
+/// one answer to "how do I reach that machine".
+///
+/// The cost is that a LAN barn is reached over two hops when one would have done.
+/// That is paid deliberately: the alternative is the connect that works at the
+/// desk and fails on the road, and a routing rule that depends on which network
+/// the user is on is a rule that cannot be tested.
+///
+/// # The house route, and why it exposes nothing
+///
+/// The barn holds `ssh -N -R <tunnel_port>:localhost:22 <house>`. Read from the
+/// house's side, that binds `<tunnel_port>` on the **house's loopback** and
+/// forwards anything that connects to it back down the barn's own outbound
+/// session to the barn's port 22. Two consequences matter:
+///
+/// - **Nothing is published.** Without `GatewayPorts yes` in the house's sshd
+///   config — and it is not wanted, not set, and not asked for here — `-R` binds
+///   `127.0.0.1` only. The port is unreachable from the house's LAN, let alone
+///   from the internet. "Reverse tunnel" reads alarming; this one is a loopback
+///   listener on one machine.
+/// - **So the only way in is from the house itself**, which is what the
+///   ProxyJump provides: `ssh -J <house> -p <tunnel_port> <user>@localhost`
+///   connects to the house first, and `localhost` is then resolved *on the
+///   house*. The destination user is the barn's, because the far end of the
+///   forward is the barn's sshd.
+///
+/// The jump hop authenticates from ssh-agent and `~/.ssh/config`: OpenSSH
+/// implements `-J` as a nested `ssh -W`, which does not inherit this argv's `-o`
+/// options or its `-i`. That is not a gap in practice — a machine cannot have a
+/// tunnel to the house without being able to ssh to the house, so the house's
+/// key is already in `known_hosts` and its credentials already work. The
+/// *barn's* host key, at `[localhost]:<tunnel_port>`, is governed by this argv's
+/// `StrictHostKeyChecking=accept-new` as usual, because that hop is this
+/// connection.
+///
+/// # What is never routed through the house
+///
+/// The house itself. It is the machine everyone can reach, so it has no tunnel,
+/// and jumping through it to get to it is a ProxyJump to the destination.
+/// Guarded twice — by its own `is_ranch_house`, and by name against the house
+/// passed in — because a copy of the record whose flag has not arrived yet would
+/// otherwise slip through the first check.
+///
+/// A barn with no tunnel, and a barn whose ranch has no house with an address of
+/// its own, both fall through to [`dial_host`]. A barn with neither a tunnel nor
+/// an address is refused, as it always was.
+pub fn route(barn: &Barn, house: Option<&Barn>) -> Option<Route> {
+    via_house(barn, house).or_else(|| {
+        dial_host(barn)
+            .map(|host| Route::Direct { host: host.to_string(), port: barn.port.unwrap_or(22) })
+    })
+}
+
+/// [`route`]'s first branch, split out only so the guards read as a list of
+/// reasons the switchboard does not apply rather than as early returns tangled
+/// with the direct case.
+fn via_house(barn: &Barn, house: Option<&Barn>) -> Option<Route> {
+    if barn.is_ranch_house == Some(true) {
+        return None;
+    }
+    let port = barn.tunnel_port?;
+    let house = house?;
+    if house.name == barn.name {
+        return None;
+    }
+
+    // A house with no address of its own is not a jump host. Returning `-J` with
+    // an empty spec would have ssh read the next argv element as the jump host.
+    let mut jump = match house.user.as_deref() {
+        Some(user) => format!("{}@{}", user, dial_host(house)?),
+        None => dial_host(house)?.to_string(),
+    };
+    if let Some(house_port) = house.port {
+        jump = format!("{}:{}", jump, house_port);
+    }
+    Some(Route::ViaHouse { jump, port })
+}
+
+/// The Ranch House, read off the roster — but only when it could matter.
+///
+/// The early return is not a micro-optimization. [`ssh_args`] is on the path of
+/// every probe, every connect and every trail step, and a directory walk per call
+/// is a real cost to pay for an answer that cannot change the route.
+///
+/// The guard is the *same condition* [`via_house`] opens with, and it has to be:
+/// a barn with no tunnel, or a barn that is itself the house, is dialled directly
+/// whatever the roster says, so reading the roster for it buys nothing. Now that
+/// the house wins, the guard is no longer "the barn has an address" — that is
+/// exactly the case the inversion exists to route through the house.
+fn house_for(barn: &Barn) -> Option<Barn> {
+    if barn.tunnel_port.is_none() || barn.is_ranch_house == Some(true) {
+        return None;
+    }
+    // `manifest::barns_from_disk`, not `config::load_barns()`: that injects a
+    // synthetic `local` and drops a real `barns/local.yaml`, and neither belongs
+    // in an answer to "which barn is the house".
+    crate::ranch::manifest::barns_from_disk()
+        .items
+        .into_iter()
+        .find(|b| b.is_ranch_house == Some(true))
+}
+
 /// Build the full argument vector for an `ssh` invocation against a barn.
 ///
 /// Single source of truth for host-key policy, timeouts, identity, and
 /// multiplexing. Returns the args only — the caller appends the remote command.
 pub fn ssh_args(barn: &Barn, opts: Opts) -> Result<Vec<String>> {
-    let host = dial_host(barn)
-        .ok_or_else(|| anyhow!("barn '{}' has no host configured", barn.name))?;
+    let house = house_for(barn);
+    let route = route(barn, house.as_ref()).ok_or_else(|| {
+        // Two ways to have no route, and they need different remedies. Saying
+        // "no host configured" about a barn that has a perfectly good tunnel port
+        // sends the user to edit a field that is not the problem.
+        let tunnel_needs_a_house = barn.is_ranch_house != Some(true) && house.is_none();
+        match barn.tunnel_port {
+            Some(port) if tunnel_needs_a_house => anyhow!(
+                "barn '{}' has no host configured, and the tunnel port {} the Ranch House gave it \
+                 needs a house to jump through — this ranch has none. Run `yeehaw ranch init` on \
+                 the machine every other one can reach",
+                barn.name,
+                port
+            ),
+            _ => anyhow!("barn '{}' has no host configured", barn.name),
+        }
+    })?;
+    let (host, port, jump) = match &route {
+        Route::Direct { host, port } => (host.as_str(), *port, None),
+        Route::ViaHouse { jump, port } => ("localhost", *port, Some(jump.as_str())),
+    };
     let user = barn.user.as_deref().unwrap_or("root");
-    let port = barn.port.unwrap_or(22);
 
     let mut args: Vec<String> = vec![
         "-o".into(), "StrictHostKeyChecking=accept-new".into(),
@@ -89,8 +268,8 @@ pub fn ssh_args(barn: &Barn, opts: Opts) -> Result<Vec<String>> {
         "-o".into(), "ControlMaster=auto".into(),
         "-o".into(), format!("ControlPath={}", control_path().display()),
         "-o".into(), format!("ControlPersist={}", CONTROL_PERSIST),
-        "-o".into(), "ServerAliveInterval=15".into(),
-        "-o".into(), "ServerAliveCountMax=3".into(),
+        "-o".into(), format!("ServerAliveInterval={}", SERVER_ALIVE_INTERVAL_SECS),
+        "-o".into(), format!("ServerAliveCountMax={}", SERVER_ALIVE_COUNT_MAX),
     ];
 
     if opts.batch {
@@ -99,6 +278,11 @@ pub fn ssh_args(barn: &Barn, opts: Opts) -> Result<Vec<String>> {
     }
     if opts.tty {
         args.push("-t".into());
+    }
+
+    if let Some(jump) = jump {
+        args.push("-J".into());
+        args.push(jump.to_string());
     }
 
     args.push("-p".into());
@@ -111,6 +295,80 @@ pub fn ssh_args(barn: &Barn, opts: Opts) -> Result<Vec<String>> {
 
     args.push(format!("{}@{}", user, host));
     Ok(args)
+}
+
+/// The argv for the reverse tunnel a barn holds open to the Ranch House:
+/// `ssh -N -R <port>:localhost:22 <house>`, with the options that make it fail
+/// rather than lie.
+///
+/// `None` when the house has no address of its own — there is nothing to dial,
+/// and an argv ending in an empty destination would have ssh read one of the
+/// `-o` values as the host.
+///
+/// This lives beside [`ssh_args`] rather than in [`crate::tunnel`] so that the
+/// host-key policy, the `ConnectTimeout` and the keepalives are decided in one
+/// file. It is deliberately *not* `ssh_args` with extra flags, and the reason is
+/// the multiplexing: for each option ssh keeps the first value it is given, so
+/// options cannot be overridden by appending, and a tunnel that shared
+/// `ssh_args`'s `ControlMaster` would be wrong in both directions at once — as a
+/// master it takes every probe down with it each time it reconnects, and as a
+/// client it dies whenever the master it borrowed goes away. The tunnel is a
+/// connection of its own for the life of the process, so it says so.
+///
+/// # The options, and the failure each one is for
+///
+/// - **`ExitOnForwardFailure=yes`** — the one that is not optional. Without it,
+///   ssh whose `-R` was refused (something else already holds the port on the
+///   house, most often a tunnel from an earlier run that has not been cleaned
+///   up) connects anyway and sits there with no forward. The supervisor sees a
+///   live child and reports a healthy tunnel; every peer that routes through it
+///   gets "connection refused" from the house's loopback. A tunnel that looks up
+///   and is not is worse than no tunnel, because nothing retries it.
+/// - **`ServerAliveInterval` / `ServerAliveCountMax`** — a connection whose
+///   network went away does not fail, it hangs: the local end has nothing to
+///   notice. Same numbers as every other connection ([`SERVER_ALIVE_INTERVAL_SECS`]).
+/// - **`BatchMode=yes`** — this runs on a background thread behind a
+///   full-screen TUI. A passphrase prompt there is a prompt nobody can see and
+///   nobody will answer, so it has to be a failure instead.
+/// - **`-N`** — no remote command, no shell, no pty. The connection exists for
+///   the forward and nothing else.
+///
+/// The forward is `<port>:localhost:22`: read on the house's side, that binds
+/// `<port>` on the **house's loopback** — without `GatewayPorts` in its sshd
+/// config, `-R` binds `127.0.0.1` only — and forwards back down this outbound
+/// session to this machine's own sshd. [`route`] is the other half; see its
+/// doc comment for why that publishes nothing.
+pub fn tunnel_args(house: &Barn, port: u16) -> Option<Vec<String>> {
+    let host = dial_host(house)?;
+
+    let mut args: Vec<String> = vec![
+        "-N".into(),
+        "-o".into(), "ExitOnForwardFailure=yes".into(),
+        "-o".into(), "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(), format!("ConnectTimeout={}", CONNECT_TIMEOUT_SECS),
+        "-o".into(), format!("ServerAliveInterval={}", SERVER_ALIVE_INTERVAL_SECS),
+        "-o".into(), format!("ServerAliveCountMax={}", SERVER_ALIVE_COUNT_MAX),
+        "-o".into(), "BatchMode=yes".into(),
+        // Not multiplexed, in either direction. See above.
+        "-o".into(), "ControlMaster=no".into(),
+        "-o".into(), "ControlPath=none".into(),
+        "-R".into(), format!("{}:localhost:22", port),
+        "-p".into(), house.port.unwrap_or(22).to_string(),
+    ];
+
+    if let Some(key) = house.identity_file.as_deref() {
+        args.push("-i".into());
+        args.push(key.to_string());
+    }
+
+    args.push(match house.user.as_deref() {
+        Some(user) => format!("{}@{}", user, host),
+        // No `user@`: ssh then uses `~/.ssh/config` or the local username,
+        // which is the right answer for a house nobody has configured a user
+        // for. `@host` would be a request to log in as nobody.
+        None => host.to_string(),
+    });
+    Some(args)
 }
 
 /// Ensure the ControlPath parent directory exists, or multiplexing silently
@@ -322,6 +580,11 @@ mod tests {
 
     #[test]
     fn rejects_a_barn_with_no_host() {
+        // The harness is needed as of Slice E and was not before: `ssh_args` now
+        // consults the roster for a Ranch House when there is no direct address,
+        // so this test reaches `yeehaw_dir()` where it used to fail earlier. An
+        // empty temp ranch has no house, which is exactly the case asserted.
+        let _ranch = crate::testing::temp_ranch();
         let mut b = barn(None);
         b.host = None;
         assert!(ssh_args(&b, Opts::default()).is_err());
@@ -388,6 +651,8 @@ mod tests {
     /// half-filled. The refusal has to survive the fallback.
     #[test]
     fn a_barn_with_neither_a_host_nor_an_address_is_still_refused() {
+        // See `rejects_a_barn_with_no_host` for why the harness is here now.
+        let _ranch = crate::testing::temp_ranch();
         let mut b = barn(None);
         b.host = None;
         assert!(b.addresses.is_empty(), "the fixture must advertise nothing");
@@ -403,6 +668,310 @@ mod tests {
         b.host = None;
         b.addresses = vec!["".into(), "  ".into(), "real.local".into()];
         assert_eq!(dial_host(&b), Some("real.local"));
+    }
+
+    // === the Ranch House route =============================================
+    //
+    // A barn with no direct address is not out of reach: it holds
+    // `ssh -N -R <tunnel_port>:localhost:22 <house>`, so `<tunnel_port>` is bound
+    // on the *house's* loopback and the barn can be reached by jumping to the
+    // house and then connecting to that port. These tests read the generated
+    // argv; nothing here opens a connection.
+
+    /// A Ranch House on the roster of whatever temp ranch is in scope.
+    fn a_house_on_the_roster(name: &str) -> Barn {
+        let mut house = Barn {
+            name: name.into(),
+            host: Some("camerons-imac.local".into()),
+            user: Some("cam".into()),
+            is_ranch_house: Some(true),
+            ..Default::default()
+        };
+        crate::config::save_barn(&mut house).expect("the roster takes a house");
+        house
+    }
+
+    /// A barn that advertises nothing and has a tunnel: the Pi behind NAT, or a
+    /// machine whose own record still says `host: null` and whose `.local` name
+    /// never resolved.
+    fn a_tunnelled_barn() -> Barn {
+        Barn {
+            name: "pi".into(),
+            host: None,
+            user: Some("cam".into()),
+            tunnel_port: Some(23007),
+            ..Default::default()
+        }
+    }
+
+    /// THE ROUTE. `ssh -J <house> -p <tunnel_port> <user>@localhost`: jump to the
+    /// house, then from the house connect to the port the barn's own reverse
+    /// tunnel bound on the house's loopback.
+    ///
+    /// `localhost` is the point, and it is why nothing here is exposed: `-R`
+    /// without `GatewayPorts` binds the loopback interface of the house only, so
+    /// the forwarded port is unreachable from anywhere except a process already
+    /// on the house — which, after the jump, is what we are.
+    #[test]
+    fn a_barn_with_no_address_but_a_tunnel_is_reached_through_the_house() {
+        let _ranch = crate::testing::temp_ranch();
+        a_house_on_the_roster("imac");
+
+        let args = ssh_args(&a_tunnelled_barn(), Opts::default())
+            .expect("a tunnelled barn is reachable through the house");
+
+        let j = args.iter().position(|a| a == "-J").expect("-J present");
+        assert_eq!(args[j + 1], "cam@camerons-imac.local", "{:?}", args);
+        let p = args.iter().position(|a| a == "-p").expect("-p present");
+        assert_eq!(args[p + 1], "23007", "the tunnel port, not the barn's ssh port: {:?}", args);
+        assert!(
+            args.contains(&"cam@localhost".to_string()),
+            "the far end of the forward is the house's own loopback: {:?}",
+            args
+        );
+    }
+
+    /// The jump spec carries the house's user and port, because a house on a
+    /// non-default ssh port is a house ProxyJump cannot reach without them.
+    #[test]
+    fn the_jump_spec_carries_the_houses_own_user_and_port() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut house = a_house_on_the_roster("imac");
+        house.port = Some(2022);
+        crate::config::save_barn(&mut house).unwrap();
+
+        let args = ssh_args(&a_tunnelled_barn(), Opts::default()).unwrap();
+        let j = args.iter().position(|a| a == "-J").unwrap();
+        assert_eq!(args[j + 1], "cam@camerons-imac.local:2022", "{:?}", args);
+    }
+
+    /// **THE HOUSE WINS.** THE BUG this pass inverts. A barn advertises
+    /// `<hostname>.local`, which is mDNS: it resolves on the LAN and nowhere
+    /// else. Preferring it meant that off-LAN every connect spent the full
+    /// `ConnectTimeout` failing to resolve a name that was never going to
+    /// resolve, and then gave up — the house, which was reachable the whole
+    /// time, was never tried. A barn with a tunnel routes through the house
+    /// whether or not it also advertises an address.
+    #[test]
+    fn a_tunnel_and_a_house_beat_a_direct_address() {
+        let _ranch = crate::testing::temp_ranch();
+        a_house_on_the_roster("imac");
+
+        let mut b = a_tunnelled_barn();
+        b.addresses = vec!["pi.local".into()];
+
+        let args = ssh_args(&b, Opts::default()).unwrap();
+        let j = args.iter().position(|a| a == "-J").expect("-J present");
+        assert_eq!(args[j + 1], "cam@camerons-imac.local", "{:?}", args);
+        assert!(
+            !args.iter().any(|a| a.contains("pi.local")),
+            "the mDNS name is not dialled when the switchboard is available: {:?}",
+            args
+        );
+        let p = args.iter().position(|a| a == "-p").unwrap();
+        assert_eq!(args[p + 1], "23007", "the tunnel port, not the barn's ssh port: {:?}", args);
+    }
+
+    /// Direct is for a barn with **no tunnel** — a plain remote host that was
+    /// never enrolled, or a k8s node. It keeps its own address and its own ssh
+    /// port, and the roster is not even read for it.
+    #[test]
+    fn a_barn_with_no_tunnel_is_dialled_directly() {
+        let _ranch = crate::testing::temp_ranch();
+        a_house_on_the_roster("imac");
+
+        let mut b = a_tunnelled_barn();
+        b.tunnel_port = None;
+        b.addresses = vec!["pi.local".into()];
+        b.port = Some(2222);
+
+        let args = ssh_args(&b, Opts::default()).unwrap();
+        assert!(!args.contains(&"-J".to_string()), "no jump for a barn with no tunnel: {:?}", args);
+        assert!(args.contains(&"cam@pi.local".to_string()), "{:?}", args);
+        let p = args.iter().position(|a| a == "-p").unwrap();
+        assert_eq!(args[p + 1], "2222", "the barn's own ssh port: {:?}", args);
+    }
+
+    /// And the same, one layer down, without touching the disk: `route` is where
+    /// the decision lives, so the precedence is pinned on the function that makes
+    /// it rather than only through the store. A configured `host` does not beat
+    /// the switchboard either — it is as likely to be the `.local` name the join
+    /// wrote as anything else.
+    #[test]
+    fn route_prefers_the_house_even_when_the_barn_has_a_direct_address() {
+        let house = Barn {
+            name: "imac".into(),
+            host: Some("imac.local".into()),
+            is_ranch_house: Some(true),
+            ..Default::default()
+        };
+        let mut b = a_tunnelled_barn();
+        b.host = Some("pi.lan".into());
+        b.port = Some(2222);
+
+        assert_eq!(
+            route(&b, Some(&house)),
+            Some(Route::ViaHouse { jump: "imac.local".into(), port: 23007 })
+        );
+    }
+
+    /// The house itself is always dialled directly, address and all — it is the
+    /// machine everyone can reach, which is the whole reason it is the house.
+    #[test]
+    fn the_house_is_always_dialled_directly() {
+        let house = Barn {
+            name: "imac".into(),
+            host: Some("imac.local".into()),
+            user: Some("cam".into()),
+            is_ranch_house: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            route(&house, Some(&house.clone())),
+            Some(Route::Direct { host: "imac.local".into(), port: 22 })
+        );
+    }
+
+    /// A house with no address of its own is not a jump host, and the barn is
+    /// then dialled at whatever it does advertise rather than refused. The
+    /// fall-through is the point: inverting the priority must not turn a
+    /// half-configured house into a ranch nobody can reach.
+    #[test]
+    fn a_barn_falls_back_to_its_own_address_when_the_house_has_none() {
+        let house = Barn {
+            name: "imac".into(),
+            host: None,
+            is_ranch_house: Some(true),
+            ..Default::default()
+        };
+        let mut b = a_tunnelled_barn();
+        b.addresses = vec!["pi.local".into()];
+
+        assert_eq!(
+            route(&b, Some(&house)),
+            Some(Route::Direct { host: "pi.local".into(), port: 22 })
+        );
+    }
+
+    /// A ranch with no house has nothing to jump through, so a tunnel port is not
+    /// a route. Refused rather than silently dialled at `localhost`, which would
+    /// be an ssh to *this* machine.
+    #[test]
+    fn a_tunnel_port_with_no_house_on_the_ranch_is_not_a_route() {
+        assert_eq!(route(&a_tunnelled_barn(), None), None);
+
+        let _ranch = crate::testing::temp_ranch();
+        let err = ssh_args(&a_tunnelled_barn(), Opts::default())
+            .expect_err("nothing to jump through");
+        let why = err.to_string();
+        assert!(why.contains("pi"), "the error must name the barn: {}", why);
+        // "no host configured" alone sends the user to edit a field that is not
+        // the problem: this barn's port is fine, the ranch has no house.
+        assert!(why.contains("23007"), "the error must name the port it cannot use: {}", why);
+        assert!(why.contains("ranch init"), "and what to do about it: {}", why);
+    }
+
+    /// The Ranch House is the thing everyone can reach, so it is never reached
+    /// *through itself* — that would be a ProxyJump to the destination.
+    #[test]
+    fn the_house_is_never_routed_through_itself() {
+        let mut house = Barn {
+            name: "imac".into(),
+            host: None,
+            user: Some("cam".into()),
+            is_ranch_house: Some(true),
+            // Nonsense on the house, and the guard must not depend on it being
+            // absent: a record that has one from an earlier build still must not
+            // produce `-J imac ... imac`.
+            tunnel_port: Some(23000),
+            ..Default::default()
+        };
+        assert_eq!(route(&house, Some(&house.clone())), None);
+
+        // And by name, for a copy whose `is_ranch_house` never arrived.
+        house.is_ranch_house = None;
+        let flagged = Barn { is_ranch_house: Some(true), ..house.clone() };
+        assert_eq!(route(&house, Some(&flagged)), None);
+    }
+
+    /// A house whose own record has no address is a house nothing can jump
+    /// through. No `-J` with an empty spec, which ssh would read as the next argv
+    /// element being the jump host.
+    #[test]
+    fn a_house_with_no_address_of_its_own_is_not_a_jump_host() {
+        let house = Barn {
+            name: "imac".into(),
+            host: None,
+            is_ranch_house: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(route(&a_tunnelled_barn(), Some(&house)), None);
+    }
+
+    /// A barn with neither an address nor a tunnel port is still refused — the
+    /// k8s-discovered node and the half-filled record from `dial_host`'s own
+    /// tests. The fallback must not invent a route for it.
+    #[test]
+    fn a_barn_with_neither_an_address_nor_a_tunnel_port_is_still_refused() {
+        let house = Barn {
+            name: "imac".into(),
+            host: Some("imac.local".into()),
+            is_ranch_house: Some(true),
+            ..Default::default()
+        };
+        let mut b = a_tunnelled_barn();
+        b.tunnel_port = None;
+        assert_eq!(route(&b, Some(&house)), None);
+    }
+
+    /// The host-key policy and the timeout still apply, because the ProxyJump is
+    /// an option on the same connection rather than a different code path. This is
+    /// the reason the fallback lives in `ssh_args` and not at the call sites.
+    #[test]
+    fn the_house_route_keeps_every_option_the_direct_one_has() {
+        let _ranch = crate::testing::temp_ranch();
+        a_house_on_the_roster("imac");
+
+        let args = ssh_args(&a_tunnelled_barn(), Opts { batch: true, tty: true, ..Opts::default() })
+            .unwrap();
+        for expected in [
+            "StrictHostKeyChecking=accept-new",
+            "ControlMaster=auto",
+            "BatchMode=yes",
+            "ServerAliveInterval=15",
+        ] {
+            assert!(args.contains(&expected.to_string()), "{} missing from {:?}", expected, args);
+        }
+        assert!(args.iter().any(|a| a.starts_with("ConnectTimeout=")), "{:?}", args);
+        assert!(args.contains(&"-t".to_string()), "{:?}", args);
+    }
+
+    /// Two tunnelled barns must not share a multiplexed connection. They do not,
+    /// and the reason is worth pinning: `ControlPath` is `%r@%h:%p`, and while
+    /// `%h` is `localhost` for both, `%p` is the barn's own tunnel port — so the
+    /// paths differ. If the port ever stopped being in the control path, `c` into
+    /// one barn would reuse the master for another.
+    #[test]
+    fn two_tunnelled_barns_do_not_share_a_control_path() {
+        let _ranch = crate::testing::temp_ranch();
+        a_house_on_the_roster("imac");
+
+        let one = ssh_args(&a_tunnelled_barn(), Opts::default()).unwrap();
+        let mut other = a_tunnelled_barn();
+        other.name = "ascend".into();
+        other.tunnel_port = Some(23008);
+        let two = ssh_args(&other, Opts::default()).unwrap();
+
+        let port_of = |args: &[String]| {
+            let p = args.iter().position(|a| a == "-p").unwrap();
+            args[p + 1].clone()
+        };
+        assert_ne!(port_of(&one), port_of(&two));
+        assert!(
+            one.iter().any(|a| a.starts_with("ControlPath=")),
+            "the control path has to be there for %p to disambiguate it: {:?}",
+            one
+        );
     }
 
     #[test]
@@ -661,3 +1230,4 @@ mod tests {
         );
     }
 }
+

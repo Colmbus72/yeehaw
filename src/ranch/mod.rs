@@ -229,12 +229,17 @@ fn send<W: std::io::Write>(out: &mut W, msg: &wire::Message) -> anyhow::Result<(
 /// - **An incompatible `Hello`** — refuse and stop. We greeted before reading,
 ///   so the refusal cannot come first; it has to be a message rather than a
 ///   silent close, or the client cannot tell "incompatible" from "ssh died".
-/// - **A `ClaimName`** — answer with the name [`assign_name`] gives it, or with
-///   the refusal that function returns, and keep reading either way. Only the
-///   house answers at all: the roster is the namespace, and a machine holding a
-///   stale copy of it cannot promise a name is free. Nothing is written here —
-///   the joining machine is the one that adopts, and the house learns the new
-///   barn from the push later in the same session. Its *brand* still arrives a
+/// - **A `ClaimName`** — answer with the name [`assign_name`] gives it and the
+///   tunnel port [`assign_tunnel_port`] gives it, or with the refusal
+///   `assign_name` returns, and keep reading either way. Only the house answers
+///   at all: the roster is the namespace *and* the port namespace, and a machine
+///   holding a stale copy of it cannot promise either is free. A port that cannot
+///   be assigned is not a refusal — the enrollment still happens, the machine is
+///   just reachable only at its direct addresses, which is what every build did
+///   before the field existed. Nothing is written here —
+///   the joining machine is the one that adopts and the one that records the port
+///   it was given, and the house learns the new barn from the push later in the
+///   same session. Its *brand* still arrives a
 ///   sync late: `join_with` records that on the joiner's own barn record after
 ///   the plan has been built, so the copy that crosses the wire here predates
 ///   it. Harmless in the direction that matters — a joiner reaches the house
@@ -358,7 +363,34 @@ fn serve_session<R: std::io::BufRead, W: std::io::Write>(
                 // `barns/local.yaml`.
                 let roster = manifest::barns_from_disk().items;
                 match assign_name(&proposed, &brand, &roster) {
-                    Ok(name) => send(&mut out, &wire::Message::NameAssigned { name })?,
+                    // The port comes off the same roster read, in the same
+                    // frame: see [`assign_tunnel_port`] for why the house is the
+                    // only party that can choose it, and
+                    // [`wire::Message::NameAssigned`] for why it rides here
+                    // rather than in a second exchange.
+                    //
+                    // A refused *port* does not refuse the join. `None` on the
+                    // wire is what every build sent before the field existed, and
+                    // it degrades to exactly that build's behaviour: the machine
+                    // enrolls and is reachable at its direct addresses. The
+                    // reason is said on stderr — the house is unattended, so
+                    // there is nobody here to read it, but it is in the joiner's
+                    // captured stderr and the alternative is refusing an
+                    // otherwise perfectly good enrollment over a full port range.
+                    Ok(name) => {
+                        let tunnel_port = match assign_tunnel_port(&brand, &roster) {
+                            Ok(port) => Some(port),
+                            Err(why) => {
+                                eprintln!(
+                                    "'{}' was enrolled without a tunnel port, so it is reachable \
+                                     only at its direct addresses: {}",
+                                    name, why
+                                );
+                                None
+                            }
+                        };
+                        send(&mut out, &wire::Message::NameAssigned { name, tunnel_port })?
+                    }
                     // Answered and then *kept reading*, like any other refusal
                     // the stream survives: nothing has been written on either
                     // side, the frame boundary is intact, and giving up is the
@@ -625,6 +657,132 @@ pub fn assign_name(
         )),
         None => Ok(proposed.to_string()),
     }
+}
+
+/// The ports the Ranch House hands out for barns' reverse tunnels: 256 of them,
+/// starting at 23000.
+///
+/// Every bound is a constraint, not a preference:
+///
+/// - **Above 1024.** The port is bound by `ssh -N -R <port>:localhost:22 <house>`
+///   *as the barn's own user on the house*, and a privileged port would need
+///   root there. Nothing about this feature should want root on the house.
+/// - **Below 30000.** Two floors sit above that and a listener must be under
+///   both. Linux's `net.ipv4.ip_local_port_range` starts at 32768 and macOS hands
+///   out ephemeral ports from 49152: a `-R` bind inside either range can lose a
+///   race to an outbound connection that already took the number, and the tunnel
+///   then fails to bind for reasons nothing in the UI could explain. 30000 also
+///   keeps clear of Kubernetes' default NodePort range (30000–32767), which
+///   matters here because `ranchhand_k8s` discovers cluster nodes *as barns*.
+/// - **Not 2222 or 22222.** Those are the two ports a barn's own sshd is most
+///   likely to already be on — the existing `ssh` fixtures use 2222 — and the
+///   confusion of "the tunnel port is the ssh port, but a different ssh port" is
+///   worth a few hundred numbers to avoid.
+/// - **Nothing a normal service wants.** 23000 is not in the dev-tool band that
+///   collides constantly (3000, 3306, 5000, 5432, 6379, 8000, 8080, 8443, 9000)
+///   nor at a memorable service number; the band above it to 23255 is quiet.
+///   23000 is *not* related to telnet's port 23 — the resemblance is a
+///   coincidence worth naming so nobody reads meaning into it.
+/// - **256 wide.** One port per machine on the ranch, and the offset from 23000
+///   is effectively a machine's index. A ranch that outgrows this has other
+///   problems; `assign_tunnel_port` refuses in words rather than wrapping.
+///
+/// Pinned by `the_tunnel_port_range_stays_clear_of_privileged_and_ephemeral_ports`.
+pub const TUNNEL_PORT_RANGE: std::ops::RangeInclusive<u16> = 23000..=23255;
+
+/// The port the Ranch House binds for the machine branded `brand`, given the
+/// house's roster — or the words for the refusal.
+///
+/// [`assign_name`]'s sibling, and built the same way for the same reasons: a pure
+/// function over the roster, so the whole policy is in one place and can be
+/// tested without a peer, called from [`serve_session`] where the house is
+/// answering a claim.
+///
+/// # What the port is, and why the house is the one that picks it
+///
+/// The barn holds `ssh -N -R <port>:localhost:22 <house>`, which binds `<port>`
+/// on the **house's** loopback. So it is one number per barn for the entire
+/// ranch, not a per-machine choice — which is why `canonical::SHAPES` moved it to
+/// content, and why a joiner must not choose its own. Two machines picking
+/// independently — each looking at what is free on *itself* — would collide the
+/// first time both were right, and the loser's `-R` either fails to bind or, if
+/// the winner's tunnel has since died, succeeds and quietly steals every peer
+/// that routes by that number.
+///
+/// The house owns the roster, so the house is the only party that can see all
+/// the assignments at once. Same argument as the naming authority, one field over.
+///
+/// # The policy, in the order the branches have to be taken
+///
+/// 1. **A barn already carries this brand *and* a port** → that port. First, and
+///    for the same reason [`assign_name`]'s brand branch is first: this is what
+///    makes a re-join idempotent. Every peer on the ranch routes to this machine
+///    by the number the house handed out and holds it as content; changing it on
+///    a reconnect would invalidate all of them at once, and `yeehaw ranch join`
+///    gets re-run for all sorts of innocuous reasons.
+/// 2. **Otherwise the lowest port in [`TUNNEL_PORT_RANGE`] no barn holds.**
+///    Lowest-free rather than highest-plus-one so that a machine removed from the
+///    ranch gives its number back and a long-lived ranch does not creep out of
+///    the range. The cost is that a reused number can produce a host-key mismatch
+///    for a peer holding a stale `[localhost]:<port>` entry in `known_hosts` —
+///    which is a loud refusal, not a silent misroute, and is the right way round.
+/// 3. **Range full** → refused, naming the range.
+///
+/// Keyed on the brand, not on the name: the brand is what survives a rename and
+/// what distinguishes two machines both called `pi`, exactly as in
+/// [`assign_name`]. The case that key does *not* cover is `assign_name`'s claim
+/// branch, where a joiner takes over an existing *unbranded* record — and it does
+/// not need covering, because a barn with no usable brand has never run yeehaw
+/// and so has never been assigned a port to keep.
+///
+/// # What this does not write
+///
+/// Nothing, exactly like [`assign_name`]. The house answers with the number and
+/// the *joiner* records it on its own barn record, which then reaches the house
+/// on the push later in the same session (see [`join_with`]). So a joiner that
+/// declines the plan leaves the house with no record of the assignment and the
+/// next joiner may be handed the same number — the identical gap the name has,
+/// for the identical reason, and the same remedy: run the join again. Closing it
+/// means the house writing a barn record for a machine that has not finished
+/// joining, which is the thing `serve_session`'s `ClaimName` branch deliberately
+/// does not do.
+///
+/// Returns the words for a [`wire::Message::Error`] rather than an
+/// `anyhow::Error`: the caller is answering a peer blocked on a reply.
+pub fn assign_tunnel_port(brand: &str, barns: &[Barn]) -> std::result::Result<u16, String> {
+    // No brand, no identity, and therefore nothing for branch 1 to be stable
+    // across. Handing out a port to an unbranded claim would give the machine a
+    // different number on every reconnect and invalidate what every peer holds —
+    // the same reasoning, and the same refusal, as `assign_name`.
+    let Some(claimed) = brand_key(brand) else {
+        return Err(
+            "the joining machine sent no usable brand, and a brand is how this ranch tells one \
+             machine from another — so there is nothing to give a stable tunnel port to. Run \
+             `yeehaw ranch join` again on a build that brands itself"
+                .to_string(),
+        );
+    };
+
+    if let Some(port) = barns
+        .iter()
+        .find(|b| b.brand.as_deref().and_then(brand_key).is_some_and(|k| k == claimed))
+        .and_then(|b| b.tunnel_port)
+    {
+        return Ok(port);
+    }
+
+    TUNNEL_PORT_RANGE
+        .clone()
+        .find(|port| !barns.iter().any(|b| b.tunnel_port == Some(*port)))
+        .ok_or_else(|| {
+            format!(
+                "every tunnel port from {} to {} is already assigned to a barn on this ranch, so \
+                 there is none left for a new machine. Delete a barn that is gone, or clear its \
+                 `tunnel_port`, and join again",
+                TUNNEL_PORT_RANGE.start(),
+                TUNNEL_PORT_RANGE.end()
+            )
+        })
 }
 
 /// Whether `barn` carries no brand this ranch could ever recognize.
@@ -1161,8 +1319,12 @@ pub fn join_with(target: &str, name: Option<String>, io: JoinIo) -> Result<JoinO
         proposed: proposed.clone(),
         brand: our_brand.clone(),
     })?;
-    let our_name = match peer.recv()? {
-        Some(wire::Message::NameAssigned { name }) => name,
+    // The name **and** the port the house assigned: one answer to one claim. See
+    // [`assign_tunnel_port`] for why this machine is not allowed to choose the
+    // port itself, and [`wire::Message::NameAssigned`] for why `None` is a
+    // legitimate answer rather than a failure.
+    let (our_name, our_tunnel_port) = match peer.recv()? {
+        Some(wire::Message::NameAssigned { name, tunnel_port }) => (name, tunnel_port),
         // The refusal is the house's own words — a name already taken, and which
         // machine has it. Nothing local has been written yet, which is the whole
         // reason the claim comes before the adoption.
@@ -1214,6 +1376,26 @@ pub fn join_with(target: &str, name: Option<String>, io: JoinIo) -> Result<JoinO
              reached at, so the house may not be able to dial back: {:#}",
             e
         ));
+    }
+
+    // The port the house just assigned, written down here for the same reason
+    // the advertisement above is: `client::load_local` on the next line is what
+    // the push is computed from, so a record written after it carries the
+    // assignment nowhere. The house would then hold no evidence of the number it
+    // handed out and could hand the same one to the next machine.
+    //
+    // A failure is a warning, not a refusal. The enrollment itself succeeded —
+    // the name is claimed and the adoption is done — and the only thing lost is
+    // the off-LAN route, which is recovered by running the join again.
+    if let Some(port) = our_tunnel_port {
+        if let Err(e) = record_our_tunnel_port(&our_name, port) {
+            warnings.push(format!(
+                "the Ranch House assigned this machine tunnel port {} but it could not be \
+                 recorded, so peers will not be able to route to this machine through the \
+                 house: {:#}",
+                port, e
+            ));
+        }
     }
 
     let ours = client::load_local()?;
@@ -1457,6 +1639,42 @@ pub fn join_with(target: &str, name: Option<String>, io: JoinIo) -> Result<JoinO
     }
 
     Ok(outcome)
+}
+
+/// Records, on this machine's own barn record, the tunnel port the Ranch House
+/// assigned it.
+///
+/// # Why the joiner writes what the house decided
+///
+/// The house does not write it. `serve_session`'s `ClaimName` branch writes
+/// nothing at all — on a first join the house has no record of this machine to
+/// write *to*, and inventing one for a machine that has not finished joining is
+/// the thing that branch deliberately avoids. So the number crosses the wire and
+/// the machine it belongs to is the one that persists it, exactly as the *name*
+/// is: `assign_name` decides it on the house and `adopt_as` writes it here.
+///
+/// From there it propagates on its own. `tunnel_port` is content in
+/// `canonical::SHAPES` as of Slice E, so the push later in this same session
+/// carries it to the house, and every subsequent sync carries it to every other
+/// machine — which is what `ssh::route` needs, since the peer doing the routing
+/// is rarely the machine that joined.
+///
+/// Writes nothing when the value is already what it should be: `config::save_barn`
+/// stamps `updated_at`, and a re-join to the same port must not make this
+/// machine's record look modified to every peer on every sync.
+fn record_our_tunnel_port(name: &str, port: u16) -> Result<()> {
+    let _guard = crate::store::lock_entity(&crate::config::barns_dir(), name)?;
+    // `adopt_as` ran a few lines above and is what creates this file, so absent
+    // here means the adoption found nothing and invented nothing. Inventing a
+    // barn record *here* would plant one carrying nothing but a port.
+    let Some(mut record) = load_barn_from_disk(name)? else {
+        return Ok(());
+    };
+    if record.tunnel_port == Some(port) {
+        return Ok(());
+    }
+    record.tunnel_port = Some(port);
+    crate::config::save_barn(&mut record)
 }
 
 /// Makes this machine a barn called `name`, and reports what that changed.
@@ -2861,6 +3079,55 @@ mod tests {
         );
     }
 
+    /// THE BOOKKEEPING, end to end. The house assigns the port; the joiner writes
+    /// it on its own barn record; and because `tunnel_port` is content it reaches
+    /// the house on the same session's push — so both machines end up holding the
+    /// same number for the same barn, which is what `ssh::route` needs on *every*
+    /// machine and not just on the one that asked.
+    ///
+    /// The joiner's write has to happen before `client::load_local`, or the push
+    /// is computed from a record that does not carry it and the house learns the
+    /// assignment it made a whole sync later — or never, if nothing else writes
+    /// that barn.
+    #[test]
+    fn a_join_records_the_tunnel_port_the_house_assigned_on_both_machines() {
+        let dirs = TwoRanches::new();
+        a_house(&dirs.house(), || {});
+
+        testing::with_ranch_env(dirs.joiner(), || {
+            let mut spawn = |_: &Barn| Ok(serve_child_command(&dirs.house()));
+            let mut confirm = |_: &str| Ok(true);
+            let mut push = |_: &Barn, _: &[String]| Ok(());
+            join_with(
+                "imac",
+                Some("macbook".into()),
+                JoinIo { spawn: &mut spawn, confirm: &mut confirm, push_brand: &mut push },
+            )
+        })
+        .expect("the join completes");
+
+        let here = barn_on(&dirs.joiner(), "macbook");
+        let port = here
+            .tunnel_port
+            .expect("the joiner has to write down what the house assigned it");
+        assert!(TUNNEL_PORT_RANGE.contains(&port), "{} is outside the range", port);
+
+        assert_eq!(
+            barn_on(&dirs.house(), "macbook").tunnel_port,
+            Some(port),
+            "the house has to end up holding the assignment it made, or the next joiner is \
+             handed the same number"
+        );
+
+        // And the house keeps none of its own: it is the thing everyone can
+        // reach, so there is nothing to tunnel to it.
+        assert_eq!(
+            barn_on(&dirs.house(), "imac").tunnel_port,
+            None,
+            "the Ranch House needs no tunnel of its own"
+        );
+    }
+
     /// A barn with no user is dialled as `root@`, which is wrong for every Mac
     /// on the ranch — so the user a join demonstrably authenticated as fills the
     /// gap.
@@ -3592,6 +3859,211 @@ mod tests {
         let reserved = assign_name(config::LOCAL_BARN_NAME, KEY_MATERIAL, &[])
             .expect_err("'local' means whichever machine is reading, so it names none");
         assert!(reserved.contains("reserved"), "{}", reserved);
+    }
+
+    // ==================================================================
+    // E — the port authority
+    // ==================================================================
+
+    /// A brand on the roster, keyed the way `assign_tunnel_port` keys it.
+    fn branded(name: &str, material: &str) -> Barn {
+        let mut b = barn_named(name);
+        b.brand = Some(format!("ssh-ed25519 {} yeehaw-ranch-{}", material, name));
+        b
+    }
+
+    fn brand_line(material: &str) -> String {
+        format!("ssh-ed25519 {} yeehaw-ranch-whatever", material)
+    }
+
+    /// THE UNIQUENESS. Two barns on one port means one barn's `-R` binds and the
+    /// other's is refused — or worse, the first tunnel to die frees the port for
+    /// the second and every peer that routes by the old number lands on the wrong
+    /// machine. So a fresh brand never gets a port the roster already holds.
+    #[test]
+    fn a_new_machine_gets_a_port_no_other_barn_holds() {
+        let mut roster = vec![branded("imac", "IMAC"), branded("pi", "PI")];
+        roster[0].tunnel_port = Some(*TUNNEL_PORT_RANGE.start());
+        roster[1].tunnel_port = Some(*TUNNEL_PORT_RANGE.start() + 1);
+
+        let got = assign_tunnel_port(&brand_line("MACBOOK"), &roster).unwrap();
+        assert!(
+            !roster.iter().any(|b| b.tunnel_port == Some(got)),
+            "{} is already taken by another barn: {:?}",
+            got,
+            roster.iter().map(|b| (b.name.clone(), b.tunnel_port)).collect::<Vec<_>>()
+        );
+        assert!(TUNNEL_PORT_RANGE.contains(&got), "{} is outside the range", got);
+    }
+
+    /// Gaps are filled rather than stepped over, so a ranch that has added and
+    /// removed machines for years does not creep out of the range.
+    #[test]
+    fn the_lowest_free_port_in_the_range_is_the_one_handed_out() {
+        let base = *TUNNEL_PORT_RANGE.start();
+        let mut roster = vec![branded("imac", "IMAC"), branded("pi", "PI")];
+        roster[0].tunnel_port = Some(base);
+        // `base + 1` was some machine's and is not on the roster any more.
+        roster[1].tunnel_port = Some(base + 2);
+
+        assert_eq!(assign_tunnel_port(&brand_line("MACBOOK"), &roster).unwrap(), base + 1);
+    }
+
+    /// THE STABILITY THE BRAND IS FOR, and the same branch `assign_name` opens
+    /// with. Every peer routes to this machine by the number the house handed out;
+    /// a re-join that changed it would invalidate what the whole ranch holds, and
+    /// `yeehaw ranch join` is run again for all sorts of reasons.
+    #[test]
+    fn a_re_joining_machine_keeps_the_port_it_already_has() {
+        let mut pi = branded("pi", "PI");
+        pi.tunnel_port = Some(*TUNNEL_PORT_RANGE.start() + 17);
+        let roster = vec![branded("imac", "IMAC"), pi.clone()];
+
+        // The same brand, whatever comment it now carries — `brand_key` drops the
+        // comment, so a renamed machine is still this machine.
+        let claim = "ssh-ed25519 PI yeehaw-ranch-renamed";
+        assert_eq!(assign_tunnel_port(claim, &roster).unwrap(), pi.tunnel_port.unwrap());
+    }
+
+    /// A machine the house knows by brand but has never assigned a port to — a
+    /// barn that joined on a build before this existed. It gets one now, and it
+    /// must not be one of its neighbours'.
+    #[test]
+    fn a_known_brand_with_no_port_yet_is_given_a_free_one() {
+        let base = *TUNNEL_PORT_RANGE.start();
+        let mut imac = branded("imac", "IMAC");
+        imac.tunnel_port = Some(base);
+        let roster = vec![imac, branded("pi", "PI")];
+
+        let got = assign_tunnel_port("ssh-ed25519 PI yeehaw-ranch-pi", &roster).unwrap();
+        assert_eq!(got, base + 1, "the only free port below is the one after the iMac's");
+    }
+
+    /// The Ranch House is the thing everyone can reach, so it is the one barn with
+    /// nothing to tunnel — but its own record still occupies a port if it has one,
+    /// and a joiner must not be handed it.
+    #[test]
+    fn a_port_already_on_the_house_is_not_handed_out_again() {
+        let base = *TUNNEL_PORT_RANGE.start();
+        let mut house = branded("imac", "IMAC");
+        house.is_ranch_house = Some(true);
+        house.tunnel_port = Some(base);
+
+        let got = assign_tunnel_port(&brand_line("MACBOOK"), &[house]).unwrap();
+        assert_ne!(got, base, "the house's number is taken like any other");
+    }
+
+    /// The same refusal `assign_name` gives, for the same reason: without a brand
+    /// there is nothing to be stable across re-joins, so every reconnect would
+    /// hand out a new number and invalidate what every peer holds.
+    #[test]
+    fn a_claim_with_no_usable_brand_gets_no_port() {
+        for brand in ["", "   ", "ssh-ed25519"] {
+            let why = assign_tunnel_port(brand, &[]).expect_err("no brand, no identity");
+            assert!(!why.trim().is_empty(), "the refusal has to say something");
+        }
+    }
+
+    /// Ports are finite. A full range is refused in words rather than by wrapping
+    /// onto a port somebody else holds — and the refusal names the range, which is
+    /// the only thing the user can act on.
+    #[test]
+    fn a_full_range_is_refused_rather_than_wrapped() {
+        let roster: Vec<Barn> = TUNNEL_PORT_RANGE
+            .clone()
+            .enumerate()
+            .map(|(i, port)| {
+                let mut b = branded(&format!("m{}", i), &format!("KEY{}", i));
+                b.tunnel_port = Some(port);
+                b
+            })
+            .collect();
+
+        let why = assign_tunnel_port(&brand_line("ONEMORE"), &roster)
+            .expect_err("every port in the range is taken");
+        assert!(
+            why.contains(&TUNNEL_PORT_RANGE.start().to_string()),
+            "the refusal must name the range: {}",
+            why
+        );
+    }
+
+    /// The house answers a claim with a port as well as a name. One frame,
+    /// because it is one act of enrollment off one roster — and a joiner that had
+    /// to ask twice could be answered by a house whose roster moved in between.
+    #[test]
+    fn a_claim_is_answered_with_a_tunnel_port_as_well_as_a_name() {
+        let ranch = testing::temp_ranch();
+        a_house(ranch.dir.path(), || {});
+
+        let input = format!(
+            "{}{}",
+            line(&hello_at(PROTOCOL_VERSION)),
+            line(&wire::Message::ClaimName {
+                proposed: "macbook".into(),
+                brand: brand_line("MACBOOK"),
+            })
+        );
+        let said = serve_against(ranch.dir.path(), &input);
+
+        assert_eq!(said.len(), 2, "the greeting and the answer: {:?}", said);
+        match &said[1] {
+            wire::Message::NameAssigned { name, tunnel_port } => {
+                assert_eq!(name, "macbook");
+                let port = tunnel_port.expect(
+                    "a machine enrolled with no port is a machine nothing off the LAN can reach",
+                );
+                assert!(TUNNEL_PORT_RANGE.contains(&port), "{} is outside the range", port);
+            }
+            other => panic!("a claim must be answered with a name and a port: {:?}", other),
+        }
+    }
+
+    /// And the house's answer comes off its own roster, so a machine it already
+    /// knows by brand is told the number every peer already holds for it.
+    #[test]
+    fn a_re_claim_is_answered_with_the_port_the_house_already_recorded() {
+        let ranch = testing::temp_ranch();
+        a_house(ranch.dir.path(), || {});
+        let keeps = *TUNNEL_PORT_RANGE.start() + 31;
+        testing::with_ranch_env(ranch.dir.path(), || {
+            let mut known = branded("macbook", "MACBOOK");
+            known.tunnel_port = Some(keeps);
+            config::save_barn(&mut known).unwrap();
+        });
+
+        let input = format!(
+            "{}{}",
+            line(&hello_at(PROTOCOL_VERSION)),
+            line(&wire::Message::ClaimName {
+                proposed: "macbook".into(),
+                // A different comment on the same key material: a renamed machine
+                // is still this machine, because `brand_key` drops the comment.
+                brand: "ssh-ed25519 MACBOOK yeehaw-ranch-something-else".into(),
+            })
+        );
+        let said = serve_against(ranch.dir.path(), &input);
+
+        assert_eq!(
+            said[1],
+            wire::Message::NameAssigned { name: "macbook".into(), tunnel_port: Some(keeps) },
+            "a re-join that moved the port would invalidate every peer's route: {:?}",
+            said[1]
+        );
+    }
+
+    /// The range itself, pinned. Every bound has a reason (see
+    /// [`TUNNEL_PORT_RANGE`]) and a silent widening would break one of them.
+    #[test]
+    fn the_tunnel_port_range_stays_clear_of_privileged_and_ephemeral_ports() {
+        assert!(*TUNNEL_PORT_RANGE.start() > 1024, "the -R bind is unprivileged");
+        // Linux's `ip_local_port_range` starts at 32768 and macOS's at 49152. A
+        // listener inside either loses races with outbound connections.
+        assert!(*TUNNEL_PORT_RANGE.end() < 30000, "clear of k8s NodePorts and of ephemeral");
+        assert!(
+            !TUNNEL_PORT_RANGE.contains(&2222) && !TUNNEL_PORT_RANGE.contains(&22222),
+            "the common alternate-ssh ports are what a barn's own sshd may be on"
+        );
     }
 
     /// A machine that has never run `ranch init` joins a house and comes away with

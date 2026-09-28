@@ -152,7 +152,9 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
                     // what makes A-Z mean anything.
                     ("t", "Stream a barn's sessions"),
                     ("n", "Create new item"),
-                    ("d", "Delete item"),
+                    // In the sessions panel `d` is not a delete at all: it
+                    // closes a viewer window, and refuses on every other row.
+                    ("d", "Delete item / close an open barn view"),
                     ("v", "Live session grid"),
                 ],
             });

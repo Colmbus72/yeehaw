@@ -1830,7 +1830,13 @@ pub(crate) mod tests {
             .collect()
     }
 
-    fn poll_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+    /// Polls `done` until it is true or `limit` elapses.
+    ///
+    /// `pub(crate)` for `tunnel`'s supervisor tests, which wait on the same kind
+    /// of thing for the same reason: a worker thread has published a state
+    /// change, and a fixed sleep long enough to be reliable is long enough to be
+    /// a slow suite.
+    pub(crate) fn poll_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + limit;
         loop {
             if done() {

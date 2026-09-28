@@ -274,6 +274,23 @@ pub struct Barn {
     pub brand: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_ranch_house: Option<bool>,
+    /// The port this barn's reverse tunnel binds on the **Ranch House's**
+    /// loopback: the barn holds `ssh -N -R <tunnel_port>:localhost:22 <house>`,
+    /// and `ssh::route` turns that into
+    /// `ssh -J <house> -p <tunnel_port> <user>@localhost` for any machine that
+    /// has no direct address for the barn.
+    ///
+    /// **Content**, and `canonical::SHAPES` classifies it so — a reversal of
+    /// Slice D, which read it as the local end of a forward and made it
+    /// machine-local. The port is bound on one machine (the house) for one barn,
+    /// so there is a single answer per barn for the whole ranch and every machine
+    /// needs it in order to route. Contrast `tunneled` above, which stayed
+    /// machine-local: whether this laptop wants a barn's sessions and where to
+    /// fetch them from are different questions.
+    ///
+    /// Assigned by the house, once, at join time — `ranch::assign_tunnel_port`,
+    /// never by the machine itself: two machines choosing independently collide,
+    /// and one tunnel then silently shadows the other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

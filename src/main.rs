@@ -22,6 +22,7 @@ mod testing;
 mod trails;
 mod tmux;
 mod tombstones;
+mod tunnel;
 mod types;
 mod update_check;
 mod vault;

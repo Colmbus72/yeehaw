@@ -277,6 +277,14 @@ impl GlobalDashboard {
                             return action;
                         }
                     }
+                    KeyCode::Char('d') => {
+                        self.sessions_state.settle_on_selectable(&items);
+                        if let Some(index) =
+                            rows.get(self.sessions_state.selected).and_then(|r| r.viewer)
+                        {
+                            return DashboardAction::CloseBarnWindow(index);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -479,7 +487,7 @@ impl GlobalDashboard {
             focused: self.focused_panel == FocusedPanel::Sessions,
             // The two namespaces, named where the list is. A capital letter is
             // not a key anyone would try unprompted.
-            hints: Some("[1-9] here  [A-Z] barn"),
+            hints: Some("[1-9] here  [A-Z] barn  [d] close"),
         };
         let sessions_inner = sessions_panel.render(frame, right_panels[0]);
         let session_items = row_items(&build_session_rows(windows, remote, stale));
@@ -801,6 +809,10 @@ struct SessionRow {
     /// `None` for a heading — the one row `Enter` has no answer for, which is
     /// why headings are also [`RowStyle::Heading`] and unselectable.
     target: Option<SessionTarget>,
+    /// The **local** tmux window index of the viewer this row has open, if it
+    /// has one. `None` for every other row, and that `None` is what `d` refuses
+    /// on.
+    viewer: Option<u32>,
 }
 
 impl SessionRow {
@@ -866,6 +878,14 @@ fn build_session_rows(
             item: local_item(position, w),
             key: local_key(position),
             target: Some(SessionTarget::Local(w.index)),
+            // `is_barn_view`, and nothing weaker. A local row is the user's own
+            // work — a claude session with something unsaved in it, a shell, an
+            // ssh — and `d` is `RequestDeleteProject` one panel to the left. The
+            // only local row it may touch is one tmux itself says is a view:
+            // a viewer whose remote row is gone (the session closed, or the barn
+            // stopped streaming) is listed here rather than under a heading, and
+            // is otherwise the one viewer with no way to be closed at all.
+            viewer: tmux::is_barn_view(w).then_some(w.index),
         });
     }
 
@@ -884,8 +904,16 @@ fn build_session_rows(
             // "Open here" is asked of the *whole* local window list, including
             // the viewers that were just folded out of it above — folding one
             // away is what proves it is open, not a reason to stop counting it.
-            let open_here =
-                windows.iter().any(|local| tmux::views_remote_window(local, name, w.index));
+            //
+            // The window's local **index** is kept, not just the yes/no: it is
+            // what `d` closes, and it is the one number that cannot be derived
+            // from this row, which is labelled with a remote index belonging to
+            // another machine.
+            let viewer = windows
+                .iter()
+                .find(|local| tmux::views_remote_window(local, name, w.index))
+                .map(|local| local.index);
+            let open_here = viewer.is_some();
             let key = letters.next();
             rows.push(SessionRow {
                 item: remote_item(key, w, frame, open_here, is_stale),
@@ -894,6 +922,7 @@ fn build_session_rows(
                     barn: name.to_string(),
                     window_index: w.index,
                 }),
+                viewer,
             });
         }
     }
@@ -948,6 +977,7 @@ fn heading_row(barn: &str, sessions: usize, is_stale: bool) -> SessionRow {
         },
         key: None,
         target: None,
+        viewer: None,
     }
 }
 
@@ -1923,6 +1953,147 @@ mod tests {
             dash.handle_input(KeyCode::Char('A'), &[], &[], &[], &[], &remote, &no_stale());
 
         assert!(matches!(action, DashboardAction::OpenBarnWindow { .. }), "focus swallowed the key");
+    }
+
+    // === closing a viewer ===================================================
+    //
+    // `d`, and only ever on a row the panel can prove is a `barn-view` window.
+    // The blast radius is the whole point of these tests: the same key deletes a
+    // project, a barn and a worm in the panels either side of this one, and a
+    // `d` that reached an ordinary local row would kill a live claude session
+    // and whatever was unsaved in it.
+
+    /// Move focus to the sessions panel and put the cursor on its first
+    /// selectable row.
+    fn focus_sessions(
+        dash: &mut GlobalDashboard,
+        windows: &[TmuxWindow],
+        remote: &HashMap<String, RemoteFrame>,
+    ) {
+        dash.handle_input(KeyCode::Tab, &[], &[], &[], windows, remote, &no_stale());
+        dash.handle_input(KeyCode::Char('g'), &[], &[], &[], windows, remote, &no_stale());
+    }
+
+    fn press(
+        dash: &mut GlobalDashboard,
+        c: char,
+        windows: &[TmuxWindow],
+        remote: &HashMap<String, RemoteFrame>,
+    ) -> DashboardAction {
+        dash.handle_input(KeyCode::Char(c), &[], &[], &[], windows, remote, &no_stale())
+    }
+
+    /// A barn's row with a viewer open closes **that local window**, by its local
+    /// index — never the remote index the row is labelled with, which belongs to
+    /// a window on another machine.
+    #[test]
+    fn d_on_a_barn_row_with_a_viewer_open_closes_the_local_window() {
+        let _ranch = crate::testing::temp_ranch();
+        let windows = [win(1, "work", "claude"), viewer(5, "guided", 4)];
+        let remote = frames(vec![frame("guided", vec![win(4, "api", "claude")])]);
+        let mut dash = GlobalDashboard::new();
+
+        focus_sessions(&mut dash, &windows, &remote);
+        // Row 0 is the local claude window, row 1 the heading `j` steps over.
+        press(&mut dash, 'j', &windows, &remote);
+
+        let action = press(&mut dash, 'd', &windows, &remote);
+
+        assert!(
+            matches!(action, DashboardAction::CloseBarnWindow(5)),
+            "`d` on an open viewer did not close local window 5: {:?}",
+            labels(&build_session_rows(&windows, &remote, &no_stale()))
+        );
+    }
+
+    /// The row a viewer is folded *out* of the local list into is the row that
+    /// closes it, and the fold is what proves the viewer is open — so this is the
+    /// same row `Enter` would open, answering the opposite question.
+    #[test]
+    fn d_and_enter_on_the_same_barn_row_are_the_two_halves_of_one_key_pair() {
+        let _ranch = crate::testing::temp_ranch();
+        let windows = [viewer(5, "guided", 4)];
+        let remote = frames(vec![frame("guided", vec![win(4, "api", "claude")])]);
+        let mut dash = GlobalDashboard::new();
+
+        focus_sessions(&mut dash, &windows, &remote);
+
+        let opened = dash.handle_input(KeyCode::Enter, &[], &[], &[], &windows, &remote, &no_stale());
+        assert!(
+            matches!(&opened, DashboardAction::OpenBarnWindow { barn, window_index: 4 } if barn == "guided"),
+            "control: the cursor is not on guided:4"
+        );
+        assert!(matches!(
+            press(&mut dash, 'd', &windows, &remote),
+            DashboardAction::CloseBarnWindow(5)
+        ));
+    }
+
+    /// **The one that matters.** A local row is a claude session, a shell or an
+    /// ssh window — the user's actual work, with whatever is unsaved in it. `d`
+    /// refuses, silently: there is nothing to close and nothing to warn about.
+    #[test]
+    fn d_on_a_local_working_session_does_nothing_at_all() {
+        let _ranch = crate::testing::temp_ranch();
+        let windows =
+            [win(1, "work", "claude"), win(2, "shell", "shell"), win(3, "barn-guided", "ssh")];
+        let remote = no_frames();
+        let mut dash = GlobalDashboard::new();
+
+        focus_sessions(&mut dash, &windows, &remote);
+
+        for row in 0..windows.len() {
+            let action = press(&mut dash, 'd', &windows, &remote);
+            assert!(
+                matches!(action, DashboardAction::None),
+                "`d` reached local row {row} ({}) — that is a live session",
+                windows[row].name,
+            );
+            press(&mut dash, 'j', &windows, &remote);
+        }
+    }
+
+    /// A barn's session with no viewer open has no local window to close, and
+    /// the remote index on the row is a window on another machine. Refused, and
+    /// refused silently — the row is still a perfectly good `Enter`.
+    #[test]
+    fn d_on_a_barn_row_with_nothing_open_here_does_nothing() {
+        let _ranch = crate::testing::temp_ranch();
+        let windows: [TmuxWindow; 0] = [];
+        let remote = frames(vec![frame("guided", vec![win(4, "api", "claude")])]);
+        let mut dash = GlobalDashboard::new();
+
+        focus_sessions(&mut dash, &windows, &remote);
+
+        let action = press(&mut dash, 'd', &windows, &remote);
+
+        assert!(matches!(action, DashboardAction::None), "`d` closed a window it does not have");
+    }
+
+    /// A viewer whose remote session has closed — or whose barn stopped
+    /// streaming — has no row under a heading to be folded into, so it is listed
+    /// as a local row. It is still only a view, and it is the one viewer that
+    /// could otherwise never be closed at all.
+    #[test]
+    fn d_closes_a_viewer_that_lost_the_barn_row_it_was_folded_under() {
+        let _ranch = crate::testing::temp_ranch();
+        let windows = [viewer(5, "guided", 4)];
+        let remote = no_frames();
+        let mut dash = GlobalDashboard::new();
+
+        focus_sessions(&mut dash, &windows, &remote);
+        assert_eq!(
+            labels(&build_session_rows(&windows, &remote, &no_stale())),
+            ["[1] guided-4"],
+            "control: the orphaned viewer is a local row"
+        );
+
+        let action = press(&mut dash, 'd', &windows, &remote);
+
+        assert!(
+            matches!(action, DashboardAction::CloseBarnWindow(5)),
+            "an orphaned viewer has no way to be closed"
+        );
     }
 
     /// `G` is select-last in every panel of this view. A barn row may not take

@@ -289,30 +289,61 @@ pub fn create_yeehaw_session() -> Result<()> {
     Ok(())
 }
 
-fn setup_status_bar_hooks() {
-    let status_check = "if-shell -F \"#{==:#{window_index},0}\" \"set status off\" \"set status on\"";
+/// The footer's rule, as one tmux command: the dashboard (window 0) wears no
+/// status bar and every other window wears one.
+const STATUS_CHECK: &str =
+    "if-shell -F \"#{==:#{window_index},0}\" \"set status off\" \"set status on\"";
 
+/// [`STATUS_CHECK`] as `after-new-window` has to phrase it.
+///
+/// A creation hook's target is the window that was just **created**, not the one
+/// on screen: measured on a throwaway server, `new-window -d` fires
+/// `after-new-window` with `#{window_index}` set to the new window while the
+/// client is still on window 0. Reusing [`STATUS_CHECK`] here would therefore
+/// raise the footer over the dashboard every time a background window opened,
+/// and every claude and worm window passes `-d`.
+///
+/// So the question asked is "is the window that just opened the one now on
+/// screen, and is it not the dashboard?" — `#{window_active}`, which the window
+/// list format already leans on, rather than `#{active_window_index}`, which is
+/// a much newer format.
+///
+/// One branch, no `else`: a `-d` window fails the guard, and an `else` would
+/// then turn the footer *off* under a user sitting on window 5. Leaving the
+/// option alone is the correct answer for a window the user cannot see.
+const NEW_WINDOW_STATUS_CHECK: &str =
+    "if-shell -F \"#{&&:#{window_active},#{!=:#{window_index},0}}\" \"set status on\"";
+
+/// Every hook that re-asks the footer's question, and the command it runs.
+///
+/// `after-new-window` is in here because auto-selection is not a
+/// `select-window`: tmux selects the window `new-window` made without running
+/// the command that `after-select-window` hooks, so a viewer window
+/// ([`open_barn_window`], the one caller that deliberately omits `-d`) opened
+/// with the dashboard's `status off` still in force and kept it until the user
+/// happened to press C-h. Hooking creation fixes that for any future caller too,
+/// rather than leaving every no-`-d` `new-window` owing a `switch_to_window`.
+pub(crate) fn status_bar_hooks() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("after-select-window", STATUS_CHECK),
+        ("after-new-window", NEW_WINDOW_STATUS_CHECK),
+        ("window-unlinked", STATUS_CHECK),
+        ("pane-focus-in", STATUS_CHECK),
+        ("client-attached", STATUS_CHECK),
+    ]
+}
+
+fn setup_status_bar_hooks() {
     // Start with status off
     let _ = Command::new("tmux")
         .args(["set", "-t", YEEHAW_SESSION, "status", "off"])
         .output();
 
-    // Hook for window changes
-    let _ = Command::new("tmux")
-        .args(["set-hook", "-t", YEEHAW_SESSION, "after-select-window", status_check])
-        .output();
-
-    let _ = Command::new("tmux")
-        .args(["set-hook", "-t", YEEHAW_SESSION, "window-unlinked", status_check])
-        .output();
-
-    let _ = Command::new("tmux")
-        .args(["set-hook", "-t", YEEHAW_SESSION, "pane-focus-in", status_check])
-        .output();
-
-    let _ = Command::new("tmux")
-        .args(["set-hook", "-t", YEEHAW_SESSION, "client-attached", status_check])
-        .output();
+    for (hook, command) in status_bar_hooks() {
+        let _ = Command::new("tmux")
+            .args(["set-hook", "-t", YEEHAW_SESSION, hook, command])
+            .output();
+    }
 }
 
 pub fn attach_to_yeehaw() {
@@ -1253,6 +1284,12 @@ fn viewer_window_command(barn: &Barn, window_index: u32) -> Result<String> {
 /// No `-d`: the window is the thing the user just asked for, so it opens
 /// selected. Failure returns before anything is tagged — a window that opened
 /// but could not be identified is worse than no window.
+///
+/// Auto-selection is not a `select-window`, so the footer is raised by the
+/// `after-new-window` hook rather than by anything here — see
+/// [`status_bar_hooks`]. This was the one caller the missing hook showed up in:
+/// every other one either passes `-d` or follows itself with a
+/// `switch_to_window`.
 pub fn open_barn_window(barn: &Barn, window_index: u32) -> Result<()> {
     let cmd = viewer_window_command(barn, window_index)?;
     let name = format!("{}-{}", barn.name, window_index);
@@ -1619,6 +1656,64 @@ mod tests {
 
         assert_eq!(w.remote_window, None);
         assert!(!is_barn_view(&w));
+    }
+
+    // === the footer's hooks ================================================
+    //
+    // Asserted against the generated command strings, not a running server:
+    // `set-hook -t yeehaw` would rewrite the hooks of the session the developer
+    // is sitting in. The behaviour of the two strings below was measured on a
+    // throwaway server (`tmux -L … -f /dev/null`) once; what a test can keep
+    // honest from here is which hooks exist and what they say.
+
+    /// The footer vanished in a barn-view window. `open_barn_window` uses
+    /// `new-window` *without* `-d`, so tmux auto-selects the new window and no
+    /// `select-window` command ever runs — `after-select-window` never fires and
+    /// the `status off` carried over from the dashboard stays on screen until
+    /// C-h/C-l happens to fire it. Hooking the creation itself is what makes
+    /// that true of *every* window rather than of the call sites that happen to
+    /// follow themselves with a `switch_to_window`.
+    #[test]
+    fn a_window_that_opens_selected_gets_the_footer_check_without_a_select() {
+        let hooks: Vec<&str> = status_bar_hooks().iter().map(|(h, _)| *h).collect();
+
+        assert!(
+            hooks.contains(&"after-new-window"),
+            "a window that opens selected never re-asks the footer's question: {hooks:?}"
+        );
+        // The four that were always there stay there: creation is an extra
+        // trigger, not a replacement for the ones that catch every other way a
+        // client's window can change.
+        for had in ["after-select-window", "window-unlinked", "pane-focus-in", "client-attached"] {
+            assert!(hooks.contains(&had), "{had} was dropped: {hooks:?}");
+        }
+    }
+
+    /// `after-new-window`'s hook target is the window that was just **created**,
+    /// not the one on screen. Measured: `new-window -d` fires the hook with
+    /// `#{window_index}` set to the new window while `#{active_window_index}` is
+    /// still 0. So this hook cannot reuse [`STATUS_CHECK`] — every background
+    /// claude and worm window (`create_claude_window`, `create_worm_window` and
+    /// friends all pass `-d`) would raise the footer over the dashboard.
+    #[test]
+    fn a_background_window_does_not_raise_the_footer_over_the_dashboard() {
+        let check = status_bar_hooks()
+            .into_iter()
+            .find(|(hook, _)| *hook == "after-new-window")
+            .map(|(_, command)| command)
+            .expect("after-new-window must be hooked");
+
+        assert!(
+            check.contains("#{window_active}"),
+            "the creation hook asks about the new window, not the visible one: {check}"
+        );
+        assert_ne!(check, STATUS_CHECK, "the creation hook reused the select check");
+        // One branch only. An `else` here would fire on a `-d` window and turn
+        // the footer *off* under a user sitting on window 5.
+        assert!(
+            !check.contains("set status off"),
+            "a window created behind the user's back can switch the footer off: {check}"
+        );
     }
 
     /// The write side and the read side, held together. Tagging a window and

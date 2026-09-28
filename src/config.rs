@@ -563,7 +563,8 @@ pub fn load_barns_checked() -> LoadResult<Barn> {
         result.items.insert(0, local_barn());
     }
 
-    // Ranch house, then this machine, then everything else by name.
+    // Ranch house, then this machine, then the tunneled barns, then everything
+    // else — each rank by name within itself.
     //
     // The two barns a user orients by are the one that arbitrates the ranch and
     // the one they are sitting at; `read_dir` order put them wherever the
@@ -574,6 +575,13 @@ pub fn load_barns_checked() -> LoadResult<Barn> {
     //
     // The synthetic `local` row, when present, is this machine by definition
     // and sorts second — there is no adopted record competing for the slot.
+    //
+    // Rank 2 is the tunneled ones: a barn the user has switched on has its
+    // sessions in the dashboard's sessions panel this second, keyed `A`-`Z`, so
+    // its row is one they keep returning to — `t` to switch it off again, `c` to
+    // walk into it. A barn nobody streams is a row that may never be touched.
+    // `tunneled` is machine-local (see [`crate::types::Barn::tunneled`]), which
+    // is exactly right for an ordering that only this machine's panel shows.
     let this_machine = this_barn_name();
     result.items.sort_by_key(|b| {
         let rank = if b.is_ranch_house == Some(true) {
@@ -582,8 +590,10 @@ pub fn load_barns_checked() -> LoadResult<Barn> {
             || this_machine.as_deref() == Some(b.name.as_str())
         {
             1
-        } else {
+        } else if b.tunneled == Some(true) {
             2
+        } else {
+            3
         };
         (rank, b.name.to_lowercase())
     });
@@ -2463,6 +2473,52 @@ jobs:
                     "zulu".to_string(),
                 ],
                 "house first, this machine second, the rest by name"
+            );
+        });
+    }
+
+    /// The third rank. A tunneled barn is the one whose sessions are on screen
+    /// right now — keyed `A`-`Z` in the sessions panel — so it is a row the user
+    /// keeps coming back to, where a barn nobody streams is a row they may never
+    /// touch. The two ranks above it were asked for by name and do not move.
+    #[test]
+    fn tunneled_barns_sort_under_the_house_and_this_machine_but_above_the_rest() {
+        crate::testing::with_temp_ranch(|_| {
+            let mk = |name: &str, house: bool, tunneled: bool| {
+                let mut b = Barn { name: name.into(), ..Default::default() };
+                if house {
+                    b.is_ranch_house = Some(true);
+                }
+                if tunneled {
+                    b.tunneled = Some(true);
+                }
+                save_barn(&mut b).unwrap();
+            };
+            // The house is *not* tunneled, so a tunneled barn overtaking it
+            // would show up here rather than hiding behind rank 0.
+            mk("camerons-imac", true, false);
+            mk("smashed-air", false, true);
+            mk("zulu", false, true);
+            mk("alpha", false, false);
+            mk("beta", false, true);
+            mk("yankee", false, false);
+
+            let mut cfg = load_config();
+            cfg.this_barn = Some("smashed-air".into());
+            save_config(&cfg).unwrap();
+
+            let names: Vec<String> = load_barns().into_iter().map(|b| b.name).collect();
+            assert_eq!(
+                names,
+                vec![
+                    "camerons-imac".to_string(),
+                    "smashed-air".to_string(),
+                    "beta".to_string(),
+                    "zulu".to_string(),
+                    "alpha".to_string(),
+                    "yankee".to_string(),
+                ],
+                "house, this machine, the tunneled ones by name, then the rest by name"
             );
         });
     }
