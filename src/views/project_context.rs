@@ -258,7 +258,14 @@ impl ProjectContextView {
                     KeyCode::Char('g') => self.livestock_state.select_first(),
                     KeyCode::Char('G') => self.livestock_state.select_last(count),
                     KeyCode::Enter => return ProjectAction::SelectLivestock(self.livestock_state.selected),
-                    KeyCode::Char('c') => return ProjectAction::NewClaude(self.livestock_state.selected),
+                    // Claude starts in a directory on this machine, so it is
+                    // only offered for livestock that lives here.
+                    KeyCode::Char('c') => {
+                        let sel = self.livestock_state.selected;
+                        if project.livestock.get(sel).is_some_and(config::livestock_is_on_this_machine) {
+                            return ProjectAction::NewClaude(sel);
+                        }
+                    }
                     KeyCode::Char('s') => return ProjectAction::OpenShell(self.livestock_state.selected),
                     KeyCode::Char('n') => {
                         self.input_mode = InputMode::NewLivestockName;
@@ -877,10 +884,14 @@ fn build_livestock_items(livestock: &[Livestock]) -> Vec<ListItem> {
             label: ls.name.clone(),
             status: Some(ItemStatus::Active),
             meta: Some(barn_info),
-            actions: vec![
-                RowAction { key: "c".to_string(), label: "claude".to_string() },
-                RowAction { key: "s".to_string(), label: "shell".to_string() },
-            ],
+            actions: if config::livestock_is_on_this_machine(ls) {
+                vec![
+                    RowAction { key: "c".to_string(), label: "claude".to_string() },
+                    RowAction { key: "s".to_string(), label: "shell".to_string() },
+                ]
+            } else {
+                vec![RowAction { key: "s".to_string(), label: "shell".to_string() }]
+            },
             ..Default::default()
         }
     }).collect()
@@ -965,6 +976,46 @@ mod tests {
         assert_eq!(barn_picked("local"), Some("imac".to_string()));
         assert_eq!(barn_picked(""), Some("imac".to_string()));
         assert_eq!(barn_picked("pi"), Some("pi".to_string()));
+    }
+
+    fn livestock_on(name: &str, barn: Option<&str>) -> Livestock {
+        Livestock {
+            name: name.into(),
+            path: format!("/srv/{}", name),
+            barn: barn.map(String::from),
+            repo: None,
+            branch: None,
+            log_path: None,
+            env_path: None,
+            source: None,
+            k8s_metadata: None,
+            trails: vec![],
+        }
+    }
+
+    /// Claude starts *here*, in a directory on this machine. For livestock on
+    /// another barn that directory is someone else's, so neither the row nor
+    /// the key offers it — `s` (shell) is how you reach remote code.
+    #[test]
+    fn claude_is_offered_only_for_livestock_on_this_machine() {
+        let _ranch = crate::testing::temp_ranch();
+        crate::migrate::adopt_this_machine("imac").unwrap();
+        let mut project = bare_project();
+        project.livestock = vec![
+            livestock_on("here", Some("imac")),
+            livestock_on("there", Some("pi")),
+        ];
+
+        let items = build_livestock_items(&project.livestock);
+        let keys = |i: usize| items[i].actions.iter().map(|a| a.key.clone()).collect::<Vec<_>>();
+        assert_eq!(keys(0), vec!["c", "s"]);
+        assert_eq!(keys(1), vec!["s"], "a remote livestock must not offer claude");
+
+        let mut view = ProjectContextView::new();
+        view.livestock_state.selected = 0;
+        assert!(matches!(view.handle_input(KeyCode::Char('c'), &project, &[]), ProjectAction::NewClaude(0)));
+        view.livestock_state.selected = 1;
+        assert!(matches!(view.handle_input(KeyCode::Char('c'), &project, &[]), ProjectAction::None));
     }
 
     /// The livestock column says here-or-elsewhere. Adoption renames this

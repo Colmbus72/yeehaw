@@ -146,18 +146,18 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
                 title: "Actions",
                 keys: vec![
                     ("c", "Open Claude / connect to barn"),
-                    ("Ctrl+D", "Disconnect from barn"),
+                    ("C-d", "Disconnect from barn"),
                     ("s", "SSH to barn / open shell"),
                     ("n", "Create new item"),
                     ("d", "Delete item"),
                     ("v", "Live session grid"),
-                    ("Ctrl+S", "Sync with connected barns"),
+                    ("C-s", "Sync with connected barns"),
                 ],
             });
             groups.push(HotkeyGroup {
                 title: "System",
                 keys: vec![
-                    ("Ctrl+R", "Restart Yeehaw"),
+                    ("C-r", "Restart Yeehaw"),
                     ("q", "Detach session"),
                     ("Q", "Quit & kill session"),
                     ("?", "Toggle help"),
@@ -182,7 +182,7 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
                 title: "Actions",
                 keys: vec![
                     ("c", "Connect to barn"),
-                    ("Ctrl+D", "Disconnect from barn"),
+                    ("C-d", "Disconnect from barn"),
                     ("s", "SSH to barn"),
                     ("e", "Edit barn"),
                     ("v", "Live session grid"),
@@ -229,7 +229,7 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
             groups.push(HotkeyGroup {
                 title: "System",
                 keys: vec![
-                    ("Ctrl+R", "Restart Yeehaw"),
+                    ("C-r", "Restart Yeehaw"),
                     ("?", "Toggle help"),
                 ],
             });

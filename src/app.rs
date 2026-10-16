@@ -1442,7 +1442,7 @@ fn apply_project_action(app: &mut App, project: Project, action: ProjectAction) 
                 app.navigate(AppView::Issues { project: project.clone() });
             }
             ProjectAction::NewClaude(ls_idx) => {
-                if let Some(ls) = project.livestock.get(ls_idx) {
+                if let Some(ls) = project.livestock.get(ls_idx).filter(|ls| config::livestock_is_on_this_machine(ls)) {
                     let working_dir = expand_path(&ls.path);
                     let window_name = format!("{}-{}-claude", project.name, ls.name);
                     let ctx = context::build_livestock_context(&project, &ls.name);
@@ -1832,7 +1832,7 @@ fn apply_livestock_action(
                     source_barn: source_barn.clone(),
                 });
             }
-            LivestockAction::OpenClaude => {
+            LivestockAction::OpenClaude if config::livestock_is_on_this_machine(&livestock) => {
                 let working_dir = expand_path(&livestock.path);
                 let window_name = format!("{}-{}-claude", project.name, livestock.name);
                 let ctx = context::build_livestock_context(&project, &livestock.name);
@@ -1847,6 +1847,8 @@ fn apply_livestock_action(
                     Err(e) => { app.error = Some(format!("Failed: {}", e)); }
                 }
             }
+            // Not offered for livestock on another barn; the key does nothing.
+            LivestockAction::OpenClaude => {}
             LivestockAction::OpenShell => {
                 let barn = barn_for_livestock(&livestock, &app.barns, source_barn.as_ref());
                 let window_name = format!("{}-{}", project.name, livestock.name);
@@ -2680,7 +2682,7 @@ fn get_bottom_bar_items(view: &AppView) -> Vec<(&'static str, &'static str)> {
     match view {
         AppView::Global => vec![
             ("v", "visualizer"),
-            ("^S", "sync"),
+            ("C-s", "sync"),
             ("q", "detach"),
             ("Q", "quit"),
             ("Tab", ""),

@@ -98,6 +98,10 @@ bind-key -T copy-mode Enter send-keys -X copy-pipe-and-cancel "pbcopy"
 bind-key -T copy-mode-vi Enter send-keys -X copy-pipe-and-cancel "pbcopy"
 # Use y to yank in vi mode
 bind-key -T copy-mode-vi y send-keys -X copy-pipe-and-cancel "pbcopy"
+# Copies made on a barn. Its tmux sends them down the ssh connection as an
+# OSC 52 escape, which tmux turns into a buffer here — but Terminal.app ignores
+# OSC 52, so forwarding it outward reaches no clipboard. This hook does it.
+set-hook -g pane-set-clipboard "run-shell -b 'command -v pbcopy >/dev/null && tmux -S \"#{socket_path}\" save-buffer - | pbcopy'"
 
 # Yeehaw keybindings
 bind-key -n C-y select-window -t :0    # Return to dashboard
@@ -1689,6 +1693,71 @@ mod tests {
         // exists. If the constant and the config literal ever drift apart, that
         // check fails at connect time instead of here.
         assert!(generate_tmux_config().contains(&format!("bind-key -T {} ", REMOTE_KEY_TABLE)));
+    }
+
+    /// A copy made inside a barn's yeehaw lands on *this* machine's clipboard.
+    ///
+    /// The barn's tmux copies into its own buffer and, with `set-clipboard on`,
+    /// sends an OSC 52 down the ssh pty into our pane. Terminal.app ignores
+    /// OSC 52, so tmux forwarding it outward reaches nothing; the
+    /// `pane-set-clipboard` hook is what hands it to `pbcopy` here.
+    ///
+    /// Run for real: the generated hook line on a throwaway tmux server, a pane
+    /// printing the OSC 52 a barn would, and a stand-in `pbcopy` on PATH that
+    /// writes to a file — the user's clipboard is never touched.
+    #[test]
+    fn a_clipboard_escape_from_a_pane_reaches_pbcopy() {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            return;
+        }
+        let hook = generate_tmux_config()
+            .lines()
+            .find(|l| l.contains("pane-set-clipboard"))
+            .expect("the generated config sets a pane-set-clipboard hook")
+            .to_string();
+
+        let dir = std::env::temp_dir().join(format!("yh-clip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("copied");
+        let fake = dir.join("pbcopy");
+        fs::write(&fake, format!("#!/bin/sh\ncat > '{}'\n", out.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = dir.join("sock");
+        let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+        let tmux = |args: &[&str]| {
+            Command::new("tmux")
+                .arg("-S").arg(&socket).arg("-f").arg("/dev/null")
+                .args(args)
+                .env("PATH", &path)
+                .env_remove("TMUX")
+                .output()
+                .expect("tmux runs")
+        };
+
+        tmux(&["new-session", "-d", "-s", "t", "sleep 20"]);
+        tmux(&["set", "-g", "set-clipboard", "on"]);
+        // The line exactly as generated, minus its leading `set-hook`, so the
+        // test exercises the real quoting rather than a copy of it.
+        let hook_args = hook.trim().strip_prefix("set-hook ").expect("a set-hook line");
+        let sourced = dir.join("hook.conf");
+        fs::write(&sourced, format!("set-hook {}\n", hook_args)).unwrap();
+        tmux(&["source-file", &sourced.to_string_lossy()]);
+        // "copied-from-a-barn", base64.
+        tmux(&["new-window", "-d", "printf '\\033]52;c;Y29waWVkLWZyb20tYS1iYXJu\\a'; sleep 5"]);
+
+        let mut got = String::new();
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            got = fs::read_to_string(&out).unwrap_or_default();
+            if !got.is_empty() {
+                break;
+            }
+        }
+        tmux(&["kill-server"]);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(got, "copied-from-a-barn");
     }
 
     // === shell_escape ===================================================

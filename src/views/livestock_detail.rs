@@ -232,7 +232,9 @@ impl LivestockDetailView {
         match self.focused_panel {
             FocusedPanel::Sessions => {
                 match key {
-                    KeyCode::Char('c') => LivestockAction::OpenClaude,
+                    KeyCode::Char('c') if crate::config::livestock_is_on_this_machine(livestock) => {
+                        LivestockAction::OpenClaude
+                    }
                     KeyCode::Char('s') => LivestockAction::OpenShell,
                     KeyCode::Char('j') | KeyCode::Down => {
                         self.sessions_state.select_next(session_count);
@@ -331,7 +333,11 @@ impl LivestockDetailView {
         let sessions_panel = Panel {
             title: "Sessions",
             focused: self.focused_panel == FocusedPanel::Sessions,
-            hints: Some("[c] claude  [s] shell"),
+            hints: Some(if crate::config::livestock_is_on_this_machine(livestock) {
+                "[c] claude  [s] shell"
+            } else {
+                "[s] shell"
+            }),
         };
         let sessions_inner = sessions_panel.render(frame, panels[0]);
 

@@ -244,32 +244,82 @@ pub fn hash_entity<T: Serialize>(kind: &str, entity: &T) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// The entity as [`hash_entity`] sees it, as a `serde_yaml::Value`: identity
+/// and this kind's machine-local keys gone from the top level, null mapping
+/// entries gone at every depth, and every mapping sorted by key. Two entities
+/// hash equal exactly when these are equal, so this is what a person should be
+/// shown when asked "what differs?".
+pub fn comparable_value<T: Serialize>(kind: &str, entity: &T) -> Result<Value> {
+    let shape = shape_for(kind)?;
+    let value = serde_yaml::to_value(entity)
+        .context("failed to serialize entity into a canonical form")?;
+    Ok(match normalize(value) {
+        // The top level is the only place not-content keys are stripped.
+        //
+        // Deliberately not recursive: `RanchHand.config` is an untyped
+        // `serde_yaml::Value` holding whatever kubeconfig or Terraform state the
+        // user pointed at, and a k8s resource with its own `id` field is
+        // ordinary content. The `Identified` fields and the per-kind
+        // machine-local fields exist exactly once per entity, at the top.
+        Value::Mapping(map) => Value::Mapping(
+            map.into_iter()
+                .filter(|(key, _)| !matches!(key, Value::String(k) if is_not_content(shape, k)))
+                .collect(),
+        ),
+        other => other,
+    })
+}
+
+/// Drops null mapping entries at every depth and sorts every mapping by key.
+///
+/// An absent key and a key explicitly set to null mean the same thing to every
+/// loader in this codebase, so they must compare the same. Sequence elements
+/// keep their order and their nulls: order is content for a `Vec` (wiki
+/// sections, steps in a trail job), and dropping a null element would silently
+/// shorten the list.
+fn normalize(value: Value) -> Value {
+    match value {
+        Value::Sequence(items) => Value::Sequence(items.into_iter().map(normalize).collect()),
+        Value::Mapping(map) => {
+            let mut pairs: Vec<(String, Value, Value)> = map
+                .into_iter()
+                .filter(|(_, v)| !matches!(v, Value::Null))
+                .map(|(k, v)| {
+                    // Alphabetical for the person reading it; any other key kind
+                    // sorts by its rendering, which gives every key kind one
+                    // total order. (The hash re-sorts in `render_mapping`, so
+                    // this order is for display only.)
+                    let order = match &k {
+                        Value::String(name) => name.clone(),
+                        other => {
+                            let mut rendered = String::new();
+                            render(other, &mut rendered);
+                            rendered
+                        }
+                    };
+                    (order, k, normalize(v))
+                })
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Mapping(pairs.into_iter().map(|(_, k, v)| (k, v)).collect())
+        }
+        Value::Tagged(mut tagged) => {
+            tagged.value = normalize(tagged.value);
+            Value::Tagged(tagged)
+        }
+        other => other,
+    }
+}
+
 /// The bytes [`hash_entity`] actually hashes.
 ///
 /// Kept separate because a hash that disagrees between two machines is
 /// otherwise undebuggable: with this, the two forms can be diffed directly and
 /// the offending field named.
 fn canonical_form<T: Serialize>(kind: &str, entity: &T) -> Result<String> {
-    let shape = shape_for(kind)?;
-    let value = serde_yaml::to_value(entity)
-        .context("failed to serialize entity into a canonical form")?;
     let mut out = String::new();
-    render_root(&value, shape, &mut out);
+    render(&comparable_value(kind, entity)?, &mut out);
     Ok(out)
-}
-
-/// The top level is the only place not-content keys are stripped.
-///
-/// Deliberately not recursive: `RanchHand.config` is an untyped
-/// `serde_yaml::Value` holding whatever kubeconfig or Terraform state the user
-/// pointed at, and a k8s resource with its own `id` field is ordinary content.
-/// The `Identified` fields and the per-kind machine-local fields exist exactly
-/// once per entity, at the top.
-fn render_root(value: &Value, shape: &KindShape, out: &mut String) {
-    match value {
-        Value::Mapping(map) => render_mapping(map, out, Some(shape)),
-        other => render(other, out),
-    }
 }
 
 /// True when `key` is bookkeeping rather than content for this kind.
@@ -307,7 +357,7 @@ fn render(value: &Value, out: &mut String) {
             }
             out.push(']');
         }
-        Value::Mapping(map) => render_mapping(map, out, None),
+        Value::Mapping(map) => render_mapping(map, out),
         // Externally tagged enums land here. The tag is content.
         Value::Tagged(tagged) => {
             out.push('!');
@@ -317,24 +367,13 @@ fn render(value: &Value, out: &mut String) {
     }
 }
 
-/// `shape` is `Some` only for the top-level mapping of an entity — that is the
-/// one place a key can mean identity or machine-local bookkeeping rather than
-/// content.
-fn render_mapping(map: &serde_yaml::Mapping, out: &mut String, shape: Option<&KindShape>) {
+/// Mappings arrive already stripped and null-free from [`comparable_value`];
+/// sorting again here keeps the rendering's determinism local rather than a
+/// promise made elsewhere.
+fn render_mapping(map: &serde_yaml::Mapping, out: &mut String) {
     let mut pairs: Vec<(String, String)> = Vec::with_capacity(map.len());
 
     for (key, value) in map {
-        // An absent key and a key explicitly set to null mean the same thing to
-        // every loader in this codebase, so they must hash the same.
-        if matches!(value, Value::Null) {
-            continue;
-        }
-        if let (Some(shape), Value::String(name)) = (shape, key) {
-            if is_not_content(shape, name.as_str()) {
-                continue;
-            }
-        }
-
         let mut rendered_key = String::new();
         render(key, &mut rendered_key);
         let mut rendered_value = String::new();
@@ -684,6 +723,19 @@ mod tests {
     /// so hashed, every project would read as different, and a machine that took
     /// the other side's path would have `expand_path(&project.path)` open
     /// nothing.
+    /// What the sync view shows: exactly what the hash compares.
+    #[test]
+    fn the_comparable_value_is_what_the_hash_sees() {
+        let mut project: Project = parse("name: api\npath: /tmp/api\nsummary: s\ncolor: null\n");
+        project.id = Some("aaa".into());
+        project.created_at = Some("2026-01-01T00:00:00+00:00".into());
+        project.updated_at = Some("2026-02-01T00:00:00+00:00".into());
+        let value = comparable_value("project", &project).unwrap();
+        let yaml = serde_yaml::to_string(&value).unwrap();
+        assert_eq!(yaml, "herds: []\nlivestock: []\nname: api\nsummary: s\nwiki: []\n");
+        assert!(comparable_value("nope", &project).is_err());
+    }
+
     #[test]
     fn a_projects_path_is_not_content() {
         let mut here: Project = parse(PROJECT_YAML);
