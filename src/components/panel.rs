@@ -30,39 +30,23 @@ impl<'a> Panel<'a> {
         self.block().inner(area)
     }
 
-    /// Render the panel block and return the inner area for content
+    /// Render the panel block and return the inner area for content.
+    ///
+    /// Hints sit in the bottom border, right-aligned, while focused — never on
+    /// a content row. Terminals are wider than they are tall, and a hints row
+    /// inside the panel cost every list its last line.
     pub fn render(&self, frame: &mut Frame, area: Rect) -> Rect {
-        let block = self.block();
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        // If we have hints and are focused, render them at the bottom of inner area
+        let mut block = self.block();
         if self.focused {
             if let Some(hints) = self.hints {
-                if inner.height > 1 {
-                    let hints_area = Rect {
-                        x: inner.x,
-                        y: inner.y + inner.height - 1,
-                        width: inner.width,
-                        height: 1,
-                    };
-                    let content_area = Rect {
-                        x: inner.x,
-                        y: inner.y,
-                        width: inner.width,
-                        height: inner.height - 1,
-                    };
-
-                    let hint_spans = render_hints(hints);
-                    let hint_line = ratatui::widgets::Paragraph::new(Line::from(hint_spans))
-                        .alignment(Alignment::Right);
-                    frame.render_widget(hint_line, hints_area);
-
-                    return content_area;
-                }
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(render_hints(hints));
+                spans.push(Span::raw(" "));
+                block = block.title_bottom(Line::from(spans).right_aligned());
             }
         }
-
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
         inner
     }
 }
@@ -94,4 +78,28 @@ fn render_hints(hints: &str) -> Vec<Span<'_>> {
         spans.push(Span::styled(current, Style::default().fg(Color::DarkGray)));
     }
     spans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hints ride in the bottom border, so a focused panel gives its content
+    /// every inner row.
+    #[test]
+    fn hints_sit_in_the_bottom_border_and_cost_no_content_row() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 6)).expect("test terminal");
+        let mut inner = Rect::default();
+        terminal
+            .draw(|f| {
+                let panel = Panel { title: "Projects", focused: true, hints: Some("[n] new  [d] delete") };
+                inner = panel.render(f, f.area());
+            })
+            .expect("draw");
+        assert_eq!(inner.height, 4, "both borders only — no row kept back for hints");
+        let buf = terminal.backend().buffer().clone();
+        let bottom: String = (0..40).map(|x| buf.cell((x, 5)).expect("a cell").symbol()).collect();
+        assert!(bottom.contains("[n] new  [d] delete"), "bottom border: {:?}", bottom);
+    }
 }

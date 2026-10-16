@@ -190,6 +190,35 @@ impl ListState {
         }
     }
 
+    /// Scroll so the cursor's row fits in `height` rows *after* the "▲ N more"
+    /// and "▼ N more" lines take theirs. Returns how many items fit and which
+    /// indicators to draw. Sizing the window without them pushed the row at
+    /// either end of a long list off the panel.
+    fn fit_window(&mut self, len: usize, height: usize) -> (usize, bool, bool) {
+        if len <= height || height < 3 {
+            self.ensure_visible(height.max(1));
+            if len <= height {
+                self.scroll_offset = 0;
+            }
+            return (height, false, false);
+        }
+        self.scroll_offset = self.scroll_offset.min(len - 1);
+        // Scrolling can switch an indicator on, which shrinks the window, which
+        // can need another scroll. Each pass only ever adds one, so it settles.
+        loop {
+            let up = self.scroll_offset > 0;
+            let mut cap = height - up as usize;
+            let down = self.scroll_offset + cap < len;
+            cap -= down as usize;
+            if (self.scroll_offset..self.scroll_offset + cap).contains(&self.selected)
+                || self.selected >= len
+            {
+                return (cap, up, down);
+            }
+            self.ensure_visible(cap);
+        }
+    }
+
     /// Ensure the selected item is visible within the viewport
     fn ensure_visible(&mut self, max_visible: usize) {
         if self.selected >= self.scroll_offset + max_visible {
@@ -224,17 +253,14 @@ pub fn render_list(
     state.settle_on_selectable(items);
 
     let max_vis = max_visible.unwrap_or(area.height as usize);
-    let effective_max = max_vis.min(area.height as usize);
-    state.ensure_visible(effective_max);
+    let height = max_vis.min(area.height as usize);
+    let (effective_max, can_scroll_up, can_scroll_down) = state.fit_window(items.len(), height);
 
     let visible_items: Vec<_> = items
         .iter()
         .skip(state.scroll_offset)
         .take(effective_max)
         .collect();
-
-    let can_scroll_up = state.scroll_offset > 0;
-    let can_scroll_down = state.scroll_offset + effective_max < items.len();
 
     let mut y = area.y;
 
@@ -468,6 +494,39 @@ mod tests {
             })
             .expect("draw");
         terminal.backend().buffer().clone()
+    }
+
+    fn draw_in(items: &[ListItem], state: &mut ListState, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, height)).expect("test terminal");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_list(f, area, items, state, true, None);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        (0..height).map(|y| text_at(&buf, y, 40)).collect()
+    }
+
+    /// The cursor's row is always on screen, whichever end of a long list it
+    /// is at. The "▲ N more" / "▼ N more" lines take rows of their own, and a
+    /// window sized without them pushed the last item below the panel.
+    #[test]
+    fn the_selected_row_is_drawn_at_every_position_of_a_long_list() {
+        let items: Vec<ListItem> = (0..12).map(|i| row(&format!("item-{:02}", i), RowStyle::Normal)).collect();
+        for height in [3u16, 4, 5, 8] {
+            let mut state = ListState::new();
+            for i in 0..items.len() {
+                state.selected = i;
+                let lines = draw_in(&items, &mut state, height);
+                let want = format!("› item-{:02}", i);
+                assert!(
+                    lines.iter().any(|l| l.starts_with(&want)),
+                    "height {}: row {} not drawn: {:?}", height, i, lines
+                );
+            }
+        }
     }
 
     fn fg_at(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> Color {
