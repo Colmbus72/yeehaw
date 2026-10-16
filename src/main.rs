@@ -10,19 +10,17 @@ mod hooks;
 mod issues;
 mod mcp_server;
 mod migrate;
-mod ranch;
 mod ranchhand_k8s;
 mod ranchhand_terraform;
 mod remote_grid;
 mod signals;
 mod ssh;
 mod store;
+mod sync;
 #[cfg(test)]
 mod testing;
 mod trails;
 mod tmux;
-mod tombstones;
-mod tunnel;
 mod types;
 mod update_check;
 mod vault;
@@ -109,8 +107,15 @@ fn handle_subcommands(args: &[String]) -> bool {
             handle_skills_subcommand(args);
             true
         }
-        Some("ranch") => {
-            handle_ranch_subcommand(args);
+        Some("brand") => {
+            handle_brand_subcommand(args);
+            true
+        }
+        Some("sync") => {
+            if let Err(e) = sync::engine::run_cli(&args[2..]) {
+                eprintln!("\x1b[31mError:\x1b[0m {}", e);
+                std::process::exit(1);
+            }
             true
         }
         Some("connect") => {
@@ -196,121 +201,38 @@ fn handle_skills_subcommand(args: &[String]) {
     }
 }
 
-fn handle_ranch_subcommand(args: &[String]) {
-    match ranch::parse_args(args) {
-        ranch::RanchCommand::Serve => {
-            // Not a `RanchCommand` field: `serve` is a verb, `--selftest` is a
-            // flag on it, and keeping the enum a plain description of the verb
-            // keeps `parse_args` free of flag handling.
-            let selftest = args.iter().any(|a| a == "--selftest");
-            if let Err(e) = ranch::serve(selftest) {
-                // stderr, never stdout: stdout is the protocol stream.
-                eprintln!("\x1b[31mError:\x1b[0m {}", e);
-                std::process::exit(1);
+/// `yeehaw brand <name>`: brand this machine as barn `<name>`, so livestock
+/// recorded here names a real barn rather than the synthetic `local`.
+fn handle_brand_subcommand(args: &[String]) {
+    let Some(name) = args.get(2) else {
+        println!("Usage: yeehaw brand <name>");
+        println!();
+        println!("Brand this machine as barn <name>: records it in barns/<name>.yaml and");
+        println!("pins every livestock that lives here to that barn.");
+        return;
+    };
+    // `{:#}`, not `{}`: `adopt_this_machine`'s refusals are the whole of the
+    // user's guidance — an unparseable project's path, or the barn that turns
+    // out to be some other machine. Plain `{}` renders only the outermost
+    // context and throws every one of them away.
+    match migrate::adopt_this_machine(name) {
+        Ok(report) => {
+            println!("This machine is now barn '{}'.", name);
+            if report.barn_created {
+                println!("  created barns/{}.yaml", name);
+            }
+            if report.livestock_reassigned > 0 {
+                println!(
+                    "  pinned {} livestock to '{}' across {} project(s)",
+                    report.livestock_reassigned,
+                    name,
+                    report.projects_touched.len()
+                );
             }
         }
-        ranch::RanchCommand::Init { name } => {
-            // `{:#}` throughout this arm, not `{}`: `ranch init` surfaces
-            // `migrate::adopt_this_machine`'s refusals, and those are the whole
-            // of the user's guidance — an unparseable project's path, or the
-            // barn that turns out to be some other machine. Plain `{}` renders
-            // only the outermost context and throws every one of them away.
-            match ranch::init(name) {
-                Ok(report) => {
-                    println!("This machine is now the Ranch House, as barn '{}'.", report.barn);
-                    if report.adoption.barn_created {
-                        println!("  created barns/{}.yaml", report.barn);
-                    }
-                    if report.adoption.livestock_reassigned > 0 {
-                        println!(
-                            "  pinned {} livestock to '{}' across {} project(s)",
-                            report.adoption.livestock_reassigned,
-                            report.barn,
-                            report.adoption.projects_touched.len()
-                        );
-                    }
-                    println!("  stamped {} entities and recorded a sync base for each", report.stamped);
-                    println!("  brand: {}", report.brand);
-                    println!("\nOn another machine, run: yeehaw ranch join <this machine>");
-                }
-                Err(e) => {
-                    eprintln!("\x1b[31mError:\x1b[0m {:#}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        ranch::RanchCommand::Join { target, name } => match ranch::join(&target, name) {
-            Ok(outcome) => {
-                // Before the apply lines, because it happened before them and
-                // because it is the one thing a join changes about *this*
-                // machine: the name came from the house's roster, not from this
-                // hostname, and every livestock here now names it.
-                // Before everything, and on its own line: the house handed this
-                // machine a record it already had. Almost always right — a barn
-                // made by hand in the TUI, finally running yeehaw — but the other
-                // reading is a mistyped `--as` merging this machine into a record
-                // that describes some other host, and only the user can tell
-                // which. Silence here is what would make that expensive.
-                if let Some(claimed) = &outcome.claimed_existing_barn {
-                    println!(
-                        "\nAdopted the existing barn '{}' — it had no brand, so this machine \
-                         has taken over that record rather than creating a second one.",
-                        claimed
-                    );
-                }
-                if let Some(adoption) = &outcome.adopted {
-                    if adoption.barn_created || adoption.livestock_reassigned > 0 {
-                        println!("\nThis machine is barn '{}' on that ranch.", outcome.barn);
-                        if adoption.barn_created {
-                            println!("  created barns/{}.yaml", outcome.barn);
-                        }
-                        if adoption.livestock_reassigned > 0 {
-                            println!(
-                                "  pinned {} livestock to '{}' across {} project(s)",
-                                adoption.livestock_reassigned,
-                                outcome.barn,
-                                adoption.projects_touched.len()
-                            );
-                        }
-                    }
-                }
-                match outcome.applied {
-                    Some(applied) => {
-                        println!(
-                            "\nJoined the ranch at '{}': {} written, {} deleted.",
-                            outcome.peer, applied.written, applied.deleted
-                        );
-                        if let Some(backup) = &outcome.backup {
-                            println!("  the ranch as it was: {}", backup.display());
-                        }
-                        if outcome.brand_pushed {
-                            println!("  this machine's brand is installed on '{}'", target);
-                        }
-                        for warning in &outcome.warnings {
-                            eprintln!("\x1b[33mWarning:\x1b[0m {}", warning);
-                        }
-                    }
-                    None => println!("\nNothing applied."),
-                }
-            }
-            Err(e) => {
-                eprintln!("\x1b[31mError:\x1b[0m {:#}", e);
-                std::process::exit(1);
-            }
-        },
-        ranch::RanchCommand::Status => {
-            eprintln!("\x1b[31mError:\x1b[0m `yeehaw ranch status` is not implemented yet");
+        Err(e) => {
+            eprintln!("\x1b[31mError:\x1b[0m {:#}", e);
             std::process::exit(1);
-        }
-        ranch::RanchCommand::Usage => {
-            println!("Usage:");
-            println!("  yeehaw ranch init [name]    Make this machine the Ranch House");
-            println!("  yeehaw ranch join <target> [--as <name>]");
-            println!("                              Join the ranch at <target> (user@host).");
-            println!("                              --as proposes what this machine is called;");
-            println!("                              the Ranch House has the final say.");
-            println!("  yeehaw ranch serve          Speak the sync protocol on stdio (run over ssh)");
-            println!("  yeehaw ranch status         Show this machine's ranch membership");
         }
     }
 }
@@ -535,6 +457,22 @@ mod tests {
             critters: vec![],
             ..Default::default()
         }
+    }
+
+    /// `yeehaw brand <name>` is the one way in to adoption: it has to leave this
+    /// machine named, with its own barn record.
+    #[test]
+    fn brand_names_this_machine_as_the_barn_given() {
+        let _ranch = testing::temp_ranch();
+        let args: Vec<String> = ["yeehaw", "brand", "imac"].iter().map(|s| s.to_string()).collect();
+
+        assert!(handle_subcommands(&args), "`brand` is not a subcommand");
+
+        assert_eq!(config::this_barn_name().as_deref(), Some("imac"));
+        assert!(
+            config::load_barns().iter().any(|b| b.name == "imac"),
+            "branding did not persist this machine's barn"
+        );
     }
 
     /// `yeehaw trail poll` drives a trail on the machine the checkout lives on,

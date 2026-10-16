@@ -139,7 +139,7 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
                     ("1-9", "Switch to a session on this machine"),
                     // Two namespaces, deliberately: a barn waking up must never
                     // renumber a local session under the user's fingers.
-                    ("A-Z", "Open a session on a barn"),
+                    ("A-Z", "Jump to a session on a connected barn"),
                 ],
             });
             groups.push(HotkeyGroup {
@@ -148,14 +148,10 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
                     ("c", "Open Claude / connect to barn"),
                     ("Ctrl+D", "Disconnect from barn"),
                     ("s", "SSH to barn / open shell"),
-                    // What puts a barn's sessions in the panel at all, and so
-                    // what makes A-Z mean anything.
-                    ("t", "Stream a barn's sessions"),
                     ("n", "Create new item"),
-                    // In the sessions panel `d` is not a delete at all: it
-                    // closes a viewer window, and refuses on every other row.
-                    ("d", "Delete item / close an open barn view"),
+                    ("d", "Delete item"),
                     ("v", "Live session grid"),
+                    ("Ctrl+S", "Sync with connected barns"),
                 ],
             });
             groups.push(HotkeyGroup {
@@ -353,7 +349,7 @@ mod tests {
     fn the_dashboard_help_names_both_session_namespaces() {
         let rows = screen("global", 120, 40);
         let text = rows.join("\n");
-        for key in ["1-9", "A-Z", "t"] {
+        for key in ["1-9", "A-Z"] {
             let needle = format!("{:>12}  ", key);
             assert!(
                 rows.iter().any(|r| r.contains(&needle)),

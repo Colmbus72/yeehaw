@@ -16,11 +16,8 @@ const BRAND_COLOR: Color = Color::Rgb(212, 160, 32);
 /// What the wizard headers put under "Barn: <name>": where this barn is
 /// reached.
 ///
-/// `ssh::dial_host`, not `barn.host`. A barn record that arrived from the
-/// machine it describes carries no `host` — that machine had nothing to dial
-/// itself with — only the addresses it advertised, and those are what ssh will
-/// actually use. Reading `host` here left every barn the ranch had just learned
-/// about, the Ranch House included, reporting its address as "unknown".
+/// `ssh::dial_host`, not `barn.host`, so a blank host reads as "unknown"
+/// exactly when ssh would refuse it.
 fn header_subtitle(barn: &Barn) -> &str {
     crate::ssh::dial_host(barn).unwrap_or("unknown")
 }
@@ -35,14 +32,7 @@ fn header_subtitle(barn: &Barn) -> &str {
 ///
 /// `is_local_barn`, not `barn_is_this_machine`: this asks whether the row is
 /// the synthetic placeholder, which has no host, no uuid and no file, so there
-/// is nothing to show but the word. The adopted self-barn *does* advertise
-/// somewhere it is reached, and wants the real subtitle.
-///
-/// And [`header_subtitle`], not `barn.host`: a barn record that arrived from
-/// the machine it describes carries no `host` — that machine had nothing to
-/// dial itself with — only the addresses it advertised, which are what ssh
-/// actually uses. Reading `host` left every such barn, the Ranch House
-/// included, reporting its address as "unknown".
+/// is nothing to show but the word.
 pub(crate) fn barn_subtitle(barn: &Barn) -> &str {
     if config::is_local_barn(barn) { "local" } else { header_subtitle(barn) }
 }
@@ -155,21 +145,10 @@ impl BarnContextView {
             connection_type: original.connection_type.clone(),
             connection_config: original.connection_config.clone(),
             connectable: original.connectable,
-            // Carried, every one of them, and deliberately NOT
-            // `..Default::default()`. This is an edit of an existing barn: a
-            // default here is not a default, it is a deletion. Dropping the
-            // identity would make the save look like a delete plus a create to
-            // anything that syncs on the uuid; dropping `brand` would revoke the
-            // barn's key from every `authorized_keys` the Ranch House manages;
-            // dropping `is_ranch_house` would leave the ranch with no house.
-            // Editing a host must not do any of that.
-            synced: original.synced,
-            tunneled: original.tunneled,
-            brand: original.brand.clone(),
-            is_ranch_house: original.is_ranch_house,
-            tunnel_port: original.tunnel_port,
-            last_seen: original.last_seen.clone(),
-            addresses: original.addresses.clone(),
+            // Carried, and deliberately NOT `..Default::default()`. This is an
+            // edit of an existing barn: a default here is not a default, it is a
+            // deletion. Dropping the identity would make the save look like a
+            // delete plus a create to anything that compares on the uuid.
             id: original.id.clone(),
             created_at: original.created_at.clone(),
             updated_at: original.updated_at.clone(),
@@ -519,27 +498,19 @@ impl BarnContextView {
 mod tests {
     use super::*;
 
-    /// Editing a barn's host must not revoke its ranch membership.
+    /// Editing a barn's host must not drop what the form does not edit.
     ///
-    /// `build_updated` rebuilds the whole struct from a literal, and the six
-    /// Slice D fields are not among the ones the form edits — so the only way
-    /// they survive is by being carried explicitly. The tempting shortening,
-    /// `..Default::default()`, is a silent `brand: None` / `is_ranch_house: None`
-    /// on every host edit: the barn's key would vanish from every
-    /// `authorized_keys` the Ranch House manages, and a ranch could lose its
-    /// house to someone fixing a typo in an IP address.
+    /// `build_updated` rebuilds the whole struct from a literal, so the only
+    /// way an unedited field survives is by being carried explicitly.
     #[test]
-    fn editing_a_host_preserves_the_barns_ranch_fields() {
+    fn editing_a_host_preserves_the_barns_other_fields() {
         let original = Barn {
             name: "pi".into(),
             host: Some("10.0.0.2".into()),
-            synced: Some(true),
-            brand: Some("ssh-ed25519 AAAAC3Nz yeehaw-ranch-pi".into()),
-            is_ranch_house: Some(true),
-            tunnel_port: Some(2222),
-            last_seen: Some("2026-09-10T09:00:00+00:00".into()),
-            addresses: vec!["pi.local".into(), "100.64.0.3".into()],
+            source: Some("ranchhand:cluster".into()),
+            connectable: Some(true),
             id: Some("3f0c1e8a-5f2b-4a55-9a3d-6d1c2b7e4f01".into()),
+            created_at: Some("2026-08-01T10:00:00+00:00".into()),
             ..Default::default()
         };
 
@@ -549,35 +520,10 @@ mod tests {
         let updated = view.build_updated(&original);
 
         assert_eq!(updated.host.as_deref(), Some("10.0.0.9"), "the edit must land");
-
-        assert_eq!(updated.synced, original.synced);
-        assert_eq!(updated.brand, original.brand, "a host edit must not revoke the barn's key");
-        assert_eq!(
-            updated.is_ranch_house, original.is_ranch_house,
-            "a host edit must not unseat the ranch house"
-        );
-        assert_eq!(updated.tunnel_port, original.tunnel_port);
-        assert_eq!(updated.last_seen, original.last_seen);
-        assert_eq!(updated.addresses, original.addresses);
-        assert_eq!(updated.id, original.id, "and the identity, as before");
-    }
-
-    /// A barn record that arrived from the machine it describes carries no
-    /// `host` — that machine had nothing to dial itself with — only the
-    /// addresses it advertised, which are what ssh will actually use. Reading
-    /// `barn.host` here left every such barn's detail page saying its address
-    /// was "unknown", including the Ranch House.
-    #[test]
-    fn a_self_advertised_barn_shows_where_it_will_be_dialled() {
-        let mut imac = Barn {
-            name: "camerons-imac".into(),
-            host: None,
-            user: Some("cam".into()),
-            ..Default::default()
-        };
-        imac.addresses = vec!["camerons-imac.local".into()];
-
-        assert_eq!(header_subtitle(&imac), "camerons-imac.local");
+        assert_eq!(updated.source, original.source);
+        assert_eq!(updated.connectable, original.connectable);
+        assert_eq!(updated.id, original.id, "a host edit must keep the identity");
+        assert_eq!(updated.created_at, original.created_at);
     }
 
     /// `host` still wins where there is one — an explicitly configured address
@@ -601,22 +547,19 @@ mod tests {
     ///
     /// `is_local_barn` is the right question *here* — it asks whether the row is
     /// the synthetic placeholder, which has no host, no uuid and no file, so
-    /// there is nothing to show but the word. Every other barn, the adopted
-    /// self-barn included, has somewhere it is reached and wants to say so.
+    /// there is nothing to show but the word.
     #[test]
     fn the_synthetic_placeholder_is_the_only_barn_that_reads_local() {
         let _ranch = crate::testing::temp_ranch();
         assert_eq!(barn_subtitle(&config::local_barn()), "local");
 
-        let mut imac = Barn { name: "camerons-imac".into(), host: None, ..Default::default() };
-        imac.addresses = vec!["camerons-imac.local".into()];
         crate::migrate::adopt_this_machine("camerons-imac").unwrap();
+        let imac = config::load_barns()
+            .into_iter()
+            .find(|b| b.name == "camerons-imac")
+            .expect("adoption persists the self-barn");
         assert!(!config::is_local_barn(&imac), "control: not the synthetic placeholder");
-        assert_eq!(
-            barn_subtitle(&imac),
-            "camerons-imac.local",
-            "a self-advertised barn knows where it is reached; it is not 'unknown'"
-        );
+        assert_ne!(barn_subtitle(&imac), "local", "only the placeholder reads 'local'");
     }
 
     /// A configured host still wins, and a barn with nowhere to dial still says

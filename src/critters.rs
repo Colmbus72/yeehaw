@@ -557,25 +557,16 @@ mod tests {
     /// This machine's own barn record, as critter discovery receives it after
     /// `migrate::adopt_this_machine`.
     ///
-    /// `addresses` is emptied on purpose, and the emptying is what makes the
-    /// tests below safe to run on a live ranch. That list holds what a *peer*
-    /// dials to reach this machine — `ssh::dial_host` falls back to it — so a
-    /// test that took the ssh branch by mistake would open a real ssh
-    /// connection to the developer's own machine and write its host key into
-    /// their `~/.ssh/known_hosts`. Emptied, the ssh branch has nothing to dial
-    /// and fails before spawning anything, which is what lets an assertion
-    /// about *which branch ran* mean something.
-    ///
-    /// The state is not invented: the live ranch's self-barn was exactly this —
-    /// `host: null`, no addresses — until `advertise_this_machine` was added.
+    /// Adoption writes it with no `host`, because you do not ssh to yourself,
+    /// so a test that took the ssh branch by mistake fails before spawning
+    /// anything — which is what lets an assertion about *which branch ran* mean
+    /// something.
     fn adopted_self_barn(name: &str) -> Barn {
         crate::migrate::adopt_this_machine(name).unwrap();
-        let mut barn = config::load_barns()
+        config::load_barns()
             .into_iter()
             .find(|b| b.name == name)
-            .expect("adoption mints this machine's record");
-        barn.addresses.clear();
-        barn
+            .expect("adoption mints this machine's record")
     }
 
     /// THE BUG. Critter discovery runs its probes through `run_command`, and

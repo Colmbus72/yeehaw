@@ -255,57 +255,6 @@ pub struct Barn {
     pub connection_config: Option<K8sBarnConnectionConfig>,
     pub connectable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub synced: Option<bool>,
-    /// Whether *this* machine wants the barn's sessions streamed into the
-    /// session grid.
-    ///
-    /// Machine-local, and `canonical::SHAPES` classifies it so. Wanting to see
-    /// a barn's sessions is a preference of the laptop in front of the user, not
-    /// a property of the barn — the same shape as `synced`. Synced, the Ranch
-    /// House's answer would arrive and switch a laptop's grid on or off behind
-    /// the user's back.
-    ///
-    /// `None` and `Some(false)` mean the same thing to the grid and are kept
-    /// apart for the same reason `synced` keeps them apart: never asked is not
-    /// the same answer as declined.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tunneled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub brand: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub is_ranch_house: Option<bool>,
-    /// The port this barn's reverse tunnel binds on the **Ranch House's**
-    /// loopback: the barn holds `ssh -N -R <tunnel_port>:localhost:22 <house>`,
-    /// and `ssh::route` turns that into
-    /// `ssh -J <house> -p <tunnel_port> <user>@localhost` for any machine that
-    /// has no direct address for the barn.
-    ///
-    /// **Content**, and `canonical::SHAPES` classifies it so — a reversal of
-    /// Slice D, which read it as the local end of a forward and made it
-    /// machine-local. The port is bound on one machine (the house) for one barn,
-    /// so there is a single answer per barn for the whole ranch and every machine
-    /// needs it in order to route. Contrast `tunneled` above, which stayed
-    /// machine-local: whether this laptop wants a barn's sessions and where to
-    /// fetch them from are different questions.
-    ///
-    /// Assigned by the house, once, at join time — `ranch::assign_tunnel_port`,
-    /// never by the machine itself: two machines choosing independently collide,
-    /// and one tunnel then silently shadows the other.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tunnel_port: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_seen: Option<String>,
-    /// DEVIATION from the Slice D plan's field list, which specifies
-    /// `#[serde(default)]` alone. `skip_serializing_if` is needed here for the
-    /// same reason the other five have it, and the plan's own stated reason: an
-    /// empty `Vec` is not `null`, so `render_mapping`'s drop-the-nulls rule does
-    /// not cover it, and a bare `#[serde(default)]` puts `addresses: []` into
-    /// every one of the existing barn files on first write *and* gives every barn
-    /// a different content hash from the one an older peer computes. Measured in
-    /// `canonical::tests::an_empty_address_list_hashes_the_same_as_a_peer_that_has_no_such_field`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub addresses: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
@@ -317,12 +266,11 @@ impl_identified!(Barn);
 
 /// An unconfigured barn: no name, no host, nothing enrolled.
 ///
-/// Exists so that adding a field to `Barn` is not a twenty-two-site edit —
-/// that is how many struct literals the six ranch fields broke. Listed
-/// exhaustively rather than `#[derive(Default)]` on purpose: the explicit
-/// literal is the tripwire, the same device `wire::WireTombstone`'s
-/// `From` impls use. A new field fails to compile *here*, which is where the
-/// question "what does an unconfigured barn say about this?" belongs.
+/// Exists so that adding a field to `Barn` is not a twenty-two-site edit.
+/// Listed exhaustively rather than `#[derive(Default)]` on purpose: the
+/// explicit literal is the tripwire. A new field fails to compile *here*, which
+/// is where the question "what does an unconfigured barn say about this?"
+/// belongs.
 ///
 /// ## `name` defaults to empty, and that is a hazard
 ///
@@ -335,11 +283,10 @@ impl_identified!(Barn);
 /// path is where every other malformed name — `/`, `..`, `\0` — is already
 /// caught, so there is one place to look.
 ///
-/// Two callers must **not** reach for this: `views::barn_context::build_updated`
-/// and `ranch::merge`'s `merge_content`. Both rebuild an *existing* barn, and
-/// defaulting a field there is not a default, it is a deletion — editing a
-/// host in the TUI would silently drop the barn's brand and its ranch-house
-/// flag.
+/// `views::barn_context::build_updated` must **not** reach for this: it
+/// rebuilds an *existing* barn, and defaulting a field there is not a default,
+/// it is a deletion — editing a host in the TUI would silently drop whatever
+/// the field held.
 impl Default for Barn {
     fn default() -> Self {
         Self {
@@ -357,13 +304,6 @@ impl Default for Barn {
             connection_type: None,
             connection_config: None,
             connectable: None,
-            synced: None,
-            tunneled: None,
-            brand: None,
-            is_ranch_house: None,
-            tunnel_port: None,
-            last_seen: None,
-            addresses: Vec::new(),
             id: None,
             created_at: None,
             updated_at: None,
@@ -598,6 +538,7 @@ pub enum AppView {
         source_barn: Option<Barn>,
     },
     SessionGrid,
+    Sync,
     Vault { source_pane: Option<String> },
 }
 
@@ -695,60 +636,48 @@ summary: The API
         assert!(p.updated_at.is_none());
     }
 
-    /// The six ranch fields Slice D adds to `Barn`, spelled as they appear in a
-    /// file. Listed once so the two tests below cannot drift apart.
-    const RANCH_FIELDS: [&str; 6] =
-        ["synced", "brand", "is_ranch_house", "tunnel_port", "last_seen", "addresses"];
+    /// Keys older builds wrote into barn files and this one no longer has a
+    /// field for. Real barn files on disk still carry them.
+    const RETIRED_BARN_KEYS: [&str; 7] =
+        ["synced", "brand", "is_ranch_house", "tunnel_port", "last_seen", "addresses", "tunneled"];
 
-    /// A barn file as the real ranch holds one today: a name, a host, and the
-    /// three identity fields Phase 1 stamped on.
-    const EXISTING_BARN_YAML: &str = "\
+    /// A barn file written by an older build, carrying every retired key.
+    const RETIRED_BARN_YAML: &str = "\
 name: imac
-host: 192.168.1.50
+host: imac.tail1234.ts.net
+user: cam
+synced: true
+brand: ssh-ed25519 AAAAC3Nz yeehaw-imac
+is_ranch_house: true
+tunnel_port: 23001
+last_seen: 2026-09-10T12:00:00+00:00
+addresses:
+- imac.local
+tunneled: true
 id: 3f0c1e8a-5f2b-4a55-9a3d-6d1c2b7e4f01
 created_at: 2026-08-01T10:00:00+00:00
 updated_at: 2026-09-01T10:00:00+00:00
 ";
 
-    /// Every barn file on the ranch predates the ranch fields. Loading one must
-    /// not require them, and must not invent values for them either: `synced`
-    /// defaulting to `Some(false)` would mark the whole ranch as deliberately
-    /// excluded from sync rather than as not-yet-enrolled.
+    /// Barns on disk were written while those keys existed. A barn that fails
+    /// to parse vanishes from every listing, so the retired keys must be
+    /// ignored rather than refused — no `deny_unknown_fields` on `Barn`.
     #[test]
-    fn an_existing_barn_file_loads_with_no_ranch_fields_set() {
-        let barn: Barn = serde_yaml::from_str(EXISTING_BARN_YAML).unwrap();
-
+    fn a_barn_file_carrying_retired_keys_still_loads() {
+        let barn: Barn = serde_yaml::from_str(RETIRED_BARN_YAML)
+            .expect("a barn file with retired keys must still parse");
         assert_eq!(barn.name, "imac");
-        assert_eq!(barn.host.as_deref(), Some("192.168.1.50"));
-        assert_eq!(barn.synced, None, "absent is not `false`; nothing has enrolled this barn");
-        assert_eq!(barn.brand, None);
-        assert_eq!(barn.is_ranch_house, None, "absent is not `not the ranch house`");
-        assert_eq!(barn.tunnel_port, None);
-        assert_eq!(barn.last_seen, None);
-        assert!(barn.addresses.is_empty(), "got {:?}", barn.addresses);
-    }
+        assert_eq!(barn.host.as_deref(), Some("imac.tail1234.ts.net"));
+        assert_eq!(barn.user.as_deref(), Some("cam"));
+        assert_eq!(barn.id.as_deref(), Some("3f0c1e8a-5f2b-4a55-9a3d-6d1c2b7e4f01"));
 
-    /// The one that protects the user's files. Every path that touches a barn
-    /// re-serializes the whole struct — `save_barn` at `config.rs:555` does, and
-    /// `stamp()` means even a no-op edit writes — so a field without
-    /// `skip_serializing_if` is six new lines on all eight of the real barn
-    /// files the first time anything is saved.
-    ///
-    /// It is not only noise. `canonical::render_mapping` drops null mapping
-    /// entries precisely so that a peer on an older build, which renders no key
-    /// at all, hashes the same as this build rendering `null` — so an emitted
-    /// key here is the difference between "nothing changed" and "every barn
-    /// changed" on a version-skewed sync.
-    #[test]
-    fn a_barn_with_no_ranch_fields_set_emits_none_of_them() {
-        let barn: Barn = serde_yaml::from_str(EXISTING_BARN_YAML).unwrap();
+        // And the next save writes them away rather than carrying them forward.
         let written = serde_yaml::to_string(&barn).unwrap();
-
-        for field in RANCH_FIELDS {
+        for key in RETIRED_BARN_KEYS {
             assert!(
-                !written.contains(&format!("{}:", field)),
-                "re-serializing an existing barn file added a `{}` key it never had:\n{}",
-                field,
+                !written.contains(&format!("{}:", key)),
+                "re-serializing kept the retired `{}` key:\n{}",
+                key,
                 written
             );
         }

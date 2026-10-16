@@ -149,17 +149,12 @@ pub fn lock_key(name: &str) -> String {
 
 /// `name` reduced to `[A-Za-z0-9_-]`, everything else collapsed to `_`.
 ///
-/// The one copy of a rule that used to be written out three times, byte for
-/// byte, in [`lock_key`], `tombstones::file_stem_for` and
-/// `ranch::base::file_stem_for`. All three want the same thing — a caller-
-/// supplied string reduced to something safe to put in a filename, with
-/// `Path::join` on `"../../escaped"` made structurally impossible rather than
-/// left to every call site to check.
+/// A caller-supplied string reduced to something safe to put in a filename,
+/// with `Path::join` on `"../../escaped"` made structurally impossible rather
+/// than left to every call site to check.
 ///
 /// The mapping is many-to-one and that is a property callers must reckon with,
-/// not a detail: see [`lock_key`] for what it means when two names share a lock,
-/// and `ranch::base::file_stem_for` for a caller that *refuses* an input this
-/// changes rather than accepting the collision.
+/// not a detail: see [`lock_key`] for what it means when two names share a lock.
 pub(crate) fn sanitized_stem(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })

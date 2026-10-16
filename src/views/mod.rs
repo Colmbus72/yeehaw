@@ -15,3 +15,4 @@ pub mod issues_view;
 pub mod ranchhand_detail;
 pub mod trail_view;
 pub mod vault_view;
+pub mod sync_view;

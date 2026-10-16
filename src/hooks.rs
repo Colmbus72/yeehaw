@@ -56,7 +56,7 @@ pub fn install_hook_script() -> anyhow::Result<PathBuf> {
     // This used to be `fs::write` + `set_permissions`, justified by being
     // reachable only from the one-shot `yeehaw hooks install`, where nothing
     // races the write. `ensure_config_dirs` now installs it too, so it runs on
-    // every process start — a TUI, an mcp-server and a `ranch serve` can be in
+    // every process start — a TUI, an mcp-server and a `yeehaw connect` can be in
     // here at once, and a claude hook firing in that window would exec a
     // half-written or non-executable file.
     crate::store::write_atomic_with_mode(&path, HOOK_SCRIPT_CONTENT.as_bytes(), 0o755)?;
@@ -200,7 +200,7 @@ mod tests {
     }
 
     /// The script is rewritten by whichever process starts first, and a TUI, an
-    /// mcp-server and a `ranch serve` can all be in here at once. Temp-then-
+    /// mcp-server and a `yeehaw connect` can all be in here at once. Temp-then-
     /// rename is what keeps a concurrent hook from exec'ing a partial file.
     #[test]
     fn reinstalling_leaves_no_window_where_the_hook_is_unusable() {

@@ -4,11 +4,11 @@
 //! entity the peer already has?* Byte comparison cannot answer it, and neither
 //! can a hash of the file's bytes:
 //!
-//! - Almost nothing carries `skip_serializing_if` — the three `Identified`
-//!   fields on every kind, and the six ranch fields Slice D added to `Barn`.
-//!   Every *other* `Option` on `Barn`, `Project`, `Livestock` and `Critter`
-//!   serializes as an explicit `null`, so a hand-written four-line barn file
-//!   comes back from a round trip as fourteen lines with identical meaning.
+//! - Almost nothing carries `skip_serializing_if` — only the three `Identified`
+//!   fields on every kind. Every *other* `Option` on `Barn`, `Project`,
+//!   `Livestock` and `Critter` serializes as an explicit `null`, so a
+//!   hand-written four-line barn file comes back from a round trip as a dozen
+//!   lines with identical meaning.
 //! - `Trail.env`, `TrailJob.env` and `TrailStep.env` are `HashMap`s. `std`'s
 //!   `RandomState` reseeds per map instance, so two
 //!   round trips of an unchanged trail iterate their keys in different orders
@@ -24,11 +24,11 @@
 //!
 //! `Identified::stamp()` runs on *every* save and advances `updated_at`. If
 //! that fed the hash, an entity re-saved with no edits would hash differently
-//! from the copy the peer holds, every save would look like a change, and every
-//! sync would ship the entire ranch. `id` and `created_at` come out for the
-//! same reason from the other direction: on a first join the two machines minted
-//! their uuids independently, so identity is exactly what has *not* got to
-//! match for two records to be the same thing.
+//! from the copy the peer holds and every save would look like a change. `id`
+//! and `created_at` come out for the same reason from the other direction: two
+//! machines that created the same record by hand minted their uuids
+//! independently, so identity is exactly what has *not* got to match for two
+//! records to be the same thing.
 //!
 //! ## Why nulls are dropped
 //!
@@ -39,87 +39,48 @@
 //! Dropping nulls keeps the two hashes equal, so a version skew does not present
 //! as "every barn changed".
 //!
-//! Slice D's six fields took the belt-and-braces route instead and carry
-//! `skip_serializing_if`, so this build renders no key either. That is not
-//! redundant with the rule here, and one of the six proves it: an empty
-//! `Vec` is not a null, so `addresses: []` survives canonicalization and would
-//! have hashed differently from an older peer's absent key. Dropping nulls does
-//! not cover empty collections — `tests::an_empty_address_list_hashes_the_same_as_a_peer_that_has_no_such_field`
-//! is the measurement, and `Vec::is_empty` on the field is the fix. Teaching the
-//! canonicalizer to drop empty sequences instead would change every existing
-//! hash and would have to answer for `critters: []`, `livestock: []` and
-//! `wiki: []` too.
+//! Dropping nulls does not cover empty collections, and deliberately so: teaching
+//! the canonicalizer to drop empty sequences would change every existing hash and
+//! would have to answer for `critters: []`, `livestock: []` and `wiki: []`. A new
+//! `Vec` field that older peers lack wants `skip_serializing_if = "Vec::is_empty"`
+//! instead.
 //!
 //! ## Identity is a special case of "machine-local bookkeeping is not content"
 //!
 //! The argument above is not really about identity. It is about *fields whose
 //! value is a verdict about the machine holding the file*. Such a field differs
-//! between two machines that hold the very same entity, and the sync has no way
-//! to reconcile it: it is not a change either side made, so neither side may
-//! win, and the merge's "changed on both → conflict" rule fires on it forever.
+//! between two machines that hold the very same entity, and it is not a change
+//! either side made, so a comparison that counted it would report a difference
+//! that can never be resolved.
 //!
-//! Seven such fields exist beyond the identity three, and they are not the same
-//! for every kind. Four predate Slice D:
+//! Six such fields exist beyond the identity three, and they are not the same
+//! for every kind:
 //!
 //! - **`Project.path`** — where the project's checkout lives on *this* machine.
-//!   The design's Decisions section already rejects "syncing filesystem paths
-//!   verbatim, which breaks the moment a Linux Pi joins", and the Layer 3 merge
-//!   table lists no `path` among the project scalars. The Ranch House's
-//!   `/Users/cam/Sites/api` and a Pi's `/home/cam/api` are two machines' answers
-//!   to a local question, not a disagreement about the project: hashed, every
-//!   project reads as changed on both sides on every sync, and the side that
-//!   loses can no longer `expand_path(&project.path)` into anything that exists —
-//!   `app.rs:815` and `app.rs:1011` both stop being able to open a session for
-//!   it.
+//!   `/Users/cam/Sites/api` on one machine and `/home/cam/api` on a Pi are two
+//!   machines' answers to a local question, not a disagreement about the
+//!   project: hashed, every project reads as different on every comparison, and
+//!   a copy that took the other side's path could no longer
+//!   `expand_path(&project.path)` into anything that exists.
 //! - **`Barn.connectable`** — a per-machine reachability verdict, written by
 //!   discovery (`ranchhand_k8s`, `ranchhand_terraform`) and by
 //!   `migrate::adopt_this_machine`. It is not decorative: `connect.rs` and
 //!   `app.rs` both *hard refuse* a barn marked `Some(false)`. If it fed the
-//!   hash, a Ranch House that cannot reach a barn would push `Some(false)` over
+//!   hash, a machine that cannot reach a barn would offer its `Some(false)` over
 //!   a peer's `Some(true)` and the user would lose the ability to connect to a
 //!   host they can demonstrably reach.
+//! - **`Barn.identity_file`** — a key path under *this* machine's `~/.ssh`.
+//! - **`Worm.working_dir`** — a directory on *this* machine, as `Project.path`.
 //! - **`RanchHand.last_sync`** — `Utc::now()`, written by
 //!   `config::update_ranchhand_last_sync` on every ranch-hand sync. It differs
-//!   on both sides essentially always, so if it fed the hash every ranch hand
-//!   would be "changed on both" and conflict on every sync, forever.
+//!   on both sides essentially always.
 //! - **`RanchHand.config`** — untyped YAML holding a `kubeconfig_path` or an S3
-//!   reference. The merge design already calls it machine-local and gives the
-//!   local value an unconditional win. A field the merge refuses to take from a
-//!   peer must not be allowed to *say* the entity changed either: it would make
-//!   every differently-configured ranch hand a permanent conflict, and the
-//!   "remote changed, we did not" branch would clobber the local kubeconfig
-//!   path with the peer's.
-//!
-//! The ranch slices added three more, all on `barn`, and all argued at the point
-//! of classification rather than here — see the comments in [`SHAPES`]:
-//!
-//! - **`Barn.last_seen`** — `RanchHand.last_sync` under another name. Written on
-//!   every reachability check, so two machines holding the same barn never agree.
-//! - **`Barn.synced`** — whether *this* machine syncs the barn. Enrolment is a
-//!   relationship, not a property of the barn, and a peer's `Some(false)` landing
-//!   here would switch off a sync this machine is actively running.
-//! - **`Barn.tunneled`** — whether *this* machine wants the barn's sessions on
-//!   its own grid. A preference of the laptop in front of the user, and two
-//!   machines can hold opposite ones without either being wrong.
-//!
-//! The other four ranch fields — `brand`, `is_ranch_house`, `addresses` and
-//! `tunnel_port` — are content, and have to be: each exists in order to reach
-//! the other machine.
-//!
-//! `tunnel_port` is the one that changed sides. Slice D classified it
-//! machine-local as "a port forwarded on *this* machine", and recorded in
-//! [`SHAPES`] the condition for re-opening it: if the field ever meant the port
-//! a *reverse* tunnel binds rather than the local end of a forward, it would be
-//! a property of the barn. Slice E made it exactly that — the barn runs
-//! `ssh -N -R <port>:localhost:22 <house>`, so the port is bound on the Ranch
-//! House's loopback, there is one answer per barn for the whole ranch, and every
-//! machine needs it to build `ssh -J <house> -p <port> <user>@localhost`. See
-//! [`SHAPES`] and `ranch::assign_tunnel_port`.
+//!   reference, which only means something on the machine that wrote it.
 //!
 //! So the not-content list is **per kind**, not flat: identity applies to all
-//! five, `path` only to `project`, `connectable`/`last_seen`/`synced`/
-//! `tunneled` only to `barn`, `last_sync` and `config` only to `ranchhand`.
-//! See [`SHAPES`].
+//! five, `path` only to `project`, `connectable` and `identity_file` only to
+//! `barn`, `working_dir` only to `worm`, `last_sync` and `config` only to
+//! `ranchhand`. See [`SHAPES`].
 //!
 //! ## Adding a field is a decision, not a default
 //!
@@ -129,28 +90,15 @@
 //! kind and fails when a key appears in neither list, so a new field cannot join
 //! the hash by default. It has to be classified on the way in.
 //!
-//! ### What Slice D found out about that guard
-//!
-//! The prediction here was that Slice D's six fields would trip the test. They
-//! did not — **one of six did**, and only because it had not yet been given its
-//! `skip_serializing_if`. The hole documented right below this paragraph was the
-//! reason, and the two halves of this note had never been read against each
-//! other: a field carrying `skip_serializing_if` renders no key, so a minimally
-//! populated instance makes it invisible to *both* directions of the check.
-//! Measured: with all six attributes in place and none of the six classified,
-//! the whole suite was green, `last_seen` included.
-//!
-//! So `barn`'s keys now come from an exhaustively populated struct literal
-//! (`tests::every_barn_field_set`) rather than from a terse YAML fixture. The
-//! literal is the tripwire: a new field on `Barn` fails to compile there, and
-//! the only way to satisfy it is to give the field a value — at which point the
-//! classification check sees it. The verdicts the six reached, argued in
-//! [`SHAPES`] rather than here, were the ones this note predicted.
-//!
-//! The hole that remains: the other four kinds are still read from YAML
-//! fixtures, which is sound only because the identity three are still the only
-//! fields they skip, and those are classified by name. Give any of them a
-//! `skip_serializing_if` field and it needs the same treatment.
+//! A field carrying `skip_serializing_if` renders no key when unset, so a
+//! minimally populated instance makes it invisible to *both* directions of that
+//! check. `barn`'s keys therefore come from an exhaustively populated struct
+//! literal (`tests::every_barn_field_set`) rather than from a terse YAML
+//! fixture: a new field on `Barn` fails to compile there, and the only way to
+//! satisfy it is to give the field a value — at which point the classification
+//! check sees it. The other four kinds are still read from YAML fixtures, which
+//! is sound only because the identity three are the only fields they skip, and
+//! those are classified by name.
 //!
 //! ## The `source` audit
 //!
@@ -170,29 +118,16 @@
 //!   is answered by `config.this_barn` through `config::barn_is_this_machine`,
 //!   by name — so it is inert today, while excluding the whole field to
 //!   neutralize it would also stop the ranch-hand provenance tag propagating,
-//!   which is genuinely shared. Verdict: content. Slice D's `is_ranch_house` and
-//!   `brand` are what should carry the meaning `"self"` is gesturing at, and
-//!   `"self"` should stop being written once they land.
+//!   which is genuinely shared. Verdict: content.
 //!
-//! ## Order is content here, so a unioned collection owes us an order
+//! ## Order is content here
 //!
 //! Sequences keep their order (see [`render`]): `TrailStep`s in a job and
 //! `WikiSection`s in a wiki are order-significant, and sorting them would make
-//! two genuinely different trails hash alike.
-//!
-//! That is correct, and it puts an obligation on the merge. Slice C *unions*
-//! `Project.livestock`, `Project.herds`, `Project.wiki`, `Barn.critters` and the
-//! `Herd` member lists. Union is a set operation and has no inherent order, so
-//! if A's union yields `[x, y]` and B's yields `[y, x]`, the two sides agree
-//! under the merge's key model and disagree under this hash — each sees the
-//! other as changed, on every sync, forever.
-//!
-//! **Any collection the merge unions must be emitted by the merge in a
-//! deterministic order** (sort by the same key the union deduplicates on).
-//! Do not fix this by blanket-sorting sequences here: that would break trail
-//! steps, where order is the program.
+//! two genuinely different trails hash alike. Do not blanket-sort sequences
+//! here: that would break trail steps, where order is the program.
 
-#![allow(dead_code)] // Wired up in Slice C/E.
+#![allow(dead_code)] // Consumed by the sync view.
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
@@ -227,41 +162,14 @@ pub struct KindShape {
 pub const SHAPES: [KindShape; 5] = [
     KindShape {
         kind: "barn",
-        machine_local: &[
-            "connectable",
-            // `Utc::now()` on every reachability check. This is
-            // `RanchHand.last_sync` with a different name: two machines probe at
-            // different moments, so they essentially never agree, and hashing it
-            // makes every barn "changed on both" and therefore a conflict, on
-            // every sync, forever. It is also a verdict about *this* machine's
-            // reach, like `connectable` — "when did I last see it", not "when was
-            // it last seen".
-            "last_seen",
-            // Whether *this* machine syncs this barn. The barn is not
-            // intrinsically synced or not; enrolment is a relationship, and the
-            // Ranch House having enrolled a barn says nothing about whether a
-            // laptop has. Hashed, the two sides disagree and conflict forever on
-            // a field neither is wrong about — and the merge's "they changed it,
-            // we did not" branch would then push `Some(false)` onto a machine
-            // that is actively syncing, switching its sync off. Same shape of
-            // loss as `connectable`.
-            "synced",
-            // Whether this machine wants the barn's sessions on its own session
-            // grid. `synced` one line up with a different question: a preference
-            // held by the laptop in front of the user, not a property of the
-            // barn, and two machines can hold opposite ones without either being
-            // wrong. Hashed, that is a permanent conflict — and the merge's
-            // "they changed it, we did not" branch would push a peer's
-            // `Some(false)` onto a machine that is actively streaming, emptying
-            // its grid.
-            "tunneled",
-        ],
+        // `identity_file` is a key under this machine's `~/.ssh`: another
+        // machine's path to its own key means nothing here.
+        machine_local: &["connectable", "identity_file"],
         content: &[
             "name",
             "host",
             "user",
             "port",
-            "identity_file",
             "critters",
             // Provenance, and shared. See "The `source` audit" in the
             // module docs — this is the one field on `Barn` where the verdict
@@ -269,66 +177,13 @@ pub const SHAPES: [KindShape; 5] = [
             "source",
             "connection_type",
             "connection_config",
-            // The barn's ed25519 *public* half, and the private half is not on
-            // this struct at all. Its entire purpose is to circulate: the Ranch
-            // House writes it into every other barn's `authorized_keys`. Strip it
-            // from the hash and it never propagates, and Task D3 has nothing to
-            // write. Identical on every machine that holds the record, so it
-            // cannot conflict.
-            "brand",
-            // There is exactly one Ranch House per ranch and every machine has to
-            // agree which barn it is — the merge's own tie-break is "the house
-            // wins", so a per-machine answer would mean two machines disagreeing
-            // about who arbitrates. It also has to travel: a third machine
-            // joining via a peer learns who the house is only if this propagates.
-            "is_ranch_house",
-            // Where the barn can be reached. The closest call of the six, because
-            // `Project.path` is machine-local for a superficially similar reason
-            // — but a path is one machine's filesystem layout, whereas an address
-            // is something the *barn* has. Which address works is per-machine;
-            // the list is not.
-            //
-            // The risk runs the other way too and is bounded: an address one
-            // machine can use and another cannot costs a connect timeout, not a
-            // lost host, because this is a union rather than a scalar. Contrast
-            // `connectable`, where a wrong value is a hard refusal — that
-            // asymmetry is the whole reason the verdicts differ.
-            //
-            // Being unioned, it owes this hash a deterministic order; see the
-            // module docs' last section. `merge::merge_addresses` pays that debt.
-            "addresses",
-            // RECLASSIFIED, Slice E. This was `machine_local`, justified as "a
-            // port forwarded on *this* machine — what is free on the iMac is
-            // taken on the Pi", with the caveat recorded right here: *re-open it
-            // if the field ever means the port a reverse tunnel binds rather
-            // than the local end of a forward.* It does now, so it moved.
-            //
-            // The barn holds `ssh -N -R <port>:localhost:22 <house>`, which
-            // binds `<port>` on the **Ranch House's** loopback. So the port is
-            // not a fact about the machine holding the file at all — it is one
-            // number, chosen once by the house (`ranch::assign_tunnel_port`),
-            // unique across the ranch, and every machine needs it in order to
-            // route: `ssh::route` turns it into
-            // `-J <house> -p <port> <user>@localhost`. Stripped from the hash it
-            // never propagates and no peer can reach the barn — the same failure
-            // `brand` would have if it were stripped.
-            //
-            // Contrast `tunneled` one entry up, which stayed machine-local: that
-            // is whether *this* laptop wants the barn on its grid. Wanting the
-            // sessions and knowing where to get them are different questions.
-            "tunnel_port",
         ],
     },
     KindShape {
         kind: "project",
-        // Where the checkout lives on *this* machine. The design rejected
-        // "syncing filesystem paths verbatim, which breaks the moment a Linux Pi
-        // joins", and the Layer 3 table lists no `path` among the project
-        // scalars — so the Ranch House's `/Users/cam/Sites/api` and a Pi's
-        // `/home/cam/api` are two machines' answers to a local question, not a
-        // disagreement about the project. Hashed, every project would read as
-        // changed on both sides on every sync, and the side that lost could no
-        // longer `expand_path(&project.path)` into anything that exists.
+        // Where the checkout lives on *this* machine: `/Users/cam/Sites/api`
+        // here and `/home/cam/api` on a Pi are two machines' answers to a local
+        // question, not a disagreement about the project.
         machine_local: &["path"],
         content: &[
             "name",
@@ -355,8 +210,9 @@ pub const SHAPES: [KindShape; 5] = [
     },
     KindShape {
         kind: "worm",
-        machine_local: &[],
-        content: &["name", "command", "schedule", "type", "enabled", "project", "working_dir"],
+        // A directory on this machine, like `project.path`.
+        machine_local: &["working_dir"],
+        content: &["name", "command", "schedule", "type", "enabled", "project"],
     },
 ];
 
@@ -532,8 +388,8 @@ mod tests {
     /// A `Barn` with **every** field populated, so that nothing is hidden by a
     /// `skip_serializing_if`.
     ///
-    /// Six of `Barn`'s nineteen fields render no key when unset, which makes a
-    /// minimally-populated instance invisible to
+    /// A field that renders no key when unset makes a minimally-populated
+    /// instance invisible to
     /// `every_top_level_field_is_classified_as_content_or_not` — the one test
     /// standing between a new field and the content hash.
     ///
@@ -558,13 +414,6 @@ mod tests {
                 node: "pi".into(),
             }),
             connectable: Some(true),
-            synced: Some(true),
-            tunneled: Some(true),
-            brand: Some("ssh-ed25519 AAAAC3Nz... yeehaw-ranch-pi".into()),
-            is_ranch_house: Some(false),
-            tunnel_port: Some(2222),
-            last_seen: Some("2026-09-10T12:00:00+00:00".into()),
-            addresses: vec!["pi.local".into()],
             id: Some("3f0c1e8a-5f2b-4a55-9a3d-6d1c2b7e4f01".into()),
             created_at: Some("2026-08-01T10:00:00+00:00".into()),
             updated_at: Some("2026-09-01T10:00:00+00:00".into()),
@@ -634,14 +483,14 @@ mod tests {
         }
     }
 
-    /// Finding 2, from both directions.
+    /// Null versus absent, from both directions.
     ///
     /// The first half — two `Barn`s parsed from a terse and a verbose file —
     /// documents the property but cannot fail: both texts parse to the same
     /// struct, so both serialize identically whatever the canonicalizer does.
     /// The second half is the one with teeth, and it is also the real case:
-    /// after Slice D adds fields to `Barn`, a peer on an older build renders a
-    /// barn without those keys while this build renders them as null.
+    /// after a field is added to `Barn`, a peer on an older build renders a
+    /// barn without that key while this build renders it as null.
     #[test]
     fn hash_ignores_explicit_null_versus_absent() {
         let terse: Barn = serde_yaml::from_str("name: pi\nhost: pi.local\n").unwrap();
@@ -651,10 +500,10 @@ mod tests {
         .unwrap();
         assert_eq!(hash_entity("barn", &terse).unwrap(), hash_entity("barn", &verbose).unwrap());
 
-        // A peer that has never heard of `synced` versus one that has it unset.
+        // A peer that has never heard of `connectable` versus one that has it unset.
         let older: Value = serde_yaml::from_str("name: pi\nhost: pi.local\n").unwrap();
         let newer: Value =
-            serde_yaml::from_str("name: pi\nhost: pi.local\nsynced: null\nbrand: null\n").unwrap();
+            serde_yaml::from_str("name: pi\nhost: pi.local\nconnectable: null\n").unwrap();
         assert_eq!(
             hash_entity("barn", &older).unwrap(),
             hash_entity("barn", &newer).unwrap(),
@@ -662,64 +511,10 @@ mod tests {
         );
     }
 
-    /// The same version-skew property as above, for the one Slice D field that
-    /// is not an `Option` — and it does not follow from that test, because
-    /// [`render_mapping`] drops *nulls*, not empty collections.
-    ///
-    /// A build without the ranch fields serializes a barn with no `addresses`
-    /// key at all. This build, given `#[serde(default)]` alone, serializes the
-    /// very same barn with `addresses: []` — one extra mapping entry, a
-    /// different canonical form, a different hash. Every barn on the ranch then
-    /// reads as changed to an older peer, which is precisely the failure
-    /// `hash_ignores_explicit_null_versus_absent` exists to prevent and cannot
-    /// catch here.
-    ///
-    /// Hashing the real `Barn` against a hand-built `Value` rather than two
-    /// `Value`s is what gives this teeth: the `Value` is the older peer's output,
-    /// and the struct is ours, so the comparison is the one that happens on the
-    /// wire. Fixed by `skip_serializing_if = "Vec::is_empty"` on the field, not
-    /// by teaching the canonicalizer to drop empty sequences — that would change
-    /// every existing hash and would have to answer for `critters: []`,
-    /// `livestock: []` and `wiki: []` as well.
-    #[test]
-    fn an_empty_address_list_hashes_the_same_as_a_peer_that_has_no_such_field() {
-        // Every key a build *without* the ranch fields serializes for this barn,
-        // nulls and empty collections included. Spelled out rather than reusing
-        // the terse two-line fixture: `critters: []` is an empty sequence, which
-        // survives canonicalization exactly like `addresses: []` would, so a
-        // short fixture here would fail for a reason that has nothing to do with
-        // the field under test.
-        let older: Value = serde_yaml::from_str(
-            "name: pi\nhost: pi.local\nuser: null\nport: null\nidentity_file: null\n\
-             critters: []\nsource: null\nconnection_type: null\nconnection_config: null\n\
-             connectable: null\n",
-        )
-        .unwrap();
-        let ours: Barn = serde_yaml::from_str("name: pi\nhost: pi.local\n").unwrap();
-        assert!(ours.addresses.is_empty(), "the fixture must leave the list unset");
-
-        assert_eq!(
-            hash_entity("barn", &older).unwrap(),
-            hash_entity("barn", &ours).unwrap(),
-            "a barn with no addresses must hash as it did before the field existed, or a \
-             version-skewed sync reports every barn on the ranch as changed"
-        );
-
-        // And the field is not inert: a real address still has to move the hash,
-        // or classifying it as content would mean nothing.
-        let mut with_one = ours.clone();
-        with_one.addresses = vec!["100.64.0.3".into()];
-        assert_ne!(
-            hash_entity("barn", &ours).unwrap(),
-            hash_entity("barn", &with_one).unwrap(),
-            "an address the peer does not have is a real difference"
-        );
-    }
-
-    /// The one that matters most. Phase 1 stamps on every save, so an entity
-    /// re-saved with no edits carries a fresh `updated_at`. If identity fed the
-    /// hash, every save would look like an edit and every sync would ship the
-    /// whole ranch.
+    /// The one that matters most. `Identified::stamp` runs on every save, so an
+    /// entity re-saved with no edits carries a fresh `updated_at`. If identity
+    /// fed the hash, every save would look like an edit and every entity would
+    /// read as different from the peer's copy.
     #[test]
     fn hash_ignores_the_identity_fields_but_notices_content() {
         let mut a: Project = serde_yaml::from_str("name: api\npath: /tmp\n").unwrap();
@@ -780,11 +575,11 @@ mod tests {
         );
     }
 
-    // ---- C1: machine-local bookkeeping is not content ----------------------
+    // ---- machine-local bookkeeping is not content ---------------------------
 
     /// The field with teeth. `connect.rs:77` and `app.rs:1432` both *refuse* a
     /// barn marked `Some(false)`, and the mark is a verdict about the machine
-    /// that made it. If it fed the hash it would sync, and a Ranch House that
+    /// that made it. If it fed the hash it would sync, and a machine that
     /// cannot reach a barn would push its `Some(false)` over a peer's
     /// `Some(true)` — leaving the user unable to connect to a host they can
     /// demonstrably reach.
@@ -809,145 +604,36 @@ mod tests {
         );
     }
 
-    // ---- D1: the six ranch fields ------------------------------------------
-
-    /// The one with teeth, and the reason the classification guard exists.
-    ///
-    /// `last_seen` is written on every reachability check, so two machines that
-    /// hold the very same barn essentially never agree on it. As content it makes
-    /// every barn read as edited on every sync — "changed on both sides", so a
-    /// conflict, so a prompt, forever — which is exactly the
-    /// `RanchHand.last_sync` failure one struct over. It is also a verdict about
-    /// *this* machine's reach, like `connectable`: "when did I last see it", not
-    /// "when was it last seen".
+    /// `identity_file` is a key under *this* machine's `~/.ssh`. The Pi's
+    /// `/home/pi/.ssh/id_ed25519` is no answer for the iMac, and hashed, it
+    /// would flag every barn as different and push one machine's key path over
+    /// the other's.
     #[test]
-    fn a_barns_last_seen_is_not_content() {
+    fn a_barns_identity_file_is_not_content() {
         let mut here: Barn = parse(BARN_YAML);
         let mut there = here.clone();
-        here.last_seen = Some("2026-09-10T09:00:00+00:00".into());
-        there.last_seen = Some("2026-09-10T09:00:01+00:00".into());
-
+        here.identity_file = Some("/Users/cam/.ssh/id_ed25519".into());
+        there.identity_file = Some("/home/pi/.ssh/id_rsa".into());
         assert_eq!(
             hash_entity("barn", &here).unwrap(),
             hash_entity("barn", &there).unwrap(),
-            "`last_seen` moves on every reachability check; hashing it conflicts every barn on \
-             every sync — the `RanchHand.last_sync` bug again"
-        );
-
-        there.host = Some("pi2.local".into());
-        assert_ne!(
-            hash_entity("barn", &here).unwrap(),
-            hash_entity("barn", &there).unwrap(),
-            "a real content change to a barn must still move the hash"
+            "`identity_file` is a path on this machine, not content"
         );
     }
 
-    /// Enrolment is a relationship, not a property of the barn. The Ranch House
-    /// having enrolled a barn says nothing about whether a laptop has, so the two
-    /// sides disagree permanently on a field neither is wrong about — and the
-    /// merge's "they changed it, we did not" branch would then push `Some(false)`
-    /// onto a machine that is actively syncing, switching its sync off. Same
-    /// shape of loss as `connectable`.
+    /// A worm's `working_dir` is a directory on this machine, like a project's
+    /// `path`.
     #[test]
-    fn whether_this_machine_syncs_a_barn_is_not_content() {
-        let mut here: Barn = parse(BARN_YAML);
+    fn a_worms_working_dir_is_not_content() {
+        let mut here: Worm = parse(WORM_YAML);
         let mut there = here.clone();
-        here.synced = Some(true);
-        there.synced = Some(false);
-
+        here.working_dir = Some("/Users/cam/Sites/api".into());
+        there.working_dir = Some("/home/cam/api".into());
         assert_eq!(
-            hash_entity("barn", &here).unwrap(),
-            hash_entity("barn", &there).unwrap(),
-            "`synced` is this machine's relationship to the barn, not the barn's own state"
+            hash_entity("worm", &here).unwrap(),
+            hash_entity("worm", &there).unwrap(),
+            "`working_dir` is a path on this machine, not content"
         );
-    }
-
-    /// Whether this laptop wants a barn's sessions on its grid is a preference
-    /// of the machine in front of the user, not a property of the barn — the
-    /// same shape as `synced`. Hashed, the two sides disagree permanently on a
-    /// field neither is wrong about, and the merge's "they changed it, we did
-    /// not" branch would then push a peer's `Some(false)` onto a machine that is
-    /// actively streaming, emptying its grid.
-    #[test]
-    fn whether_this_machine_tunnels_to_a_barn_is_not_content() {
-        let mut here: Barn = parse(BARN_YAML);
-        let mut there = here.clone();
-        here.tunneled = Some(true);
-        there.tunneled = Some(false);
-
-        assert_eq!(
-            hash_entity("barn", &here).unwrap(),
-            hash_entity("barn", &there).unwrap(),
-            "`tunneled` is this machine's preference about the barn, not the barn's own state"
-        );
-
-        there.host = Some("pi2.local".into());
-        assert_ne!(
-            hash_entity("barn", &here).unwrap(),
-            hash_entity("barn", &there).unwrap(),
-            "a real content change to a barn must still move the hash"
-        );
-    }
-
-    /// DELIBERATE REVERSAL. This test used to be
-    /// `a_barns_local_tunnel_port_is_not_content`, asserting the two hashes
-    /// *equal* on the grounds that "whatever is free on the iMac is taken on the
-    /// Pi". That was the **local-forward** reading of the field, and [`SHAPES`]
-    /// recorded the condition for re-opening it: *if the field ever means the
-    /// port a reverse tunnel binds, it is a property of the barn.* It does now.
-    ///
-    /// The port is bound on the **Ranch House's** loopback by the barn's own
-    /// `ssh -N -R <port>:localhost:22 <house>`, so there is exactly one answer
-    /// per barn for the whole ranch, and every machine needs it: `ssh::route`
-    /// builds `-J <house> -p <port> <user>@localhost` out of it. Stripped from
-    /// the hash it never propagates, and a peer that cannot learn barn X's port
-    /// cannot reach barn X at all.
-    #[test]
-    fn a_barns_tunnel_port_is_content() {
-        let mut here: Barn = parse(BARN_YAML);
-        let mut there = here.clone();
-        here.tunnel_port = Some(23000);
-        there.tunnel_port = Some(23001);
-
-        assert_ne!(
-            hash_entity("barn", &here).unwrap(),
-            hash_entity("barn", &there).unwrap(),
-            "the house binds one port per barn, so two ports are two different barns — \
-             a hash that cannot tell them apart never ships the port to a peer"
-        );
-    }
-
-    /// The other direction, and just as load-bearing: these three have to reach
-    /// the peer, so they must be in the hash or the sync never notices they
-    /// differ and never ships them.
-    ///
-    /// - `brand` is the barn's ed25519 public half. Task D3 writes it into every
-    ///   other barn's `authorized_keys`; a brand that does not propagate is a
-    ///   managed block with nothing in it.
-    /// - `is_ranch_house` has to travel or a third machine joining via a peer
-    ///   never learns who arbitrates — and the merge's tie-break is "the house
-    ///   wins".
-    /// - `addresses` is how a joining machine reaches anything at all, which is
-    ///   the whole goal of the slice.
-    #[test]
-    fn a_barns_brand_and_ranch_house_flag_and_addresses_are_content() {
-        let base: Barn = parse(BARN_YAML);
-
-        for (what, mutate) in [
-            ("brand", (|b: &mut Barn| b.brand = Some("ssh-ed25519 AAAA".into())) as fn(&mut Barn)),
-            ("is_ranch_house", |b: &mut Barn| b.is_ranch_house = Some(true)),
-            ("addresses", |b: &mut Barn| b.addresses = vec!["100.64.0.3".into()]),
-        ] {
-            let mut changed = base.clone();
-            mutate(&mut changed);
-            assert_ne!(
-                hash_entity("barn", &base).unwrap(),
-                hash_entity("barn", &changed).unwrap(),
-                "`{}` must be content: stripped from the hash it never looks different, so the \
-                 sync never ships it and the feature it exists for never works",
-                what
-            );
-        }
     }
 
     /// `config::update_ranchhand_last_sync` writes `Utc::now()` on every
@@ -975,11 +661,9 @@ mod tests {
         );
     }
 
-    /// The merge gives `RanchHand.config` an unconditional local win — it holds
-    /// this machine's kubeconfig path and S3 references. A field the merge
-    /// refuses to take from a peer must not be able to *say* the entity changed
-    /// either, or the "they changed it, we did not" branch clobbers the local
-    /// path with the peer's.
+    /// `RanchHand.config` holds this machine's kubeconfig path and S3
+    /// references. Two machines configured differently hold the same ranch hand,
+    /// and the difference must not read as the entity having changed.
     #[test]
     fn a_ranch_hands_machine_local_config_is_not_content() {
         let mut here: RanchHand = parse(RANCHHAND_YAML);
@@ -996,13 +680,10 @@ mod tests {
 
     /// A project's `path` is where its checkout lives on *this* machine.
     ///
-    /// The design rejected syncing filesystem paths verbatim — "which breaks the
-    /// moment a Linux Pi joins" — and the Layer 3 table lists no `path` among the
-    /// project scalars. Hashing it is the same mistake from the other side: the
-    /// Ranch House's `/Users/cam/Sites/api` differs from a Pi's
-    /// `/home/cam/api`, so every project would read as changed on both sides,
-    /// conflict, and the losing machine's `expand_path(&project.path)` would then
-    /// open nothing.
+    /// `/Users/cam/Sites/api` on one machine differs from a Pi's `/home/cam/api`,
+    /// so hashed, every project would read as different, and a machine that took
+    /// the other side's path would have `expand_path(&project.path)` open
+    /// nothing.
     #[test]
     fn a_projects_path_is_not_content() {
         let mut here: Project = parse(PROJECT_YAML);
@@ -1026,8 +707,8 @@ mod tests {
     }
 
     /// Identity plus `path` is the whole of a project's not-content list — and
-    /// the re-stamp case is the one that would otherwise ship the entire ranch on
-    /// every save.
+    /// the re-stamp case is the one that would otherwise flag every project as
+    /// different after every save.
     #[test]
     fn a_projects_stamp_is_not_content_but_its_summary_is() {
         let mut here: Project = parse(PROJECT_YAML);
@@ -1086,9 +767,8 @@ mod tests {
 
     /// The guard that makes the next field a decision instead of an accident.
     ///
-    /// Slice D adds six fields to `Barn`; without this they would join the hash
-    /// by default and `last_seen` alone would make every barn a permanent
-    /// conflict. Serializing an instance catches them because an `Option` with
+    /// Without this a new field joins the hash by default, and a per-machine one
+    /// would make every copy of the entity read as different. Serializing an instance catches them because an `Option` with
     /// no `skip_serializing_if` still renders its key as `null` — which is why
     /// this reads the keys *before* nulls are dropped.
     ///
@@ -1100,19 +780,13 @@ mod tests {
     ///
     /// Serializing a *minimal* instance cannot see a field carrying
     /// `skip_serializing_if` — it renders no key, so neither direction of the
-    /// check applies to it. That was harmless while only the identity three had
-    /// the attribute. Slice D gave six more to `Barn`, all of them
-    /// `Option::is_none` or `Vec::is_empty`, and measured: with the terse
-    /// `BARN_YAML` fixture this test went **green** with all six unclassified and
-    /// silently in the content hash — including `last_seen`, which is written on
-    /// every reachability check and would have made every barn a permanent
-    /// conflict. One of six was caught, and only because `addresses` had not
-    /// been given its attribute yet.
+    /// check applies to it. With the terse `BARN_YAML` fixture this test once
+    /// went green with several such fields unclassified and silently in the
+    /// content hash.
     ///
     /// So `barn`'s keys come from [`every_barn_field_set`], where every field is
     /// populated and nothing can be skipped. The exhaustive struct literal in
-    /// that helper **is** the tripwire — the same device `wire::WireTombstone`'s
-    /// `From` impls use — so a new field on `Barn` fails to compile there, and
+    /// that helper **is** the tripwire, so a new field on `Barn` fails to compile there, and
     /// the fix is to give it a value, not to reach for `..Default::default()`.
     ///
     /// The other four kinds stay on their YAML fixtures because the identity
@@ -1166,18 +840,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The shape table and the manifest's kind list are two spellings of the
-    /// same set. A kind in one and not the other is a manifest that cannot be
-    /// hashed, or a shape nothing reaches.
-    #[test]
-    fn the_shape_table_covers_exactly_the_kinds_a_sync_moves() {
-        let mut shaped: Vec<&str> = SHAPES.iter().map(|s| s.kind).collect();
-        shaped.sort_unstable();
-        let mut synced: Vec<&str> = crate::ranch::manifest::KINDS.to_vec();
-        synced.sort_unstable();
-        assert_eq!(shaped, synced);
     }
 
     /// A kind with no registered shape has no known not-content list, so there

@@ -107,6 +107,17 @@ impl GlobalDashboard {
         }
     }
 
+    /// The barns panel's cursor, whichever panel has focus.
+    pub fn barn_cursor(&self) -> usize {
+        self.barns_state.selected
+    }
+
+    /// Move the barns panel's cursor, for when the list it indexes into has
+    /// been re-sorted under it.
+    pub fn set_barn_cursor(&mut self, index: usize) {
+        self.barns_state.selected = index;
+    }
+
     fn reset_forms(&mut self) {
         self.new_project_name.clear();
         self.new_barn_name.clear();
@@ -248,11 +259,6 @@ impl GlobalDashboard {
                     KeyCode::Enter => return DashboardAction::SelectBarn(self.barns_state.selected),
                     KeyCode::Char('s') => return DashboardAction::SshToBarn(self.barns_state.selected),
                     KeyCode::Char('c') => return DashboardAction::ConnectBarn(self.barns_state.selected),
-                    // The third verb, next to shell and connect. `c` opens a
-                    // barn's whole TUI; this asks only for its sessions on the
-                    // grid, which is a different question with a different
-                    // answer for most barns.
-                    KeyCode::Char('t') => return DashboardAction::ToggleTunnel(self.barns_state.selected),
                     KeyCode::Char('d') => return DashboardAction::RequestDeleteBarn(self.barns_state.selected),
                     _ => {}
                 }
@@ -275,14 +281,6 @@ impl GlobalDashboard {
                             rows.get(self.sessions_state.selected).and_then(SessionRow::action)
                         {
                             return action;
-                        }
-                    }
-                    KeyCode::Char('d') => {
-                        self.sessions_state.settle_on_selectable(&items);
-                        if let Some(index) =
-                            rows.get(self.sessions_state.selected).and_then(|r| r.viewer)
-                        {
-                            return DashboardAction::CloseBarnWindow(index);
                         }
                     }
                     _ => {}
@@ -487,7 +485,7 @@ impl GlobalDashboard {
             focused: self.focused_panel == FocusedPanel::Sessions,
             // The two namespaces, named where the list is. A capital letter is
             // not a key anyone would try unprompted.
-            hints: Some("[1-9] here  [A-Z] barn  [d] close"),
+            hints: Some("[1-9] here  [A-Z] barn"),
         };
         let sessions_inner = sessions_panel.render(frame, right_panels[0]);
         let session_items = row_items(&build_session_rows(windows, remote, stale));
@@ -684,49 +682,15 @@ fn build_barn_items(barns: &[Barn], connected: &HashSet<String>) -> Vec<ListItem
         let is_this_machine =
             config::is_local_barn(b) || this_machine.as_deref() == Some(b.name.as_str());
 
-        // Built as parts and joined rather than nested formats: there are four
-        // things a row can now say and every combination occurs — the Ranch
-        // House is exactly the barn most likely to be all four at once.
+        // Built as parts and joined rather than nested formats: identity first,
+        // then live state.
         let mut parts: Vec<String> = Vec::new();
 
         // Identity first: what this row *is*, or where it will be reached.
         if is_this_machine {
             parts.push("this machine".to_string());
         } else if let Some((user, host)) = b.user.as_deref().zip(ssh::dial_host(b)) {
-            // `dial_host`, not `b.host`: a barn record that arrived from the
-            // machine it describes carries no host — that machine had nothing to
-            // dial itself with — only the addresses it advertised, and those are
-            // what ssh will actually use. Reading `b.host` here would leave the
-            // row blank for precisely the barns the ranch just learned about.
             parts.push(format!("{}@{}", user, host));
-        }
-
-        // Then role, then ranch membership, then live state — least volatile to
-        // most, which leaves `connected` last where it has always been.
-        //
-        // Both new markers are *additive*: a row says "ranch house" or "synced"
-        // when it is one and says nothing extra when it is not. That is what
-        // lets them ride in `meta` at all — the synthetic `local` row still
-        // reads exactly "this machine", and no other view's `ListItem` changes.
-        if b.is_ranch_house == Some(true) {
-            parts.push("ranch house".to_string());
-        }
-        // `Some(true)` only. `Some(false)` is a barn this machine has decided not
-        // to sync, `None` is one nothing has enrolled — different states, neither
-        // of them "in the ranch", and `types.rs` pins that absent is not `false`
-        // dressed up as an answer.
-        if b.synced == Some(true) {
-            parts.push("synced".to_string());
-        }
-        // Additive and `Some(true)`-only for the same reason `synced` is: a barn
-        // switched off is not a barn never asked about. It sits before
-        // `connected` because it is a standing preference of this machine, where
-        // `connected` is whether a session exists this second — and since
-        // `tunneled` is now what decides whether a barn's sessions reach the
-        // grid, a user who cannot see it cannot tell an empty grid from a barn
-        // they never switched on.
-        if b.tunneled == Some(true) {
-            parts.push("tunneled".to_string());
         }
         if is_connected {
             parts.push("connected".to_string());
@@ -738,9 +702,6 @@ fn build_barn_items(barns: &[Barn], connected: &HashSet<String>) -> Vec<ListItem
             // The green dot is the connection: it used to be Active for every
             // barn, which said nothing. Every other panel here already reads its
             // dot as live state (a project with sessions, an enabled worm).
-            // `ItemStatus` has three variants and connectedness already spends
-            // them, so the two ranch indicators had to go somewhere else
-            // regardless of which carrier was cheapest.
             status: Some(if is_connected { ItemStatus::Active } else { ItemStatus::Inactive }),
             meta: (!parts.is_empty()).then(|| parts.join(" · ")),
             actions: vec![RowAction { key: "s".to_string(), label: "shell".to_string() }],
@@ -754,7 +715,7 @@ fn build_barn_items(barns: &[Barn], connected: &HashSet<String>) -> Vec<ListItem
 // ===========================================================================
 //
 // One list covering the whole ranch: this machine's windows first, then every
-// tunneled barn's, under a heading of its own. The two halves are numbered in
+// connected barn's, under a heading of its own. The two halves are numbered in
 // **separate namespaces** on purpose — digits here, capitals there — because a
 // barn waking up or dying must never renumber the `[3]` the user is reaching
 // for. That is also why the local rows are always first and the barns follow in
@@ -768,8 +729,8 @@ fn build_barn_items(barns: &[Barn], connected: &HashSet<String>) -> Vec<ListItem
 /// where this list is on screen, so they are skipped rather than shadowed —
 /// a row that stole `Q` would be a row that stopped the user quitting.
 ///
-/// Twenty-two rows is not a limit worth engineering around: a ranch that
-/// tunnels more remote sessions than that has a grid for it. Rows past the end
+/// Twenty-two rows is not a limit worth engineering around: a ranch with more
+/// remote sessions connected than that has a grid for it. Rows past the end
 /// still list and still answer `Enter`; they simply have no key of their own.
 pub(crate) const REMOTE_KEYS: [char; 22] = [
     'A', 'B', 'C', 'D', 'E', 'F', 'H', 'I', 'J', 'K', 'L', 'M', 'O', 'P', 'R', 'S', 'T', 'U', 'V',
@@ -784,14 +745,10 @@ const LOCAL_KEYS: usize = 9;
 #[derive(Debug, Clone, PartialEq)]
 enum SessionTarget {
     /// A window of this machine's yeehaw session, by **tmux window index**.
-    ///
-    /// The index, never a position in the list: a `barn-view` window is drawn
-    /// under its barn rather than here, so the list and `tmux list-windows` no
-    /// longer agree on positions and a position would land on a neighbour.
     Local(u32),
-    /// A window on a barn. Opening it is a local viewer window onto that barn's
-    /// session — [`crate::tmux::open_barn_window`], the same path a number key
-    /// on the grid takes.
+    /// A window on a barn. Opening it selects that window in the barn's yeehaw
+    /// and switches to the barn's connect session — the same path a letter on
+    /// the grid takes.
     Remote { barn: String, window_index: u32 },
 }
 
@@ -809,10 +766,6 @@ struct SessionRow {
     /// `None` for a heading — the one row `Enter` has no answer for, which is
     /// why headings are also [`RowStyle::Heading`] and unselectable.
     target: Option<SessionTarget>,
-    /// The **local** tmux window index of the viewer this row has open, if it
-    /// has one. `None` for every other row, and that `None` is what `d` refuses
-    /// on.
-    viewer: Option<u32>,
 }
 
 impl SessionRow {
@@ -820,7 +773,7 @@ impl SessionRow {
         match self.target.clone()? {
             SessionTarget::Local(window_index) => Some(DashboardAction::SelectWindow(window_index)),
             SessionTarget::Remote { barn, window_index } => {
-                Some(DashboardAction::OpenBarnWindow { barn, window_index })
+                Some(DashboardAction::JumpToBarnSession { barn, window_index })
             }
         }
     }
@@ -837,9 +790,9 @@ fn row_items(rows: &[SessionRow]) -> Vec<ListItem> {
 /// whose stream died keeps its rows, marked stale, instead of having them
 /// vanish and renumber every row after them. `stale` names those barns.
 ///
-/// Driven off the frames rather than off `Barn.tunneled` because the two agree
-/// by construction: `reconcile_at` drops the frame of any barn that is switched
-/// off, so a frame exists only for a barn the user asked for.
+/// Driven off the frames rather than off the connected set because the two
+/// agree by construction: `reconcile_at` drops the frame of any barn that
+/// disconnects, so a frame exists only for a connected barn.
 fn build_session_rows(
     windows: &[TmuxWindow],
     remote: &HashMap<String, RemoteFrame>,
@@ -852,40 +805,16 @@ fn build_session_rows(
     let mut names: Vec<&str> = remote.keys().map(String::as_str).collect();
     names.sort_unstable();
 
-    // Settled before the local half is built, because the local half's one
-    // question is whether a `barn-view` window already has a row under a barn.
-    let listed_remotely: HashSet<(&str, u32)> = remote
-        .iter()
-        .flat_map(|(barn, frame)| {
-            frame
-                .windows
-                .iter()
-                .filter(|w| w.index > 0)
-                .map(move |w| (barn.as_str(), w.index))
-        })
-        .collect();
-
     let mut rows: Vec<SessionRow> = Vec::new();
 
     // This machine's windows, first and unchanged. First is not a cosmetic
     // choice: it is what keeps a barn waking up or dying from moving `[3]`.
     for w in windows.iter().filter(|w| w.index > 0) {
-        if folded_into_a_barn(w, &listed_remotely) {
-            continue;
-        }
         let position = rows.len();
         rows.push(SessionRow {
             item: local_item(position, w),
             key: local_key(position),
             target: Some(SessionTarget::Local(w.index)),
-            // `is_barn_view`, and nothing weaker. A local row is the user's own
-            // work — a claude session with something unsaved in it, a shell, an
-            // ssh — and `d` is `RequestDeleteProject` one panel to the left. The
-            // only local row it may touch is one tmux itself says is a view:
-            // a viewer whose remote row is gone (the session closed, or the barn
-            // stopped streaming) is listed here rather than under a heading, and
-            // is otherwise the one viewer with no way to be closed at all.
-            viewer: tmux::is_barn_view(w).then_some(w.index),
         });
     }
 
@@ -901,45 +830,19 @@ fn build_session_rows(
         rows.push(heading_row(name, barn_windows.len(), is_stale));
 
         for w in barn_windows {
-            // "Open here" is asked of the *whole* local window list, including
-            // the viewers that were just folded out of it above — folding one
-            // away is what proves it is open, not a reason to stop counting it.
-            //
-            // The window's local **index** is kept, not just the yes/no: it is
-            // what `d` closes, and it is the one number that cannot be derived
-            // from this row, which is labelled with a remote index belonging to
-            // another machine.
-            let viewer = windows
-                .iter()
-                .find(|local| tmux::views_remote_window(local, name, w.index))
-                .map(|local| local.index);
-            let open_here = viewer.is_some();
             let key = letters.next();
             rows.push(SessionRow {
-                item: remote_item(key, w, frame, open_here, is_stale),
+                item: remote_item(key, w, frame, is_stale),
                 key,
                 target: Some(SessionTarget::Remote {
                     barn: name.to_string(),
                     window_index: w.index,
                 }),
-                viewer,
             });
         }
     }
 
     rows
-}
-
-/// Is this local window already listed under a barn, as a view of one of its
-/// sessions?
-///
-/// Per remote *window*, never per barn. A viewer whose remote session has since
-/// closed — or one onto a barn that is not streaming at all — has no row under
-/// a heading to be folded into, and dropping it would be the only sign of that
-/// session anywhere disappearing.
-fn folded_into_a_barn(w: &TmuxWindow, listed_remotely: &HashSet<(&str, u32)>) -> bool {
-    tmux::is_barn_view(w)
-        && w.remote_window.is_some_and(|index| listed_remotely.contains(&(w.barn.as_str(), index)))
 }
 
 /// The digit a local row answers to, if it is within the first nine.
@@ -977,7 +880,6 @@ fn heading_row(barn: &str, sessions: usize, is_stale: bool) -> SessionRow {
         },
         key: None,
         target: None,
-        viewer: None,
     }
 }
 
@@ -991,7 +893,6 @@ fn remote_item(
     key: Option<char>,
     w: &TmuxWindow,
     frame: &RemoteFrame,
-    open_here: bool,
     is_stale: bool,
 ) -> ListItem {
     // The same four columns whether or not there is a key, so a row past the
@@ -1017,9 +918,8 @@ fn remote_item(
         label: format!("  {chip}{}", w.name),
         status: Some(if w.active { ItemStatus::Active } else { ItemStatus::Inactive }),
         meta: (!parts.is_empty()).then(|| parts.join(" · ")),
-        // The third state, and the only one a glance has to catch: greyed is a
-        // session that is running on a barn and is *not* on this machine.
-        style: if open_here { RowStyle::Normal } else { RowStyle::Muted },
+        // Greyed: a session that is running on a barn, not on this machine.
+        style: RowStyle::Muted,
         ..Default::default()
     }
 }
@@ -1106,8 +1006,8 @@ mod tests {
 
     // --- the remote half of the sessions panel ------------------------------
 
-    /// Nothing tunneled, which is what every test written before the merge
-    /// assumes and what most ranches look like most of the time.
+    /// No barn connected, which is what most ranches look like most of the
+    /// time.
     fn no_frames() -> HashMap<String, RemoteFrame> {
         HashMap::new()
     }
@@ -1128,19 +1028,6 @@ mod tests {
             pane_id: format!("%{index}"),
             window_type: ty.into(),
             barn: "local".into(),
-            ..Default::default()
-        }
-    }
-
-    /// A local window that is a view onto `barn`'s window `remote`.
-    fn viewer(index: u32, barn: &str, remote: u32) -> TmuxWindow {
-        TmuxWindow {
-            index,
-            name: format!("{barn}-{remote}"),
-            pane_id: format!("%{index}"),
-            window_type: tmux::VIEWER_WINDOW_TYPE.into(),
-            barn: barn.into(),
-            remote_window: Some(remote),
             ..Default::default()
         }
     }
@@ -1273,86 +1160,6 @@ mod tests {
         assert_eq!(items[0].status, Some(ItemStatus::Inactive));
     }
 
-    // === ranch membership on the barn rows ==================================
-    //
-    // The user joined a ranch and there was no sign of it anywhere in the TUI.
-    // Both indicators ride in `meta` — see `build_barn_items` for why that
-    // rather than a new `ListItem` field — and both are *additive*: a row says
-    // "ranch house" or "synced" when it is one, and says nothing extra when it
-    // is not. That is what keeps the local barn's row exactly "this machine"
-    // and leaves every other view's `ListItem` construction untouched.
-
-    /// There is exactly one Ranch House per ranch and it is the machine that
-    /// arbitrates every merge. Nothing in the TUI said which one it was.
-    #[test]
-    fn the_ranch_house_is_marked_on_its_row() {
-        let _ranch = crate::testing::temp_ranch();
-        let mut house = barn("camerons-imac");
-        house.is_ranch_house = Some(true);
-
-        let items = build_barn_items(&[house, barn("guided")], &HashSet::new());
-
-        assert!(
-            items[0].meta.as_deref().unwrap().contains("ranch house"),
-            "the house must be identifiable: {:?}",
-            items[0].meta
-        );
-        assert!(
-            !items[1].meta.as_deref().unwrap().contains("ranch house"),
-            "and only the house: {:?}",
-            items[1].meta
-        );
-    }
-
-    /// `synced` is what says this machine actually exchanges entities with a
-    /// barn. A ranch the user just joined looked identical to one they had not.
-    #[test]
-    fn a_barn_in_the_ranch_is_distinguished_from_one_that_is_not() {
-        let _ranch = crate::testing::temp_ranch();
-        let mut enrolled = barn("camerons-imac");
-        enrolled.synced = Some(true);
-        let mut declined = barn("guided");
-        declined.synced = Some(false);
-
-        let items = build_barn_items(&[enrolled, declined, barn("never-asked")], &HashSet::new());
-
-        assert!(items[0].meta.as_deref().unwrap().contains("synced"), "{:?}", items[0].meta);
-        assert!(
-            !items[1].meta.as_deref().unwrap().contains("synced"),
-            "`Some(false)` is a barn this machine does not sync: {:?}",
-            items[1].meta
-        );
-        assert!(
-            !items[2].meta.as_deref().unwrap().contains("synced"),
-            "and absent is not `false` dressed up as an answer: {:?}",
-            items[2].meta
-        );
-    }
-
-    /// The indicators compose with each other and with the connection dot,
-    /// because the Ranch House is exactly the barn most likely to be all three
-    /// at once.
-    #[test]
-    fn the_markers_compose_without_displacing_the_connection() {
-        let _ranch = crate::testing::temp_ranch();
-        let mut house = barn("camerons-imac");
-        house.is_ranch_house = Some(true);
-        house.synced = Some(true);
-        let set = connected(&[tmux::barn_session_name("camerons-imac")]);
-
-        let items = build_barn_items(&[house], &set);
-
-        let meta = items[0].meta.clone().unwrap();
-        for expected in ["forge@172.233.141.59", "ranch house", "synced", "connected"] {
-            assert!(meta.contains(expected), "{:?} missing from {:?}", expected, meta);
-        }
-        assert_eq!(
-            items[0].status,
-            Some(ItemStatus::Active),
-            "the dot is still the connection and nothing else"
-        );
-    }
-
     /// After adoption this machine has a *real* barn record — a name, a uuid, a
     /// place in the ranch — and the synthetic `local` row sits above it. Both
     /// are this machine, and `is_local_barn` only ever knew the synthetic one, so
@@ -1364,14 +1171,12 @@ mod tests {
         cfg.this_barn = Some("smashed-air".into());
         config::save_config(&cfg).unwrap();
 
-        let mut self_barn = Barn {
+        let self_barn = Barn {
             name: "smashed-air".into(),
             host: None,
             user: Some("cam".into()),
-            synced: Some(true),
             ..Default::default()
         };
-        self_barn.addresses = vec!["smashed-air.local".into()];
 
         let items =
             build_barn_items(&[config::local_barn(), self_barn, barn("guided")], &HashSet::new());
@@ -1380,128 +1185,10 @@ mod tests {
         let meta = items[1].meta.clone().unwrap();
         assert!(
             meta.starts_with("this machine"),
-            "the user is sitting at it — `cam@smashed-air.local` is telling them their own \
-             address where it used to say `local`: {:?}",
+            "the user is sitting at it: {:?}",
             meta
         );
-        assert!(meta.contains("synced"), "and it is in the ranch: {:?}", meta);
         assert_eq!(items[0].meta.as_deref(), Some("this machine"), "the alias row is unchanged");
-    }
-
-    /// A barn that arrived from the machine it describes carries no `host` — it
-    /// had nothing to dial itself with — only the addresses it advertised. The
-    /// row has to show where it will actually be reached, or the fix to the ssh
-    /// path is invisible in the one place the user looks.
-    #[test]
-    fn a_barn_that_advertises_an_address_shows_where_it_will_be_dialled() {
-        let _ranch = crate::testing::temp_ranch();
-        let mut imac = Barn {
-            name: "camerons-imac".into(),
-            host: None,
-            user: Some("cam".into()),
-            ..Default::default()
-        };
-        imac.addresses = vec!["camerons-imac.local".into()];
-
-        let items = build_barn_items(&[imac], &HashSet::new());
-
-        assert_eq!(items[0].meta.as_deref(), Some("cam@camerons-imac.local"));
-    }
-
-    // === the tunnel toggle ==================================================
-    //
-    // Streaming a barn's sessions into the grid used to require having run
-    // `connect` on it, which conflates "I opened that machine's whole TUI" with
-    // "I want to see its sessions". `t` is the second question, asked on its own.
-
-    /// `t` is the barns panel's third verb, next to `s` (shell) and `c`
-    /// (connect). Without a key there is no way to want a barn's sessions
-    /// without opening its whole TUI.
-    #[test]
-    fn t_on_the_barns_panel_asks_to_toggle_the_selected_barns_tunnel() {
-        let _ranch = crate::testing::temp_ranch();
-        let mut dash = GlobalDashboard::new();
-        let barns = [barn("guided"), barn("smash-mac")];
-
-        // Tab cycles Projects -> Sessions -> Barns.
-        dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[], &no_frames(), &no_stale());
-        dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[], &no_frames(), &no_stale());
-        dash.handle_input(KeyCode::Char('j'), &[], &barns, &[], &[], &no_frames(), &no_stale());
-
-        let action = dash.handle_input(KeyCode::Char('t'), &[], &barns, &[], &[], &no_frames(), &no_stale());
-
-        assert!(
-            matches!(action, DashboardAction::ToggleTunnel(1)),
-            "`t` must toggle the *selected* barn"
-        );
-    }
-
-    /// `t` anywhere else must not reach the barns panel, the same discipline
-    /// every other panel-scoped verb keeps.
-    #[test]
-    fn t_outside_the_barns_panel_is_not_a_tunnel_toggle() {
-        let _ranch = crate::testing::temp_ranch();
-        let mut dash = GlobalDashboard::new();
-        let barns = [barn("guided")];
-
-        // Focus starts on Projects.
-        let action = dash.handle_input(KeyCode::Char('t'), &[], &barns, &[], &[], &no_frames(), &no_stale());
-
-        assert!(
-            !matches!(action, DashboardAction::ToggleTunnel(_)),
-            "the projects panel toggled a barn's tunnel"
-        );
-    }
-
-    /// The toggle is invisible unless the row says so — and `tunneled` is now
-    /// what decides whether a barn's sessions reach the grid, so a user who
-    /// cannot see the state cannot tell an empty grid from a barn they never
-    /// switched on.
-    #[test]
-    fn a_tunneled_barn_says_so_on_its_row() {
-        let _ranch = crate::testing::temp_ranch();
-        let mut wanted = barn("guided");
-        wanted.tunneled = Some(true);
-        let mut declined = barn("smash-mac");
-        declined.tunneled = Some(false);
-
-        let items = build_barn_items(&[wanted, declined, barn("never-asked")], &HashSet::new());
-
-        assert!(items[0].meta.as_deref().unwrap().contains("tunneled"), "{:?}", items[0].meta);
-        assert!(
-            !items[1].meta.as_deref().unwrap().contains("tunneled"),
-            "`Some(false)` is a barn this machine has switched off: {:?}",
-            items[1].meta
-        );
-        assert!(
-            !items[2].meta.as_deref().unwrap().contains("tunneled"),
-            "and absent is not `false` dressed up as an answer: {:?}",
-            items[2].meta
-        );
-    }
-
-    /// The marker is additive like `ranch house` and `synced`, and it must not
-    /// displace them or the connection.
-    #[test]
-    fn the_tunnel_marker_composes_with_the_others() {
-        let _ranch = crate::testing::temp_ranch();
-        let mut house = barn("camerons-imac");
-        house.is_ranch_house = Some(true);
-        house.synced = Some(true);
-        house.tunneled = Some(true);
-        let set = connected(&[tmux::barn_session_name("camerons-imac")]);
-
-        let items = build_barn_items(&[house], &set);
-
-        let meta = items[0].meta.clone().unwrap();
-        for expected in ["forge@172.233.141.59", "ranch house", "synced", "tunneled", "connected"] {
-            assert!(meta.contains(expected), "{:?} missing from {:?}", expected, meta);
-        }
-        assert_eq!(
-            items[0].status,
-            Some(ItemStatus::Active),
-            "the dot is still the connection and nothing else"
-        );
     }
 
     /// `C-d` is dispatched from `app.rs`, which can only see the barns panel
@@ -1552,18 +1239,17 @@ mod tests {
     // === the whole ranch in one sessions panel ==============================
     //
     // The panel listed this machine's windows and nothing else, while the grid
-    // — a keypress away — had every tunneled barn's. The two answers to "what
+    // — a keypress away — had every connected barn's. The two answers to "what
     // is running" disagreed, and the dashboard's was the one that was wrong.
     //
-    // No fixture below carries a host or an address. `ssh::dial_host` falls
-    // back to `addresses`, and this file's tests run beside a live ranch.
+    // No fixture below carries a host, and this file's tests run beside a live
+    // ranch.
 
     /// The control. Nothing in this section can reach a real machine even if a
     /// branch went wrong and tried.
     #[test]
     fn the_session_fixtures_have_nothing_to_dial() {
         let b = Barn { name: "guided".into(), ..Default::default() };
-        assert!(b.addresses.is_empty());
         assert_eq!(ssh::dial_host(&b), None, "a fixture that could open a real ssh");
     }
 
@@ -1605,7 +1291,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tunneled_barns_windows_sit_under_a_heading_carrying_its_name() {
+    fn a_connected_barns_windows_sit_under_a_heading_carrying_its_name() {
         // `get_window_status` reads the ranch for a claude window's signal.
         // Harness only — no assertion below depends on what is in it.
         let _ranch = crate::testing::temp_ranch();
@@ -1755,10 +1441,11 @@ mod tests {
         assert_eq!(rows[9].item.label, "[10] w10");
     }
 
-    // === the three states of a remote row ===================================
+    // === how a remote row looks ==============================================
 
+    /// A session running on a barn, not on this machine, is greyed.
     #[test]
-    fn a_remote_session_not_open_on_this_machine_is_greyed() {
+    fn a_remote_session_is_greyed() {
         // `get_window_status` reads the ranch for a claude window's signal.
         // Harness only — no assertion below depends on what is in it.
         let _ranch = crate::testing::temp_ranch();
@@ -1769,42 +1456,6 @@ mod tests {
         );
 
         assert_eq!(rows[1].item.style, RowStyle::Muted);
-    }
-
-    #[test]
-    fn a_remote_session_already_open_here_is_drawn_as_an_ordinary_row() {
-        // `get_window_status` reads the ranch for a claude window's signal.
-        // Harness only — no assertion below depends on what is in it.
-        let _ranch = crate::testing::temp_ranch();
-        let rows = build_session_rows(
-            &[viewer(3, "guided", 4)],
-            &frames(vec![frame("guided", vec![win(4, "api", "claude")])]),
-            &no_stale(),
-        );
-
-        let remote: Vec<&SessionRow> = rows.iter().filter(|r| r.key == Some('A')).collect();
-        assert_eq!(remote.len(), 1);
-        assert_eq!(remote[0].item.style, RowStyle::Normal, "an open session still reads as closed");
-    }
-
-    /// One viewer must not light up the whole barn — that is the entire reason
-    /// the viewer window carries the remote window index and not just the barn.
-    #[test]
-    fn opening_one_of_a_barns_sessions_does_not_mark_the_rest_open() {
-        // `get_window_status` reads the ranch for a claude window's signal.
-        // Harness only — no assertion below depends on what is in it.
-        let _ranch = crate::testing::temp_ranch();
-        let rows = build_session_rows(
-            &[viewer(3, "guided", 4)],
-            &frames(vec![frame("guided", vec![win(4, "api", "claude"), win(7, "web", "shell")])]),
-            &no_stale(),
-        );
-
-        // The viewer itself is folded under the barn, so the barn's heading is
-        // row 0 and its two sessions follow it.
-        assert_eq!(labels(&rows), ["guided", "  [A] api", "  [B] web"]);
-        assert_eq!(rows[1].item.style, RowStyle::Normal);
-        assert_eq!(rows[2].item.style, RowStyle::Muted, "a neighbour read as open");
     }
 
     /// A barn whose stream died keeps its rows. Dropping them would renumber
@@ -1855,63 +1506,6 @@ mod tests {
         );
     }
 
-    // === the double count ===================================================
-    //
-    // A `barn-view` window is two things at once: a window of this machine's
-    // session, and a view of one of a barn's. Listed as both it is the same
-    // work twice, under two different keys.
-
-    #[test]
-    fn a_window_viewing_a_barn_is_listed_under_that_barn_and_not_as_local_work() {
-        // `get_window_status` reads the ranch for a claude window's signal.
-        // Harness only — no assertion below depends on what is in it.
-        let _ranch = crate::testing::temp_ranch();
-        let rows = build_session_rows(
-            &[win(1, "api-claude", "claude"), viewer(2, "guided", 4)],
-            &frames(vec![frame("guided", vec![win(4, "api", "claude")])]),
-            &no_stale(),
-        );
-
-        assert_eq!(
-            labels(&rows),
-            ["[1] api-claude", "guided", "  [A] api"],
-            "the viewer was counted twice"
-        );
-    }
-
-    /// The de-duplication is per remote *window*, not per barn: a viewer whose
-    /// remote session has since closed has no row under the barn to be folded
-    /// into, and must not simply disappear.
-    #[test]
-    fn a_viewer_with_no_row_under_its_barn_is_still_listed_locally() {
-        // `get_window_status` reads the ranch for a claude window's signal.
-        // Harness only — no assertion below depends on what is in it.
-        let _ranch = crate::testing::temp_ranch();
-        let rows = build_session_rows(
-            &[viewer(2, "guided", 99)],
-            &frames(vec![frame("guided", vec![win(4, "api", "claude")])]),
-            &no_stale(),
-        );
-
-        assert_eq!(
-            labels(&rows),
-            ["[1] guided-99", "guided", "  [A] api"],
-            "a viewer onto a session the barn no longer has vanished"
-        );
-    }
-
-    /// Same, for a barn that is not tunneled at all: nothing lists its windows,
-    /// so the viewer is the only sign of that session anywhere.
-    #[test]
-    fn a_viewer_onto_a_barn_that_is_not_streaming_is_still_listed_locally() {
-        // `get_window_status` reads the ranch for a claude window's signal.
-        // Harness only — no assertion below depends on what is in it.
-        let _ranch = crate::testing::temp_ranch();
-        let rows = build_session_rows(&[viewer(2, "guided", 4)], &no_frames(), &no_stale());
-
-        assert_eq!(labels(&rows), ["[1] guided-4"]);
-    }
-
     // === what the keys do ===================================================
 
     fn dash_on(windows: &[TmuxWindow], remote: &HashMap<String, RemoteFrame>) -> GlobalDashboard {
@@ -1932,7 +1526,7 @@ mod tests {
         assert!(
             matches!(
                 &action,
-                DashboardAction::OpenBarnWindow { barn, window_index: 4 } if barn == "guided"
+                DashboardAction::JumpToBarnSession { barn, window_index: 4 } if barn == "guided"
             ),
             "`A` did not open guided:4"
         );
@@ -1952,148 +1546,7 @@ mod tests {
         let action =
             dash.handle_input(KeyCode::Char('A'), &[], &[], &[], &[], &remote, &no_stale());
 
-        assert!(matches!(action, DashboardAction::OpenBarnWindow { .. }), "focus swallowed the key");
-    }
-
-    // === closing a viewer ===================================================
-    //
-    // `d`, and only ever on a row the panel can prove is a `barn-view` window.
-    // The blast radius is the whole point of these tests: the same key deletes a
-    // project, a barn and a worm in the panels either side of this one, and a
-    // `d` that reached an ordinary local row would kill a live claude session
-    // and whatever was unsaved in it.
-
-    /// Move focus to the sessions panel and put the cursor on its first
-    /// selectable row.
-    fn focus_sessions(
-        dash: &mut GlobalDashboard,
-        windows: &[TmuxWindow],
-        remote: &HashMap<String, RemoteFrame>,
-    ) {
-        dash.handle_input(KeyCode::Tab, &[], &[], &[], windows, remote, &no_stale());
-        dash.handle_input(KeyCode::Char('g'), &[], &[], &[], windows, remote, &no_stale());
-    }
-
-    fn press(
-        dash: &mut GlobalDashboard,
-        c: char,
-        windows: &[TmuxWindow],
-        remote: &HashMap<String, RemoteFrame>,
-    ) -> DashboardAction {
-        dash.handle_input(KeyCode::Char(c), &[], &[], &[], windows, remote, &no_stale())
-    }
-
-    /// A barn's row with a viewer open closes **that local window**, by its local
-    /// index — never the remote index the row is labelled with, which belongs to
-    /// a window on another machine.
-    #[test]
-    fn d_on_a_barn_row_with_a_viewer_open_closes_the_local_window() {
-        let _ranch = crate::testing::temp_ranch();
-        let windows = [win(1, "work", "claude"), viewer(5, "guided", 4)];
-        let remote = frames(vec![frame("guided", vec![win(4, "api", "claude")])]);
-        let mut dash = GlobalDashboard::new();
-
-        focus_sessions(&mut dash, &windows, &remote);
-        // Row 0 is the local claude window, row 1 the heading `j` steps over.
-        press(&mut dash, 'j', &windows, &remote);
-
-        let action = press(&mut dash, 'd', &windows, &remote);
-
-        assert!(
-            matches!(action, DashboardAction::CloseBarnWindow(5)),
-            "`d` on an open viewer did not close local window 5: {:?}",
-            labels(&build_session_rows(&windows, &remote, &no_stale()))
-        );
-    }
-
-    /// The row a viewer is folded *out* of the local list into is the row that
-    /// closes it, and the fold is what proves the viewer is open — so this is the
-    /// same row `Enter` would open, answering the opposite question.
-    #[test]
-    fn d_and_enter_on_the_same_barn_row_are_the_two_halves_of_one_key_pair() {
-        let _ranch = crate::testing::temp_ranch();
-        let windows = [viewer(5, "guided", 4)];
-        let remote = frames(vec![frame("guided", vec![win(4, "api", "claude")])]);
-        let mut dash = GlobalDashboard::new();
-
-        focus_sessions(&mut dash, &windows, &remote);
-
-        let opened = dash.handle_input(KeyCode::Enter, &[], &[], &[], &windows, &remote, &no_stale());
-        assert!(
-            matches!(&opened, DashboardAction::OpenBarnWindow { barn, window_index: 4 } if barn == "guided"),
-            "control: the cursor is not on guided:4"
-        );
-        assert!(matches!(
-            press(&mut dash, 'd', &windows, &remote),
-            DashboardAction::CloseBarnWindow(5)
-        ));
-    }
-
-    /// **The one that matters.** A local row is a claude session, a shell or an
-    /// ssh window — the user's actual work, with whatever is unsaved in it. `d`
-    /// refuses, silently: there is nothing to close and nothing to warn about.
-    #[test]
-    fn d_on_a_local_working_session_does_nothing_at_all() {
-        let _ranch = crate::testing::temp_ranch();
-        let windows =
-            [win(1, "work", "claude"), win(2, "shell", "shell"), win(3, "barn-guided", "ssh")];
-        let remote = no_frames();
-        let mut dash = GlobalDashboard::new();
-
-        focus_sessions(&mut dash, &windows, &remote);
-
-        for row in 0..windows.len() {
-            let action = press(&mut dash, 'd', &windows, &remote);
-            assert!(
-                matches!(action, DashboardAction::None),
-                "`d` reached local row {row} ({}) — that is a live session",
-                windows[row].name,
-            );
-            press(&mut dash, 'j', &windows, &remote);
-        }
-    }
-
-    /// A barn's session with no viewer open has no local window to close, and
-    /// the remote index on the row is a window on another machine. Refused, and
-    /// refused silently — the row is still a perfectly good `Enter`.
-    #[test]
-    fn d_on_a_barn_row_with_nothing_open_here_does_nothing() {
-        let _ranch = crate::testing::temp_ranch();
-        let windows: [TmuxWindow; 0] = [];
-        let remote = frames(vec![frame("guided", vec![win(4, "api", "claude")])]);
-        let mut dash = GlobalDashboard::new();
-
-        focus_sessions(&mut dash, &windows, &remote);
-
-        let action = press(&mut dash, 'd', &windows, &remote);
-
-        assert!(matches!(action, DashboardAction::None), "`d` closed a window it does not have");
-    }
-
-    /// A viewer whose remote session has closed — or whose barn stopped
-    /// streaming — has no row under a heading to be folded into, so it is listed
-    /// as a local row. It is still only a view, and it is the one viewer that
-    /// could otherwise never be closed at all.
-    #[test]
-    fn d_closes_a_viewer_that_lost_the_barn_row_it_was_folded_under() {
-        let _ranch = crate::testing::temp_ranch();
-        let windows = [viewer(5, "guided", 4)];
-        let remote = no_frames();
-        let mut dash = GlobalDashboard::new();
-
-        focus_sessions(&mut dash, &windows, &remote);
-        assert_eq!(
-            labels(&build_session_rows(&windows, &remote, &no_stale())),
-            ["[1] guided-4"],
-            "control: the orphaned viewer is a local row"
-        );
-
-        let action = press(&mut dash, 'd', &windows, &remote);
-
-        assert!(
-            matches!(action, DashboardAction::CloseBarnWindow(5)),
-            "an orphaned viewer has no way to be closed"
-        );
+        assert!(matches!(action, DashboardAction::JumpToBarnSession { .. }), "focus swallowed the key");
     }
 
     /// `G` is select-last in every panel of this view. A barn row may not take
@@ -2162,7 +1615,7 @@ mod tests {
             dash.handle_input(KeyCode::Enter, &[], &[], &[], &windows, &remote, &no_stale());
 
         assert!(
-            matches!(&action, DashboardAction::OpenBarnWindow { barn, window_index: 4 } if barn == "guided"),
+            matches!(&action, DashboardAction::JumpToBarnSession { barn, window_index: 4 } if barn == "guided"),
             "one `j` off a single local row must land on the barn's session, not its heading"
         );
     }
@@ -2193,7 +1646,7 @@ mod tests {
         let action = dash.handle_input(KeyCode::Enter, &[], &[], &[], &[], &remote, &no_stale());
 
         assert!(
-            matches!(&action, DashboardAction::OpenBarnWindow { barn, .. } if barn == "guided"),
+            matches!(&action, DashboardAction::JumpToBarnSession { barn, .. } if barn == "guided"),
             "the cursor was parked on a heading with nothing to open"
         );
     }
@@ -2232,7 +1685,7 @@ mod tests {
         let text = screen(&mut dash, &windows, &remote);
 
         assert!(text.contains("[1] local-window"), "the local half went missing:\n{text}");
-        assert!(text.contains("guided"), "no heading for the tunneled barn:\n{text}");
+        assert!(text.contains("guided"), "no heading for the connected barn:\n{text}");
         assert!(text.contains("[A] remote-window"), "the barn's session is not on screen:\n{text}");
     }
 }

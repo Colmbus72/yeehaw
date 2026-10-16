@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(state.selected, 0, "the cursor stopped on the barn heading");
     }
 
-    /// Consecutive headings happen the moment two barns are tunneled and one of
+    /// Consecutive headings happen the moment two barns are connected and one of
     /// them has no sessions at all.
     #[test]
     fn a_run_of_headings_is_stepped_over_in_one_move() {

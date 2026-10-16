@@ -92,7 +92,7 @@ pub(crate) const FRAME_SENTINEL: &str = "\u{1}\u{2}YHFRAME\u{2}\u{1}";
 /// The script holds no single quote, so [`frame_command`] nests it in `bash -lc
 /// '...'` with no escaping beyond the wrapper.
 const FRAME_SCRIPT: &str = "\
-    FMT=\"#{window_index}\t#{window_name}\t#{window_active}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{window_activity}\t#{@yeehaw_type}\t#{@yeehaw_project}\t#{@yeehaw_barn}\t#{@yeehaw_remote_window}\"; \
+    FMT=\"#{window_index}\t#{window_name}\t#{window_active}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{window_activity}\t#{@yeehaw_type}\t#{@yeehaw_project}\t#{@yeehaw_barn}\"; \
     T=$(printf \"\\t\"); \
     while :; do \
     W=$(tmux list-windows -t \"=yeehaw\" -F \"$FMT\" 2>/dev/null); \
@@ -178,20 +178,68 @@ pub(crate) fn select_window_command(window_index: u32) -> String {
     )
 }
 
+/// How long a jump waits on the barn's `select-window` before switching
+/// anyway.
+///
+/// ~70–180 ms over a warm `ControlMaster` is the normal case. Against a barn
+/// whose master has gone the select would otherwise sit out ssh's
+/// `ConnectTimeout`, 10 s, with the TUI frozen behind it on a keypress.
+pub const SELECT_TIMEOUT: Duration = Duration::from_millis(600);
+
+/// What became of a bounded remote command.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Bounded {
+    /// It ran to completion and succeeded.
+    Done,
+    /// It was still running at the deadline, and was killed and reaped.
+    TimedOut,
+}
+
 /// Select a window in the yeehaw session on `barn`, so a jump lands there.
 ///
-/// **Blocking**, ~70–180 ms over a warm `ControlMaster`. Affordable here and
-/// nowhere else: this is a keypress. Nothing on the 250 ms idle tick may call
-/// it — that is what the streaming thread exists to avoid.
-///
-/// The warm figure is the *good* case, and it is the only one the design
-/// measured. Against a barn whose master has gone — which is exactly the barn
-/// whose cells are about to be marked stale — this blocks for ssh's
-/// `ConnectTimeout`, 10 s, with the TUI frozen behind it. That is the upper
-/// bound to design a stale-cell jump around, not 180 ms.
-pub fn select_window(barn: &Barn, window_index: u32) -> Result<()> {
-    ssh::run(barn, &select_window_command(window_index), SELECT_OPTS)?;
-    Ok(())
+/// Bounded by [`SELECT_TIMEOUT`]: nothing on the 250 ms idle tick may call
+/// this, and a keypress may not hold the loop for longer than that either.
+/// `Ok(TimedOut)` is not an error — the caller switches anyway and the user
+/// lands on whatever window the barn had.
+pub fn select_window(barn: &Barn, window_index: u32) -> Result<Bounded> {
+    let cmd = ssh::command(barn, &select_window_command(window_index), SELECT_OPTS)?;
+    run_bounded(cmd, SELECT_TIMEOUT, &barn.name)
+}
+
+/// Run `cmd` for at most `timeout`. A non-zero exit is an `Err` carrying its
+/// stderr; a command still running at the deadline is killed **and reaped**,
+/// so a jump never leaves an ssh zombie behind.
+pub(crate) fn run_bounded(mut cmd: Command, timeout: Duration, barn: &str) -> Result<Bounded> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("failed to spawn ssh: {}", e))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                return Ok(Bounded::Done);
+            }
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            let stderr = stderr.trim();
+            return Err(if stderr.is_empty() {
+                anyhow!("ssh to '{}' failed", barn)
+            } else {
+                anyhow!("{}", stderr)
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(Bounded::TimedOut);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// One frame from one barn.
@@ -629,8 +677,7 @@ struct Failure {
     next: Instant,
 }
 
-/// One stream per barn this machine tunnels to, and the last thing each barn
-/// had to say.
+/// One stream per connected barn, and the last thing each barn had to say.
 ///
 /// Owned by the app for the lifetime of the process, but only ever *populated*
 /// while the session grid is open: [`Self::reconcile`] opens the ssh channels
@@ -674,19 +721,16 @@ impl RemoteStreams {
         }
     }
 
-    /// Bring the running streams in line with the barns this machine tunnels to
-    /// *right now*: spawn for barns that were switched on, drop for barns that
-    /// were switched off.
+    /// Bring the running streams in line with `barns`, the barns that are
+    /// connected *right now*: spawn for barns that gained a connection, drop for
+    /// barns that lost one.
     ///
-    /// `Barn.tunneled`, not a tmux session, is the question. The two used to be
-    /// the same one: a barn streamed only if `connect` had been run on it, which
-    /// conflates "I opened that machine's whole TUI" with "I want to see its
-    /// sessions". `t` on the barns panel is now the second question, asked on
-    /// its own — so a barn can be on the grid with no `yh-barn-*` session, and a
-    /// connected barn stays off the grid until it is asked for.
+    /// The caller decides what "connected" means — a `yh-barn-*` tmux session
+    /// exists, see `app::tick_remote_streams` — so every barn passed in is
+    /// wanted, and the registry never touches tmux.
     ///
     /// Called on **every 250ms tick**, not only when the grid opens — so that
-    /// toggling a barn from the dashboard brings its sessions in without
+    /// connecting to a barn brings its sessions in without
     /// reopening the grid. Which makes idempotence load-bearing: a reconcile
     /// that respawned a live stream would open four ssh channels a second per
     /// barn.
@@ -730,16 +774,12 @@ impl RemoteStreams {
     where
         F: Fn(&Barn, Sender<RemoteEvent>) -> Result<RemoteStream>,
     {
-        // `Some(true)` only, the same reading the barns panel gives it: a barn
-        // switched off is not a barn never asked about, and neither belongs on
-        // the grid.
-        let live: Vec<&Barn> = barns.iter().filter(|b| b.tunneled == Some(true)).collect();
-        let wanted: HashSet<&str> = live.iter().map(|b| b.name.as_str()).collect();
+        let wanted: HashSet<&str> = barns.iter().map(|b| b.name.as_str()).collect();
 
-        // Switching a barn off takes its cells off the grid, so everything the
+        // Disconnecting a barn takes its cells off the grid, so everything the
         // registry knows about it goes at once — the stream (dropped, which
         // kills and reaps), the last frame, and any failure. A frame left
-        // behind would keep painting a barn the user just dismissed.
+        // behind would keep painting a barn the user just closed.
         //
         // `RemoteStream::drop` sets `stopping` before the kill, so none of this
         // reports the barn as failed. That is the one thing this path must not
@@ -748,7 +788,7 @@ impl RemoteStreams {
         self.frames.retain(|barn, _| wanted.contains(barn.as_str()));
         self.failed.retain(|barn, _| wanted.contains(barn.as_str()));
 
-        for barn in live {
+        for barn in barns {
             // Already streaming.
             if self.streams.contains_key(&barn.name) {
                 continue;
@@ -758,12 +798,12 @@ impl RemoteStreams {
             // against a host that is not answering, each blocking a child for
             // ConnectTimeout.
             //
-            // That is not a hypothetical. `tunneled` is a preference the user
-            // set once and a standing one — nothing re-checks the host before
-            // the next tick — so a barn that is powered off, or one whose
-            // `dial_host` resolves to nothing, sits in the wanted set looking
-            // exactly like a healthy one. Being asked for is never a claim that
-            // ssh works.
+            // That is not a hypothetical. A `yh-barn-*` session exists from the
+            // moment `tmux::connect_to_barn` creates it, and the `yeehaw
+            // connect` inside it renders "unreachable" and offers a retry
+            // *without exiting* — so a barn sitting on that error screen is
+            // connected exactly like a healthy one. Being connected means a
+            // session exists, never that ssh works.
             if self.failed.get(&barn.name).is_some_and(|f| now < f.next) {
                 continue;
             }
@@ -811,7 +851,7 @@ impl RemoteStreams {
     /// Events for a barn that is not currently streaming are dropped. That is
     /// what keeps a `Failed` racing a deliberate teardown — decided by the
     /// reader an instant before `stopping` was set — from marking a barn that
-    /// the user simply switched off.
+    /// the user simply disconnected.
     pub fn drain(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
@@ -859,7 +899,7 @@ impl RemoteStreams {
     /// with the wait starting over each time. What survives is a claim about
     /// right now ("this barn has no stream, and here is when it may have one"),
     /// not stale news: it names the barn in the header, and it is dropped the
-    /// moment a frame arrives or the barn is switched off.
+    /// moment a frame arrives or the barn is disconnected.
     ///
     /// The channel is replaced rather than reused. A stream that had genuinely
     /// failed a moment before the shutdown may have left a `Failed` in it with
@@ -1832,11 +1872,7 @@ pub(crate) mod tests {
 
     /// Polls `done` until it is true or `limit` elapses.
     ///
-    /// `pub(crate)` for `tunnel`'s supervisor tests, which wait on the same kind
-    /// of thing for the same reason: a worker thread has published a state
-    /// change, and a fixed sleep long enough to be reliable is long enough to be
-    /// a slow suite.
-    pub(crate) fn poll_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+    fn poll_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + limit;
         loop {
             if done() {
@@ -2208,14 +2244,6 @@ pub(crate) mod tests {
         Barn { name: name.to_string(), host: Some("192.0.2.1".into()), ..stream_barn() }
     }
 
-    /// [`named_barn`], switched on: a barn the user has asked to see on the
-    /// grid, which is the precondition of every reconcile below. `named_barn`
-    /// stays off, so a fixture says which of the two it is rather than leaving
-    /// it to a default.
-    pub(crate) fn tunneled_barn(name: &str) -> Barn {
-        Barn { tunneled: Some(true), ..named_barn(name) }
-    }
-
     /// A stand-in for [`RemoteStream::spawn`] that runs `cmd(barn)` locally and
     /// records every barn it was asked for, in order.
     ///
@@ -2290,35 +2318,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reconcile_streams_the_barns_this_machine_tunnels_to() {
-        // Wanting a barn's sessions on the grid and having opened that machine's
-        // whole TUI are two different questions, and `connected` only ever
-        // answered the second. A barn the user asked for has to stream whether
-        // or not a `yh-barn-*` session exists.
-        let barns = [tunneled_barn("guided"), named_barn("smash-mac")];
-        let log = RefCell::new(Vec::new());
-        let mut reg = RemoteStreams::new();
-
-        reg.reconcile_with(&barns, recording_spawner(&log, silent));
-        let _guards = guard_all(&reg);
-
-        assert_eq!(*log.borrow(), ["guided"], "a barn the user asked for got no stream");
-        assert!(reg.streams.contains_key("guided"));
-        assert!(
-            !reg.streams.contains_key("smash-mac"),
-            "streams exist only for barns this machine tunnels to: {:?}",
-            reg.streams.keys().collect::<Vec<_>>()
-        );
-
-        reg.shutdown();
-    }
-
-    #[test]
-    fn a_barn_the_user_has_not_asked_for_is_not_streamed() {
-        // The other half, and the one that costs something: `connect` used to
-        // imply "put this machine's sessions on my grid", so every barn whose
-        // TUI the user had opened held an ssh channel emitting a frame a second.
-        // A `yh-barn-*` session is no longer an input to this decision at all.
+    fn reconcile_spawns_for_the_barns_it_is_handed_only() {
         let barns = [named_barn("guided")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
@@ -2326,19 +2326,19 @@ pub(crate) mod tests {
         reg.reconcile_with(&barns, recording_spawner(&log, silent));
         let _guards = guard_all(&reg);
 
-        assert!(
-            log.borrow().is_empty(),
-            "a barn nobody asked for got a stream: {:?}",
-            log.borrow()
+        assert_eq!(*log.borrow(), ["guided"]);
+        assert_eq!(
+            reg.streams.keys().collect::<Vec<_>>(),
+            ["guided"],
+            "streams exist only for connected barns"
         );
-        assert!(reg.streams.is_empty(), "{:?}", reg.streams.keys().collect::<Vec<_>>());
 
         reg.shutdown();
     }
 
     #[test]
-    fn reconcile_drops_the_stream_for_a_barn_switched_off() {
-        let both = [tunneled_barn("guided"), tunneled_barn("smash-mac")];
+    fn reconcile_drops_the_stream_for_a_disconnected_barn() {
+        let both = [named_barn("guided"), named_barn("smash-mac")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2347,48 +2347,38 @@ pub(crate) mod tests {
         let guided = child_pid(&reg, "guided").expect("guided is streaming");
         let gone = child_pid(&reg, "smash-mac").expect("smash-mac is streaming");
 
-        // `t` on smash-mac: the record the next tick reconciles against now says
-        // `Some(false)`.
-        let one = [tunneled_barn("guided"), named_barn("smash-mac")];
+        // `C-d` on smash-mac: the next tick no longer counts it as connected.
+        let one = [named_barn("guided")];
         reg.reconcile_with(&one, recording_spawner(&log, silent));
 
         assert!(
             !reg.streams.contains_key("smash-mac"),
-            "the barn switched off kept its stream: {:?}",
+            "the disconnected barn kept its stream: {:?}",
             reg.streams.keys().collect::<Vec<_>>()
         );
         // Dropping the entry is the whole teardown, so the child has to be gone
-        // *and reaped* — a `Z` here is an ssh zombie per toggle for the rest
+        // *and reaped* — a `Z` here is an ssh zombie per disconnect for the rest
         // of the TUI's life.
         assert_eq!(
             process_state(gone),
             None,
-            "the child of the barn switched off outlived its stream"
+            "the disconnected barn's child outlived its stream"
         );
         assert_eq!(
             child_pid(&reg, "guided"),
             Some(guided),
-            "a barn still switched on had its stream disturbed by its neighbour leaving"
+            "the connected barn's stream was disturbed by its neighbour leaving"
         );
 
         reg.shutdown();
     }
 
-    /// DELIBERATE NARROWING. This was `reconcile_matches_barns_by_session_name_
-    /// not_by_barn_name`, and it guarded a real hazard: `connected` held
-    /// `yh-barn-camera-pi-<hash>`, so matching on the raw name — or on
-    /// `barn_session_target`'s `=` form — found nothing, and finding nothing
-    /// looks exactly like "no barns connected": an empty grid, forever, with no
-    /// error to explain it. `reconcile` no longer maps a name to a session, so
-    /// that hazard is gone from here; the same hazard still exists in
-    /// `views::global_dashboard::build_barn_items`, where
-    /// `the_indicator_matches_names_as_tmux_reports_them_not_targets` guards it.
-    ///
-    /// What survives is the half that is still true: the three registry maps are
-    /// keyed by the barn's own name, however unlike an identifier it is.
+    /// The three registry maps are keyed by the barn's own name, however unlike
+    /// an identifier it is. Mapping a name to its tmux session is the caller's
+    /// job — see `app::tests::only_barns_with_a_connect_session_are_streamed`.
     #[test]
     fn reconcile_keys_its_streams_by_barn_name() {
-        let barns = [tunneled_barn("camera pi")];
+        let barns = [named_barn("camera pi")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2405,7 +2395,7 @@ pub(crate) mod tests {
     fn reconcile_is_idempotent_and_does_not_respawn_a_live_stream() {
         // It runs on every 250ms tick, not just on grid open. Respawning a live
         // stream opens four ssh channels a second per barn.
-        let barns = [tunneled_barn("guided")];
+        let barns = [named_barn("guided")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2452,7 +2442,7 @@ pub(crate) mod tests {
         // The state that actually recurs: a live stream, mid-login, with nothing
         // to say yet. `rx` has a sender in it, so a blocking read has no EOF to
         // rescue it.
-        let barns = [tunneled_barn("guided")];
+        let barns = [named_barn("guided")];
         let log = RefCell::new(Vec::new());
         reg.reconcile_with(&barns, recording_spawner(&log, silent));
         let _guards = guard_all(&reg);
@@ -2476,7 +2466,7 @@ pub(crate) mod tests {
         // Dropping a dead barn's cells would renumber every cell after them
         // under the user's fingers. The last frame stays so Task 9 can dim it
         // and badge it STALE in place.
-        let barns = [tunneled_barn("guided")];
+        let barns = [named_barn("guided")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2517,7 +2507,7 @@ pub(crate) mod tests {
         // a host that is not answering — each one blocking for ConnectTimeout.
         // (RG-9 turns this into a retry with backoff; it must not become a
         // retry without one.)
-        let barns = [tunneled_barn("guided")];
+        let barns = [named_barn("guided")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2545,10 +2535,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_barn_switched_off_takes_its_last_frame_with_it() {
-        // `t` on a streaming barn has to remove its cells from the grid. A
-        // frame left behind would keep painting a barn the user just dismissed.
-        let barns = [tunneled_barn("guided")];
+    fn a_disconnected_barn_takes_its_last_frame_with_it() {
+        // `C-d` on a connected barn has to remove its cells from the grid. A
+        // frame left behind would keep painting a barn the user just closed.
+        let barns = [named_barn("guided")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2564,10 +2554,10 @@ pub(crate) mod tests {
             "no frame ever arrived, so there is nothing to drop"
         );
 
-        reg.reconcile_with(&[named_barn("guided")], recording_spawner(&log, silent));
+        reg.reconcile_with(&[], recording_spawner(&log, silent));
         assert!(
             reg.frames().get("guided").is_none(),
-            "a barn switched off kept its cells on the grid"
+            "a disconnected barn kept its cells on the grid"
         );
 
         reg.shutdown();
@@ -2577,7 +2567,7 @@ pub(crate) mod tests {
     fn frames_from_two_barns_land_in_their_own_slots() {
         // Pane ids collide across hosts — `%1` exists on every machine — so
         // frames are partitioned per barn and never merged into one map.
-        let barns = [tunneled_barn("guided"), tunneled_barn("smash-mac")];
+        let barns = [named_barn("guided"), named_barn("smash-mac")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2613,7 +2603,7 @@ pub(crate) mod tests {
 
     #[test]
     fn shutdown_clears_every_stream() {
-        let barns = [tunneled_barn("guided"), tunneled_barn("smash-mac")];
+        let barns = [named_barn("guided"), named_barn("smash-mac")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2669,7 +2659,7 @@ pub(crate) mod tests {
         // Once per 250ms tick is four ssh handshakes a second against a dead
         // host, each blocking a child for ConnectTimeout. Never retrying at all
         // is a barn that never comes back from a ten-second blip.
-        let barns = [tunneled_barn("guided")];
+        let barns = [named_barn("guided")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2724,7 +2714,7 @@ pub(crate) mod tests {
         // A barn that has failed twice is likelier to be gone than one that has
         // failed once. Retrying both at the same interval spends the same
         // handshakes on a host that has never answered as on one that blipped.
-        let barns = [tunneled_barn("guided")];
+        let barns = [named_barn("guided")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2773,7 +2763,7 @@ pub(crate) mod tests {
         // runs on every grid *open* as well as on the tick. A backoff that lived
         // only as long as the grid would hand a barn parked on its own
         // "unreachable" screen one fresh handshake per `v`.
-        let barns = [tunneled_barn("guided")];
+        let barns = [named_barn("guided")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2814,7 +2804,7 @@ pub(crate) mod tests {
         // frame lands the cells stay STALE — a spawned child is not a barn that
         // answered — and the moment it does, the marking has to go or the grid
         // dims a barn that is streaming happily.
-        let barns = [tunneled_barn("guided")];
+        let barns = [named_barn("guided")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2863,7 +2853,7 @@ pub(crate) mod tests {
         // `attempts` counts *consecutive* failures. Left uncleared, a barn that
         // drops once an hour and recovers every time would eventually wait a
         // full minute to notice a blip.
-        let barns = [tunneled_barn("guided")];
+        let barns = [named_barn("guided")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2904,11 +2894,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn switching_a_barn_off_forgets_its_backoff() {
-        // `t` off then `t` on is a deliberate act, and the user watching for
+    fn disconnecting_a_barn_forgets_its_backoff() {
+        // `C-d` then reconnect is a deliberate act, and the user watching for
         // their sessions to come back should not be made to sit out a wait that
         // belonged to the last attempt.
-        let barns = [tunneled_barn("guided")];
+        let barns = [named_barn("guided")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2922,17 +2912,17 @@ pub(crate) mod tests {
         );
         let seen = Instant::now();
 
-        // Switch it off: the barn leaves the wanted set entirely.
-        reg.reconcile_at(seen, &[named_barn("guided")], recording_spawner(&log, dies));
-        assert!(reg.stale().is_empty(), "a barn switched off is still marked stale");
+        // Disconnect: the barn leaves the wanted set entirely.
+        reg.reconcile_at(seen, &[], recording_spawner(&log, dies));
+        assert!(reg.stale().is_empty(), "a disconnected barn is still marked stale");
 
-        // Switch it back on inside what would have been the backoff window.
+        // Reconnect inside what would have been the backoff window.
         reg.reconcile_at(seen, &barns, recording_spawner(&log, dies));
         guards.extend(guard_all(&reg));
         assert_eq!(
             log.borrow().len(),
             2,
-            "switching a barn back on by hand still waited out the old backoff"
+            "reconnecting a barn by hand still waited out the old backoff"
         );
 
         reg.shutdown();
@@ -2944,7 +2934,7 @@ pub(crate) mod tests {
         // that went away. If that landed in `failed`, disconnecting a barn — or
         // simply leaving the grid — would badge it STALE on the way out and
         // again the next time it came back.
-        let barns = [tunneled_barn("guided")];
+        let barns = [named_barn("guided")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -2958,11 +2948,11 @@ pub(crate) mod tests {
             "control: the stream has to be genuinely alive first"
         );
 
-        // The barn is switched off and immediately back on — `t` then `t`. The
+        // The barn disconnects and immediately reconnects — `C-d` then `c`. The
         // second reconcile puts the barn back in `streams`, so a `Failed` from
         // the stream we deliberately dropped is no longer covered by "this barn
         // is not streaming" and lands squarely on the new one.
-        reg.reconcile_with(&[named_barn("guided")], recording_spawner(&log, alive));
+        reg.reconcile_with(&[], recording_spawner(&log, alive));
         reg.reconcile_with(&barns, recording_spawner(&log, alive));
         guards.extend(guard_all(&reg));
 
@@ -2993,7 +2983,7 @@ pub(crate) mod tests {
         // its `Failed` sitting in the channel with nobody reading. Reopening the
         // grid spawns a fresh stream for that barn, and the stale event would
         // land on it: one dead barn ago, rendered STALE now.
-        let barns = [tunneled_barn("guided")];
+        let barns = [named_barn("guided")];
         let log = RefCell::new(Vec::new());
         let mut reg = RemoteStreams::new();
 
@@ -3021,17 +3011,55 @@ pub(crate) mod tests {
         reg.shutdown();
     }
 
+    // === the bounded jump select ==========================================
+
+    /// The jump's `select-window` runs on the thread that paints. A barn whose
+    /// ssh hangs must cost the TUI the bound and no more — and the ssh it gave
+    /// up on must not be left running, or as a zombie, behind it.
+    #[test]
+    fn a_bounded_command_that_overruns_is_killed_and_reaped_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let cmd = local_child(&format!("echo $$ > '{}'; exec sleep 30", pid_file.display()));
+
+        let started = Instant::now();
+        let outcome = run_bounded(cmd, Duration::from_millis(300), "guided").unwrap();
+        let took = started.elapsed();
+
+        assert_eq!(outcome, Bounded::TimedOut);
+        assert!(took < Duration::from_secs(3), "the select held the loop for {took:?}");
+        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        let _group = GroupGuard(pid);
+        assert_eq!(process_state(pid), None, "the abandoned select outlived the jump");
+    }
+
+    #[test]
+    fn a_bounded_command_that_finishes_in_time_reports_how_it_went() {
+        let ok = run_bounded(local_child("exit 0"), Duration::from_secs(5), "guided").unwrap();
+        assert_eq!(ok, Bounded::Done);
+
+        let err = run_bounded(
+            local_child("echo \"can't find window: 4\" >&2; exit 1"),
+            Duration::from_secs(5),
+            "guided",
+        )
+        .expect_err("a failed select is an error, not a timeout");
+        assert!(err.to_string().contains("can't find window: 4"), "{err}");
+
+        let silent = run_bounded(local_child("exit 255"), Duration::from_secs(5), "guided")
+            .expect_err("a silent failure is still a failure");
+        assert!(silent.to_string().contains("guided"), "{silent}");
+    }
+
     #[test]
     fn a_barn_that_cannot_be_reached_is_recorded_rather_than_spawning_a_child() {
         let _ranch = crate::testing::temp_ranch();
         // The real `reconcile`, the real `RemoteStream::spawn`: a barn with no
         // host cannot even produce an ssh argv. The failure has to be recorded
         // like any other, or reconcile retries it four times a second forever.
-        let barns = [Barn { host: None, ..tunneled_barn("ghost") }];
-        // CONTROL, and not a formality: `ssh::dial_host` falls back to
-        // `addresses` when `host` is `None`, so a fixture that carried one would
-        // make the real `RemoteStream::spawn` below open a real ssh to whatever
-        // it named. Nothing here may be reachable.
+        let barns = [Barn { host: None, ..named_barn("ghost") }];
+        // CONTROL: the real `RemoteStream::spawn` below would open a real ssh
+        // to whatever the fixture named. Nothing here may be reachable.
         assert!(
             crate::ssh::dial_host(&barns[0]).is_none(),
             "the fixture is dialable, so this test would ssh somewhere real"

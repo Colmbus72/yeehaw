@@ -60,7 +60,7 @@ mod sys {
 /// with no lock and no ordering between tests. A thread spawned *inside* a test
 /// gets its own empty recorder, exactly as it gets its own (absent) ranch.
 #[cfg(test)]
-mod sys {
+pub(crate) mod sys {
     use std::cell::RefCell;
 
     use anyhow::Result;

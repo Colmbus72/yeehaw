@@ -166,11 +166,6 @@ pub fn ensure_config_dirs() {
         trail_runs_dir(),
         poll_state_dir(),
         skills_dir(),
-        crate::tombstones::tombstones_dir(),
-        // The three-way merge's ancestor snapshots. Created up front like every
-        // other store directory, so the first sync is not also the first time
-        // this path has ever been exercised.
-        crate::ranch::base::base_dir(),
     ];
     for dir in &dirs {
         if !dir.exists() {
@@ -350,9 +345,6 @@ pub fn create_project(project: &mut Project) -> Result<()> {
 /// this was a rename and not a delete plus a create. `save_project` alone
 /// leaves the old file in place, and two files then carry one uuid.
 ///
-/// **No tombstone.** The surviving uuid is the whole signal; a tombstone would
-/// tell peers to delete the entity that was just renamed.
-///
 /// Write-then-delete, not delete-then-write. A crash between the two steps
 /// leaves a duplicate, which a human can resolve, rather than nothing at all.
 pub fn rename_project(old_name: &str, project: &mut Project) -> Result<()> {
@@ -428,18 +420,7 @@ pub fn rename_project(old_name: &str, project: &mut Project) -> Result<()> {
     Ok(())
 }
 
-/// Deletes a project and entombs it.
-///
-/// The tombstone is what stops the deletion from being undone. Absence and
-/// deletion look identical on disk, so a peer that still has the project reads
-/// "I have something you lack" and pushes it back. The tombstone says "I had
-/// this and I deleted it", keyed by the uuid the peer is matching on.
-///
-/// **Read the id before the unlink.** After `remove_file` there is nothing left
-/// to read it from, and the tombstone degrades to the `{kind}--{name}` fallback
-/// key — which no peer is matching on, so the deletion never lands.
-///
-/// Contrast [`rename_project`], which deliberately records nothing.
+/// Deletes a project.
 pub fn delete_project(name: &str) -> Result<bool> {
     validate_name(name, "project")?;
     let path = projects_dir().join(format!("{}.yaml", name));
@@ -447,27 +428,8 @@ pub fn delete_project(name: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    let id = entity_id::<Project>(&path);
-
     fs::remove_file(&path).context("Failed to delete project")?;
-    crate::tombstones::record("project", name, id.as_deref())?;
     Ok(true)
-}
-
-/// The stable id recorded in the entity file at `path`, if it has one.
-///
-/// Everything is best-effort on purpose: this runs on the deletion path, where
-/// the file is about to stop existing. An unreadable or unparseable file, or one
-/// written before Task 6 gave entities ids, yields `None` and the caller falls
-/// back to the deterministic `{kind}--{name}` key. Recording a deletion under a
-/// weaker key is strictly better than refusing to record it.
-fn entity_id<T: serde::de::DeserializeOwned + crate::types::Identified>(
-    path: &Path,
-) -> Option<String> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|c| serde_yaml::from_str::<T>(&c).ok())
-        .and_then(|e| e.id().map(|s| s.to_string()))
 }
 
 pub fn add_livestock_to_project(project_name: &str, livestock: &Livestock) -> Result<()> {
@@ -563,39 +525,19 @@ pub fn load_barns_checked() -> LoadResult<Barn> {
         result.items.insert(0, local_barn());
     }
 
-    // Ranch house, then this machine, then the tunneled barns, then everything
-    // else — each rank by name within itself.
+    // This machine, then everything else by name.
     //
-    // The two barns a user orients by are the one that arbitrates the ranch and
-    // the one they are sitting at; `read_dir` order put them wherever the
-    // filesystem felt like. Sorting here rather than in the barns panel is
-    // deliberate: `s`, `c`, `t` and `d` all index into this list, so a display
-    // that sorted on its own would act on a different barn than the one under
-    // the cursor.
+    // The barn a user orients by is the one they are sitting at; `read_dir`
+    // order put it wherever the filesystem felt like. The synthetic `local`
+    // row, when present, is this machine by definition.
     //
-    // The synthetic `local` row, when present, is this machine by definition
-    // and sorts second — there is no adopted record competing for the slot.
-    //
-    // Rank 2 is the tunneled ones: a barn the user has switched on has its
-    // sessions in the dashboard's sessions panel this second, keyed `A`-`Z`, so
-    // its row is one they keep returning to — `t` to switch it off again, `c` to
-    // walk into it. A barn nobody streams is a row that may never be touched.
-    // `tunneled` is machine-local (see [`crate::types::Barn::tunneled`]), which
-    // is exactly right for an ordering that only this machine's panel shows.
+    // Connected barns sort above the rest too, but that needs live tmux state
+    // and so happens in the app layer (`app::order_barns_for_display`), which
+    // owns the list the barns panel indexes into.
     let this_machine = this_barn_name();
     result.items.sort_by_key(|b| {
-        let rank = if b.is_ranch_house == Some(true) {
-            0
-        } else if b.name == LOCAL_BARN_NAME
-            || this_machine.as_deref() == Some(b.name.as_str())
-        {
-            1
-        } else if b.tunneled == Some(true) {
-            2
-        } else {
-            3
-        };
-        (rank, b.name.to_lowercase())
+        let this = b.name == LOCAL_BARN_NAME || this_machine.as_deref() == Some(b.name.as_str());
+        (!this, b.name.to_lowercase())
     });
 
     result
@@ -629,9 +571,8 @@ pub fn create_barn(barn: &mut Barn) -> Result<()> {
 }
 
 pub fn delete_barn(name: &str) -> Result<bool> {
-    // Above the tombstone logic, and it has to stay there. `local` is synthetic
-    // — injected into every listing, never written to disk — so there is no file
-    // to read an id from and no entity any peer could be asked to delete.
+    // `local` is synthetic — injected into every listing, never written to
+    // disk — so there is no file to delete.
     if name == LOCAL_BARN_NAME {
         return Ok(false);
     }
@@ -641,10 +582,7 @@ pub fn delete_barn(name: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    let id = entity_id::<Barn>(&path);
-
     fs::remove_file(&path).context("Failed to delete barn")?;
-    crate::tombstones::record("barn", name, id.as_deref())?;
     Ok(true)
 }
 
@@ -870,10 +808,7 @@ pub fn delete_worm(name: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    let id = entity_id::<Worm>(&path);
-
     fs::remove_file(&path).context("Failed to delete worm")?;
-    crate::tombstones::record("worm", name, id.as_deref())?;
     Ok(true)
 }
 
@@ -1054,10 +989,7 @@ pub fn delete_trail(name: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    let id = entity_id::<crate::trails::Trail>(&path);
-
     fs::remove_file(&path).context("Failed to delete trail")?;
-    crate::tombstones::record("trail", name, id.as_deref())?;
     Ok(true)
 }
 
@@ -1234,10 +1166,7 @@ pub fn delete_ranchhand(name: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    let id = entity_id::<RanchHand>(&path);
-
     fs::remove_file(&path).context("Failed to delete ranchhand")?;
-    crate::tombstones::record("ranchhand", name, id.as_deref())?;
     Ok(true)
 }
 
@@ -2341,7 +2270,7 @@ jobs:
         assert!(loaded.last_sync.is_some(), "last_sync must actually have been written");
     }
 
-    /// Slice D gave `Barn` a `Default`, which makes
+    /// `Barn` has a `Default`, which makes
     /// `Barn { host: .., ..Default::default() }` a one-line way to ask for a barn
     /// with no name. The name becomes the filename, so an unnamed barn lands at
     /// `barns/.yaml` — a dotfile that then loads back as a barn called `""`,
@@ -2440,23 +2369,15 @@ jobs:
 
     /// The whole point of the change: a file that fails to parse used to
     /// disappear from the UI with no error at all.
-    /// The two barns a user orients by are the one that arbitrates the ranch
-    /// and the one they are sitting at. `read_dir` put them wherever the
-    /// filesystem felt like.
+    /// The barn a user orients by is the one they are sitting at. `read_dir`
+    /// put it wherever the filesystem felt like.
     #[test]
-    fn the_ranch_house_leads_the_list_and_this_machine_follows_it() {
+    fn this_machine_leads_the_list_and_the_rest_follow_by_name() {
         crate::testing::with_temp_ranch(|_| {
-            let mut mk = |name: &str, house: bool| {
+            for name in ["zulu", "Alpha", "smashed-air", "camerons-imac"] {
                 let mut b = Barn { name: name.into(), ..Default::default() };
-                if house {
-                    b.is_ranch_house = Some(true);
-                }
                 save_barn(&mut b).unwrap();
-            };
-            mk("zulu", false);
-            mk("alpha", false);
-            mk("smashed-air", false);
-            mk("camerons-imac", true);
+            }
 
             let mut cfg = load_config();
             cfg.this_barn = Some("smashed-air".into());
@@ -2467,58 +2388,12 @@ jobs:
             assert_eq!(
                 names,
                 vec![
-                    "camerons-imac".to_string(),
                     "smashed-air".to_string(),
-                    "alpha".to_string(),
+                    "Alpha".to_string(),
+                    "camerons-imac".to_string(),
                     "zulu".to_string(),
                 ],
-                "house first, this machine second, the rest by name"
-            );
-        });
-    }
-
-    /// The third rank. A tunneled barn is the one whose sessions are on screen
-    /// right now — keyed `A`-`Z` in the sessions panel — so it is a row the user
-    /// keeps coming back to, where a barn nobody streams is a row they may never
-    /// touch. The two ranks above it were asked for by name and do not move.
-    #[test]
-    fn tunneled_barns_sort_under_the_house_and_this_machine_but_above_the_rest() {
-        crate::testing::with_temp_ranch(|_| {
-            let mk = |name: &str, house: bool, tunneled: bool| {
-                let mut b = Barn { name: name.into(), ..Default::default() };
-                if house {
-                    b.is_ranch_house = Some(true);
-                }
-                if tunneled {
-                    b.tunneled = Some(true);
-                }
-                save_barn(&mut b).unwrap();
-            };
-            // The house is *not* tunneled, so a tunneled barn overtaking it
-            // would show up here rather than hiding behind rank 0.
-            mk("camerons-imac", true, false);
-            mk("smashed-air", false, true);
-            mk("zulu", false, true);
-            mk("alpha", false, false);
-            mk("beta", false, true);
-            mk("yankee", false, false);
-
-            let mut cfg = load_config();
-            cfg.this_barn = Some("smashed-air".into());
-            save_config(&cfg).unwrap();
-
-            let names: Vec<String> = load_barns().into_iter().map(|b| b.name).collect();
-            assert_eq!(
-                names,
-                vec![
-                    "camerons-imac".to_string(),
-                    "smashed-air".to_string(),
-                    "beta".to_string(),
-                    "zulu".to_string(),
-                    "alpha".to_string(),
-                    "yankee".to_string(),
-                ],
-                "house, this machine, the tunneled ones by name, then the rest by name"
+                "this machine first, the rest by name, ignoring case"
             );
         });
     }
@@ -2528,22 +2403,17 @@ jobs:
     #[test]
     fn the_synthetic_row_takes_this_machines_slot_when_nothing_else_does() {
         crate::testing::with_temp_ranch(|_| {
-            let mut mk = |name: &str, house: bool| {
+            for name in ["alpha", "pi"] {
                 let mut b = Barn { name: name.into(), ..Default::default() };
-                if house {
-                    b.is_ranch_house = Some(true);
-                }
                 save_barn(&mut b).unwrap();
-            };
-            mk("alpha", false);
-            mk("pi", true);
+            }
 
             let names: Vec<String> =
                 load_barns().into_iter().map(|b| b.name).collect();
             assert_eq!(
                 names,
-                vec!["pi".to_string(), LOCAL_BARN_NAME.to_string(), "alpha".to_string()],
-                "the placeholder is this machine and sorts second"
+                vec![LOCAL_BARN_NAME.to_string(), "alpha".to_string(), "pi".to_string()],
+                "the placeholder is this machine and sorts first"
             );
         });
     }
@@ -2729,104 +2599,10 @@ jobs:
         });
     }
 
-    // ========================================================================
-    // Tombstones on deletion (Task 10)
-    // ========================================================================
-
-    #[test]
-    fn delete_project_records_a_tombstone_with_the_entity_id() {
-        testing::with_temp_ranch(|_| {
-            let mut p = bare_project("api");
-            save_project(&mut p).unwrap();
-            let id = p.id.clone().unwrap();
-
-            assert!(delete_project("api").unwrap());
-
-            let stones = crate::tombstones::load_all();
-            assert_eq!(stones.len(), 1);
-            assert_eq!(stones[0].id, id, "tombstone must carry the entity's uuid");
-            assert_eq!(stones[0].kind, "project");
-            assert_eq!(stones[0].name, "api");
-        });
-    }
-
-    /// A deletion of something that was never there is not a deletion. Recording
-    /// one would hand every peer an instruction to delete an entity this machine
-    /// never had — and `delete_*` returning `false` is exactly how the callers
-    /// spell "nothing to do".
-    #[test]
-    fn deleting_a_missing_project_records_nothing() {
-        testing::with_temp_ranch(|_| {
-            assert!(!delete_project("nope").unwrap());
-            assert!(crate::tombstones::load_all().is_empty());
-        });
-    }
-
-    /// Every top-level entity, not just projects. Each is entombed under its own
-    /// kind, because the kind plus the uuid is what a peer matches against.
-    #[test]
-    fn every_deleter_records_a_tombstone_carrying_the_entitys_id() {
-        testing::with_temp_ranch(|_| {
-            let mut barn = bare_barn("pi");
-            save_barn(&mut barn).unwrap();
-            let mut worm = bare_worm("nightly");
-            save_worm(&mut worm).unwrap();
-            let mut trail = bare_trail("deploy");
-            save_trail(&mut trail).unwrap();
-            let mut rh = bare_ranchhand("k8s");
-            save_ranchhand(&mut rh).unwrap();
-
-            assert!(delete_barn("pi").unwrap());
-            assert!(delete_worm("nightly").unwrap());
-            assert!(delete_trail("deploy").unwrap());
-            assert!(delete_ranchhand("k8s").unwrap());
-
-            let mut got: Vec<(String, String, String)> = crate::tombstones::load_all()
-                .into_iter()
-                .map(|t| (t.kind, t.name, t.id))
-                .collect();
-            got.sort();
-
-            let mut want = vec![
-                ("barn".to_string(), "pi".to_string(), barn.id.clone().unwrap()),
-                ("ranchhand".to_string(), "k8s".to_string(), rh.id.clone().unwrap()),
-                ("trail".to_string(), "deploy".to_string(), trail.id.clone().unwrap()),
-                ("worm".to_string(), "nightly".to_string(), worm.id.clone().unwrap()),
-            ];
-            want.sort();
-
-            assert_eq!(got, want);
-        });
-    }
-
-    /// `local` is injected into every listing and never written to disk, so
-    /// there is no file to read an id from and no entity for a peer to delete.
-    /// `delete_barn` returns `false` for it before anything else happens.
-    #[test]
-    fn deleting_the_local_barn_entombs_nothing() {
-        testing::with_temp_ranch(|_| {
-            ensure_config_dirs();
-            assert!(!delete_barn(LOCAL_BARN_NAME).unwrap());
-            assert!(
-                crate::tombstones::load_all().is_empty(),
-                "the synthetic local barn has nothing to entomb"
-            );
-        });
-    }
-
-    /// The critical asymmetry between a rename and a delete.
-    ///
     /// A rename keeps the uuid and moves the file; the surviving uuid *is* the
-    /// signal that says "renamed, not replaced". A tombstone says the opposite —
-    /// it tells every peer to delete that uuid. Emit both and the sync deletes
-    /// the project the user just renamed.
-    ///
-    /// This is a live hazard rather than a hypothetical one: `rename_project`
-    /// removes the old file itself instead of calling `delete_project`, and the
-    /// obvious "simplification" is to route it through `delete_project` — which
-    /// would silently entomb the survivor.
+    /// signal that says "renamed, not replaced".
     #[test]
-    fn renaming_a_project_records_no_tombstone() {
+    fn renaming_a_project_keeps_its_id() {
         testing::with_temp_ranch(|_| {
             let mut p = bare_project("api");
             save_project(&mut p).unwrap();
@@ -2836,76 +2612,10 @@ jobs:
             renamed.name = "gateway".into();
             rename_project("api", &mut renamed).unwrap();
 
-            assert!(
-                crate::tombstones::load_all().is_empty(),
-                "a rename must leave no tombstone — the surviving uuid is the \
-                 rename signal, and a tombstone would tell peers to delete it"
-            );
-
             let loaded = load_projects();
             assert_eq!(loaded.len(), 1);
             assert_eq!(loaded[0].name, "gateway");
             assert_eq!(loaded[0].id.as_deref(), Some(id.as_str()));
-        });
-    }
-
-    /// Renaming a project to the name it already has short-circuits into
-    /// `save_project`. That path must stay tombstone-free too.
-    #[test]
-    fn renaming_a_project_to_its_own_name_records_no_tombstone() {
-        testing::with_temp_ranch(|_| {
-            let mut p = bare_project("api");
-            save_project(&mut p).unwrap();
-
-            let mut same = p.clone();
-            rename_project("api", &mut same).unwrap();
-
-            assert!(crate::tombstones::load_all().is_empty());
-        });
-    }
-
-    /// Every file already on disk predates Task 6 and carries no uuid, and
-    /// nothing restamps one until it is next saved. Deleting such a project
-    /// still has to be recorded — under the deterministic fallback key, because
-    /// a deletion nobody wrote down is a resurrection on the next sync.
-    #[test]
-    fn deleting_a_project_that_was_never_stamped_records_the_fallback_key() {
-        testing::with_temp_ranch(|_| {
-            ensure_config_dirs();
-            fs::write(
-                projects_dir().join("legacy.yaml"),
-                "name: legacy\npath: /tmp/legacy\n",
-            )
-            .unwrap();
-
-            assert!(delete_project("legacy").unwrap());
-
-            let stones = crate::tombstones::load_all();
-            assert_eq!(stones.len(), 1);
-            assert_eq!(stones[0].id, "project--legacy");
-            assert_eq!(stones[0].kind, "project");
-        });
-    }
-
-    /// The id has to be read out of the file while the file still exists.
-    /// Reading it after the `remove_file` yields `None` every time, and the
-    /// tombstone silently degrades to the fallback key — which is not the uuid
-    /// the peer holding this project is matching on, so the deletion never
-    /// cancels their copy and the project comes back.
-    #[test]
-    fn a_deletion_tombstone_is_never_the_fallback_key_when_the_entity_had_an_id() {
-        testing::with_temp_ranch(|_| {
-            let mut p = bare_project("api");
-            save_project(&mut p).unwrap();
-
-            delete_project("api").unwrap();
-
-            let stones = crate::tombstones::load_all();
-            assert_eq!(stones.len(), 1);
-            assert_ne!(
-                stones[0].id, "project--api",
-                "the id was read after the file was removed, so it was lost"
-            );
         });
     }
 
