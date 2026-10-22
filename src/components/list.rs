@@ -1,3 +1,4 @@
+use crossterm::event::KeyCode;
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
@@ -228,6 +229,191 @@ impl ListState {
             self.scroll_offset = self.selected;
         }
     }
+}
+
+// ===========================================================================
+// Type-to-filter
+// ===========================================================================
+//
+// `/` on a focused list starts a filter; typed characters narrow the list to
+// rows whose label contains them (case-insensitive). `Esc` drops the filter and
+// brings every row back, and so does `Tab`ing to another panel. One filter per
+// view is enough for that reason: it only ever applies to the focused panel.
+//
+// The filter never touches the data a view indexes into. A view runs its rows
+// through [`filter_items`], keeps the returned index map, and resolves the
+// cursor through it — so what `Enter` opens is exactly the row drawn under the
+// cursor, filtered or not.
+
+/// What the filter did with a key.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FilterKey {
+    /// The filter used the key. `changed` says the query moved, so the view
+    /// should put its cursor back on the first row.
+    Consumed { changed: bool },
+    /// Not the filter's key: the view handles it as it would without a filter.
+    PassThrough,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ListFilter {
+    query: String,
+    typing: bool,
+}
+
+impl ListFilter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Keys are going into the query. While this is true the view, and the app
+    /// above it, must treat every printable key as text.
+    pub fn is_typing(&self) -> bool {
+        self.typing
+    }
+
+    /// A filter is narrowing the list, or is open to be typed into.
+    pub fn is_active(&self) -> bool {
+        self.typing || !self.query.is_empty()
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn clear(&mut self) {
+        self.query.clear();
+        self.typing = false;
+    }
+
+    /// Does a row with this label survive the filter?
+    pub fn matches(&self, label: &str) -> bool {
+        self.query.is_empty() || label.to_lowercase().contains(&self.query.to_lowercase())
+    }
+
+    /// Offer a key to the filter before the view sees it.
+    ///
+    /// While typing, printable keys and `Backspace` edit the query, `Esc`
+    /// drops it, and `↑`/`↓`/`Enter`/`Tab` pass through so the user can move
+    /// and open without leaving the filter first. `Enter` also stops typing,
+    /// keeping the filter, so `j`/`k` and the panel's hotkeys work again.
+    ///
+    /// Outside typing, only `/` (start), `Esc` with a filter applied (drop it)
+    /// and `Tab` (drop it, then switch panels as usual) are the filter's.
+    pub fn handle_key(&mut self, key: KeyCode) -> FilterKey {
+        if self.typing {
+            return match key {
+                KeyCode::Esc => {
+                    self.clear();
+                    FilterKey::Consumed { changed: true }
+                }
+                KeyCode::Enter => {
+                    self.typing = false;
+                    FilterKey::PassThrough
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    self.clear();
+                    FilterKey::PassThrough
+                }
+                KeyCode::Up | KeyCode::Down => FilterKey::PassThrough,
+                KeyCode::Backspace => {
+                    if self.query.pop().is_none() {
+                        self.typing = false;
+                    }
+                    FilterKey::Consumed { changed: true }
+                }
+                KeyCode::Char(c) => {
+                    self.query.push(c);
+                    FilterKey::Consumed { changed: true }
+                }
+                _ => FilterKey::Consumed { changed: false },
+            };
+        }
+        match key {
+            KeyCode::Char('/') => {
+                self.typing = true;
+                FilterKey::Consumed { changed: false }
+            }
+            KeyCode::Esc if self.is_active() => {
+                self.clear();
+                FilterKey::Consumed { changed: true }
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.clear();
+                FilterKey::PassThrough
+            }
+            _ => FilterKey::PassThrough,
+        }
+    }
+}
+
+/// The rows that survive `filter`, paired with each one's index in `items`.
+///
+/// A heading survives only while at least one row under it does: a barn name
+/// over nothing is noise, and it would be the only thing left to look at.
+/// Headings are matched on the rows beneath them, not their own label.
+pub fn filter_items(items: Vec<ListItem>, filter: &ListFilter) -> (Vec<ListItem>, Vec<usize>) {
+    if filter.query().is_empty() {
+        let map = (0..items.len()).collect();
+        return (items, map);
+    }
+    let mut out: Vec<ListItem> = Vec::new();
+    let mut map: Vec<usize> = Vec::new();
+    let mut pending_heading: Option<(usize, ListItem)> = None;
+    for (i, item) in items.into_iter().enumerate() {
+        if item.style == RowStyle::Heading {
+            pending_heading = Some((i, item));
+            continue;
+        }
+        if filter.matches(&item.label) {
+            if let Some((hi, heading)) = pending_heading.take() {
+                out.push(heading);
+                map.push(hi);
+            }
+            out.push(item);
+            map.push(i);
+        }
+    }
+    (out, map)
+}
+
+/// [`render_list`], with the filter's query drawn on the panel's first row
+/// whenever a filter is active. The row is only taken while there is something
+/// to show in it.
+pub fn render_filtered_list(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[ListItem],
+    state: &mut ListState,
+    focused: bool,
+    filter: &ListFilter,
+) {
+    if !(focused && filter.is_active()) || area.height < 2 {
+        render_list(frame, area, items, state, focused, None);
+        return;
+    }
+    let mut spans = vec![
+        Span::styled("/ ", Style::default().fg(BRAND_COLOR).add_modifier(Modifier::BOLD)),
+        Span::raw(filter.query().to_string()),
+    ];
+    if filter.is_typing() {
+        spans.push(Span::styled("▏", Style::default().fg(BRAND_COLOR)));
+    } else {
+        spans.push(Span::styled("  [esc] clear", Style::default().fg(Color::DarkGray)));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect { x: area.x, y: area.y, width: area.width, height: 1 },
+    );
+    let rest = Rect { y: area.y + 1, height: area.height - 1, ..area };
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matches").style(Style::default().fg(Color::DarkGray)),
+            rest,
+        );
+        return;
+    }
+    render_list(frame, rest, items, state, focused, None);
 }
 
 pub fn render_list(
@@ -571,5 +757,70 @@ mod tests {
         assert!(!text_at(&buf, 0, 40).starts_with('\u{203a}'), "the heading got the cursor");
         assert!(text_at(&buf, 1, 40).starts_with('\u{203a}'), "and nothing else got it either");
         assert_eq!(state.selected, 1, "render left the cursor parked on a heading");
+    }
+
+    fn labels(items: &[ListItem]) -> Vec<&str> {
+        items.iter().map(|i| i.label.as_str()).collect()
+    }
+
+    fn typed(keys: &str) -> ListFilter {
+        let mut f = ListFilter::new();
+        f.handle_key(KeyCode::Char('/'));
+        for c in keys.chars() {
+            f.handle_key(KeyCode::Char(c));
+        }
+        f
+    }
+
+    #[test]
+    fn the_filter_matches_labels_case_insensitively_and_maps_back() {
+        let items = vec![row("Web", RowStyle::Normal), row("worker", RowStyle::Normal), row("api", RowStyle::Normal)];
+        let (out, map) = filter_items(items, &typed("w"));
+        assert_eq!(labels(&out), ["Web", "worker"]);
+        assert_eq!(map, [0, 1]);
+    }
+
+    #[test]
+    fn a_heading_survives_only_with_a_matching_row_under_it() {
+        let items = vec![
+            row("local-a", RowStyle::Normal),
+            row("guided", RowStyle::Heading),
+            row("A", RowStyle::Muted),
+            row("smash", RowStyle::Heading),
+            row("local-b", RowStyle::Muted),
+        ];
+        let (out, map) = filter_items(items, &typed("local"));
+        assert_eq!(labels(&out), ["local-a", "smash", "local-b"]);
+        assert_eq!(map, [0, 3, 4]);
+    }
+
+    #[test]
+    fn esc_clears_the_filter_and_typed_letters_are_never_passed_through() {
+        let mut f = typed("ab");
+        assert!(f.is_typing());
+        assert_eq!(f.handle_key(KeyCode::Char('j')), FilterKey::Consumed { changed: true });
+        assert_eq!(f.handle_key(KeyCode::Down), FilterKey::PassThrough);
+        assert_eq!(f.handle_key(KeyCode::Esc), FilterKey::Consumed { changed: true });
+        assert!(!f.is_active());
+        // With nothing applied, Esc is the view's again (go back).
+        assert_eq!(f.handle_key(KeyCode::Esc), FilterKey::PassThrough);
+    }
+
+    #[test]
+    fn enter_stops_typing_but_keeps_the_filter_and_tab_drops_it() {
+        let mut f = typed("ab");
+        assert_eq!(f.handle_key(KeyCode::Enter), FilterKey::PassThrough);
+        assert!(!f.is_typing());
+        assert_eq!(f.query(), "ab");
+        assert_eq!(f.handle_key(KeyCode::Char('j')), FilterKey::PassThrough, "j navigates again");
+        assert_eq!(f.handle_key(KeyCode::Tab), FilterKey::PassThrough);
+        assert!(!f.is_active());
+    }
+
+    #[test]
+    fn backspace_on_an_empty_query_closes_the_filter() {
+        let mut f = typed("");
+        f.handle_key(KeyCode::Backspace);
+        assert!(!f.is_active());
     }
 }

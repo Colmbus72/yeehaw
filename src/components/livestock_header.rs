@@ -91,85 +91,103 @@ fn generate_cow_art(livestock: &Livestock, project_name: &str) -> Vec<String> {
         .collect()
 }
 
+/// Rows the cow takes.
+pub const COW_HEIGHT: u16 = COW_TEMPLATE.len() as u16;
+
+/// Columns the cow takes.
+fn cow_width() -> u16 {
+    COW_TEMPLATE.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16
+}
+
+/// Room the details need beside the cow before it is worth putting them there.
+const DETAILS_MIN_WIDTH: u16 = 30;
+
+/// Below this many rows for the whole view, the cow is dropped and only the
+/// details are drawn: the panels underneath are what the page is for.
+const MIN_VIEW_HEIGHT_FOR_COW: u16 = 30;
+
+/// How many rows the header wants, given the whole area the view has.
+///
+/// Wide enough: the cow, with the details beside it — one cow's height and not
+/// a row more. Too narrow for that: the cow over the details. Too short for a
+/// cow at all: the details alone.
+pub fn preferred_height(view: Rect, livestock: &Livestock) -> u16 {
+    let details = detail_lines(livestock, "").len() as u16;
+    if view.height < MIN_VIEW_HEIGHT_FOR_COW {
+        details
+    } else if view.width >= cow_width() + 2 + DETAILS_MIN_WIDTH {
+        COW_HEIGHT
+    } else {
+        COW_HEIGHT + 1 + details
+    }
+}
+
+fn detail_lines(livestock: &Livestock, project_name: &str) -> Vec<Line<'static>> {
+    let label = |s: &'static str| Span::styled(s, Style::default().fg(Color::DarkGray));
+    let value = |s: String| Span::styled(s, Style::default().fg(Color::White));
+
+    let mut lines = vec![
+        Line::from(vec![
+            label(" Name:    "),
+            Span::styled(livestock.name.clone(), Style::default().fg(BRAND_COLOR).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![label(" Project: "), value(project_name.to_string())]),
+        Line::from(vec![label(" Path:    "), value(livestock.path.clone())]),
+    ];
+
+    // Only livestock that lives somewhere else gets a `Barn:` row. A livestock
+    // on this machine never had one, and adoption renaming it from `None` to
+    // the machine's own name is not a fact worth a line of the header.
+    if let Some(barn) = crate::config::resolve_livestock_barn(livestock) {
+        lines.push(Line::from(vec![label(" Barn:    "), value(barn.to_string())]));
+    }
+    if let Some(ref repo) = livestock.repo {
+        lines.push(Line::from(vec![label(" Repo:    "), value(repo.clone())]));
+    }
+    lines
+}
+
 pub fn render_livestock_header(
     frame: &mut Frame,
     area: Rect,
     livestock: &Livestock,
     project_name: &str,
 ) {
-    let cow_art = generate_cow_art(livestock, project_name);
-    let mut lines: Vec<Line> = Vec::new();
+    let details = detail_lines(livestock, project_name);
 
-    // Render the cow art — all in brand color
-    for art_line in &cow_art {
-        lines.push(Line::from(Span::styled(
-            art_line.clone(),
-            Style::default().fg(BRAND_COLOR).add_modifier(Modifier::BOLD),
-        )));
+    // Not enough rows for the cow: details only.
+    if area.height < COW_HEIGHT {
+        frame.render_widget(Paragraph::new(details), area);
+        return;
     }
 
-    // Blank separator
+    let cow: Vec<Line> = generate_cow_art(livestock, project_name)
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, Style::default().fg(BRAND_COLOR).add_modifier(Modifier::BOLD))))
+        .collect();
+
+    let cow_w = cow_width();
+    if area.width >= cow_w + 2 + DETAILS_MIN_WIDTH {
+        // Side by side: the details sit level with the cow's head and body.
+        let cow_area = Rect { width: cow_w, height: COW_HEIGHT, ..area };
+        frame.render_widget(Paragraph::new(cow), cow_area);
+
+        let top = (COW_HEIGHT.saturating_sub(details.len() as u16)) / 2;
+        let details_area = Rect {
+            x: area.x + cow_w + 2,
+            y: area.y + top,
+            width: area.width - cow_w - 2,
+            height: area.height.saturating_sub(top),
+        };
+        frame.render_widget(Paragraph::new(details), details_area);
+        return;
+    }
+
+    // Narrow: the cow over the details.
+    let mut lines = cow;
     lines.push(Line::from(""));
-
-    // Metadata lines
-    lines.push(Line::from(vec![
-        Span::styled(
-            " Name:    ",
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            livestock.name.clone(),
-            Style::default().fg(BRAND_COLOR).add_modifier(Modifier::BOLD),
-        ),
-    ]));
-
-    lines.push(Line::from(vec![
-        Span::styled(
-            " Project: ",
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(project_name.to_string(), Style::default().fg(Color::White)),
-    ]));
-
-    lines.push(Line::from(vec![
-        Span::styled(
-            " Path:    ",
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            livestock.path.clone(),
-            Style::default().fg(Color::White),
-        ),
-    ]));
-
-    // Only livestock that lives somewhere else gets a `Barn:` row. A livestock
-    // on this machine never had one, and adoption renaming it from `None` to
-    // the machine's own name is not a fact worth a line of the header.
-    if let Some(barn) = crate::config::resolve_livestock_barn(livestock) {
-        lines.push(Line::from(vec![
-            Span::styled(
-                " Barn:    ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(barn.to_string(), Style::default().fg(Color::White)),
-        ]));
-    }
-
-    if let Some(ref repo) = livestock.repo {
-        lines.push(Line::from(vec![
-            Span::styled(
-                " Repo:    ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(repo.clone(), Style::default().fg(Color::White)),
-        ]));
-    }
-
-    let total = lines.len().min(area.height as usize);
-    let visible: Vec<Line> = lines.into_iter().take(total).collect();
-
-    let paragraph = Paragraph::new(visible);
-    frame.render_widget(paragraph, area);
+    lines.extend(details);
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 #[cfg(test)]
@@ -232,5 +250,33 @@ mod tests {
         );
         assert!(!screen(&livestock_on(None)).contains("Barn:"));
         assert!(screen(&livestock_on(Some("pi"))).contains("Barn:"));
+    }
+
+    /// On a wide screen the details sit beside the cow, so the header is one
+    /// cow tall and every detail line is on screen — the feet included.
+    #[test]
+    fn a_wide_header_puts_the_details_beside_the_cow() {
+        let _ranch = crate::testing::temp_ranch();
+        let ls = livestock_on(None);
+        let view = Rect::new(0, 0, 120, 40);
+        let h = preferred_height(view, &ls);
+        assert_eq!(h, COW_HEIGHT);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, h)).expect("terminal");
+        terminal.draw(|f| render_livestock_header(f, f.area(), &ls, "api")).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..h)
+            .map(|y| (0..120).map(|x| buf.cell((x, y)).unwrap().symbol().to_string()).collect::<String>() + "\n")
+            .collect();
+        assert!(text.contains("Path:"), "{text}");
+        assert!(text.contains("`^'"), "the cow's feet were cut off:\n{text}");
+    }
+
+    /// A short terminal drops the cow rather than the panels below it.
+    #[test]
+    fn a_short_view_gets_the_details_only() {
+        let _ranch = crate::testing::temp_ranch();
+        let ls = livestock_on(None);
+        assert!(preferred_height(Rect::new(0, 0, 120, 24), &ls) < COW_HEIGHT);
     }
 }

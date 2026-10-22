@@ -5,7 +5,7 @@ use ratatui::widgets::Paragraph;
 use crate::app::BarnAction;
 use crate::components::barn_header;
 use crate::components::header;
-use crate::components::list::{self, ListItem, ListState, ItemStatus};
+use crate::components::list::{self, FilterKey, ListFilter, ListItem, ListState, ItemStatus};
 use crate::components::panel::Panel;
 use crate::components::text_input::TextInput;
 use crate::config;
@@ -68,6 +68,8 @@ pub struct BarnContextView {
     edit_identity_file: String,
     // New critter form
     new_critter_name: String,
+    /// `/` filter over the focused panel.
+    filter: ListFilter,
 }
 
 impl BarnContextView {
@@ -83,11 +85,50 @@ impl BarnContextView {
             edit_port: String::new(),
             edit_identity_file: String::new(),
             new_critter_name: String::new(),
+            filter: ListFilter::new(),
         }
     }
 
     pub fn is_editing(&self) -> bool {
         self.edit_mode != EditMode::Normal
+    }
+
+    /// A `/` filter is being typed into: every key is text.
+    pub fn is_filter_typing(&self) -> bool {
+        self.filter.is_typing()
+    }
+
+    /// A filter is applied, so `Esc` belongs to it rather than to "go back".
+    pub fn has_filter(&self) -> bool {
+        self.filter.is_active()
+    }
+
+    fn filter_for(&self, panel: FocusedPanel) -> ListFilter {
+        if self.focused_panel == panel { self.filter.clone() } else { ListFilter::new() }
+    }
+
+    fn livestock_rows(&self, livestock: &[(Project, Livestock)]) -> (Vec<ListItem>, Vec<usize>) {
+        let items = livestock.iter().map(|(p, ls)| ListItem {
+            id: format!("{}:{}", p.name, ls.name),
+            label: format!("{} / {}", p.name, ls.name),
+            status: Some(ItemStatus::Active),
+            meta: Some(ls.path.clone()),
+            actions: vec![],
+            ..Default::default()
+        }).collect();
+        list::filter_items(items, &self.filter_for(FocusedPanel::Livestock))
+    }
+
+    fn critter_rows(&self, barn: &Barn) -> (Vec<ListItem>, Vec<usize>) {
+        let items = barn.critters.iter().map(|c| ListItem {
+            id: c.name.clone(),
+            label: c.name.clone(),
+            status: Some(ItemStatus::Active),
+            meta: Some(c.service.clone()),
+            actions: vec![],
+            ..Default::default()
+        }).collect();
+        list::filter_items(items, &self.filter_for(FocusedPanel::Critters))
     }
 
     fn start_edit(&mut self, barn: &Barn) {
@@ -155,7 +196,7 @@ impl BarnContextView {
         }
     }
 
-    pub fn handle_input(&mut self, key: KeyCode, barn: &Barn, livestock_count: usize) -> BarnAction {
+    pub fn handle_input(&mut self, key: KeyCode, barn: &Barn, livestock: &[(Project, Livestock)]) -> BarnAction {
         // Handle edit mode input
         if self.edit_mode != EditMode::Normal {
             if key == KeyCode::Esc {
@@ -202,6 +243,22 @@ impl BarnContextView {
         }
 
         // Normal mode
+        // The `/` filter sees every key first.
+        match self.filter.handle_key(key) {
+            FilterKey::Consumed { changed } => {
+                if changed {
+                    match self.focused_panel {
+                        FocusedPanel::Livestock => self.livestock_state.select_first(),
+                        FocusedPanel::Critters => self.critters_state.select_first(),
+                    }
+                }
+                return BarnAction::None;
+            }
+            FilterKey::PassThrough => {}
+        }
+        // Only ↑/↓/Enter get past a filter being typed into.
+        let typing = self.filter.is_typing();
+
         // Tab to cycle
         if key == KeyCode::Tab {
             self.focused_panel = match self.focused_panel {
@@ -211,39 +268,59 @@ impl BarnContextView {
             return BarnAction::None;
         }
 
-        // Page-level: 's' to SSH into barn
-        if key == KeyCode::Char('s') {
-            return BarnAction::SshToBarn;
-        }
-
-        // Page-level: 'c' to connect to the barn's remote yeehaw
-        if key == KeyCode::Char('c') {
-            return BarnAction::ConnectBarn;
-        }
-
-        // Page-level: 'e' to edit barn (only for remote barns)
-        if key == KeyCode::Char('e') {
-            if !config::is_local_barn(barn) {
-                self.start_edit(barn);
+        if !typing {
+            match key {
+                // Page-level: 's' to SSH into barn
+                KeyCode::Char('s') => return BarnAction::SshToBarn,
+                // Page-level: 'c' to connect to the barn's remote yeehaw
+                KeyCode::Char('c') => return BarnAction::ConnectBarn,
+                // Page-level: 'e' to edit barn (only for remote barns)
+                KeyCode::Char('e') => {
+                    if !config::is_local_barn(barn) {
+                        self.start_edit(barn);
+                    }
+                    return BarnAction::None;
+                }
+                _ => {}
             }
-            return BarnAction::None;
         }
 
         match self.focused_panel {
             FocusedPanel::Livestock => {
+                let map = self.livestock_rows(livestock).1;
+                let count = map.len();
                 match key {
-                    KeyCode::Char('j') | KeyCode::Down => self.livestock_state.select_next(livestock_count),
-                    KeyCode::Char('k') | KeyCode::Up => self.livestock_state.select_prev(),
-                    KeyCode::Enter => return BarnAction::SelectLivestock(self.livestock_state.selected),
+                    KeyCode::Down => self.livestock_state.select_next(count),
+                    KeyCode::Up => self.livestock_state.select_prev(),
+                    KeyCode::Enter => {
+                        if let Some(&i) = map.get(self.livestock_state.selected) {
+                            return BarnAction::SelectLivestock(i);
+                        }
+                    }
+                    _ if typing => {}
+                    KeyCode::Char('j') => self.livestock_state.select_next(count),
+                    KeyCode::Char('k') => self.livestock_state.select_prev(),
+                    KeyCode::Char('g') => self.livestock_state.select_first(),
+                    KeyCode::Char('G') => self.livestock_state.select_last(count),
                     _ => {}
                 }
             }
             FocusedPanel::Critters => {
-                let count = barn.critters.len();
+                let map = self.critter_rows(barn).1;
+                let count = map.len();
                 match key {
-                    KeyCode::Char('j') | KeyCode::Down => self.critters_state.select_next(count),
-                    KeyCode::Char('k') | KeyCode::Up => self.critters_state.select_prev(),
-                    KeyCode::Enter => return BarnAction::SelectCritter(self.critters_state.selected),
+                    KeyCode::Down => self.critters_state.select_next(count),
+                    KeyCode::Up => self.critters_state.select_prev(),
+                    KeyCode::Enter => {
+                        if let Some(&i) = map.get(self.critters_state.selected) {
+                            return BarnAction::SelectCritter(i);
+                        }
+                    }
+                    _ if typing => {}
+                    KeyCode::Char('j') => self.critters_state.select_next(count),
+                    KeyCode::Char('k') => self.critters_state.select_prev(),
+                    KeyCode::Char('g') => self.critters_state.select_first(),
+                    KeyCode::Char('G') => self.critters_state.select_last(count),
                     KeyCode::Char('n') => {
                         self.edit_mode = EditMode::NewCritterName;
                         self.text_input = TextInput::new("");
@@ -298,48 +375,30 @@ impl BarnContextView {
         let livestock_panel = Panel {
             title: "Livestock",
             focused: self.focused_panel == FocusedPanel::Livestock,
-            hints: Some("[n] add"),
+            hints: Some("[n] add  [/] filter"),
         };
         let livestock_inner = livestock_panel.render(frame, panels[0]);
-        let livestock_items: Vec<ListItem> = livestock.iter().map(|(p, ls)| {
-            ListItem {
-                id: format!("{}:{}", p.name, ls.name),
-                label: format!("{} / {}", p.name, ls.name),
-                status: Some(ItemStatus::Active),
-                meta: Some(ls.path.clone()),
-                actions: vec![],
-                ..Default::default()
-            }
-        }).collect();
-        list::render_list(
+        let (livestock_items, _) = self.livestock_rows(livestock);
+        list::render_filtered_list(
             frame, livestock_inner, &livestock_items,
             &mut self.livestock_state,
             self.focused_panel == FocusedPanel::Livestock,
-            None,
+            &self.filter,
         );
 
         // Critters on this barn
         let critters_panel = Panel {
             title: "Critters",
             focused: self.focused_panel == FocusedPanel::Critters,
-            hints: Some("[n] add  [d] remove"),
+            hints: Some("[n] add  [d] remove  [/] filter"),
         };
         let critters_inner = critters_panel.render(frame, panels[1]);
-        let critter_items: Vec<ListItem> = barn.critters.iter().map(|c| {
-            ListItem {
-                id: c.name.clone(),
-                label: c.name.clone(),
-                status: Some(ItemStatus::Active),
-                meta: Some(c.service.clone()),
-                actions: vec![],
-                ..Default::default()
-            }
-        }).collect();
-        list::render_list(
+        let (critter_items, _) = self.critter_rows(barn);
+        list::render_filtered_list(
             frame, critters_inner, &critter_items,
             &mut self.critters_state,
             self.focused_panel == FocusedPanel::Critters,
-            None,
+            &self.filter,
         );
     }
 

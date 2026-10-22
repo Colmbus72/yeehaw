@@ -122,7 +122,8 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
                 ("G", "Go to bottom"),
                 ("Tab", "Switch panel"),
                 ("Enter", "Select item"),
-                ("Esc", "Go back"),
+                ("/", "Filter the focused list"),
+                ("Esc", "Clear filter / go back"),
             ],
         });
     }
@@ -136,6 +137,7 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
                     ("k / ↑", "Move up"),
                     ("Tab", "Switch panel"),
                     ("Enter", "Select item"),
+                    ("/", "Filter the focused list (Esc clears)"),
                     ("1-9", "Switch to a session on this machine"),
                     // Two namespaces, deliberately: a barn waking up must never
                     // renumber a local session under the user's fingers.
@@ -168,6 +170,7 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
             groups.push(HotkeyGroup {
                 title: "Actions",
                 keys: vec![
+                    ("1-9", "Switch to that session"),
                     ("c", "Open Claude for livestock"),
                     ("s", "Open shell for livestock"),
                     ("w", "Open wiki"),
@@ -238,6 +241,7 @@ fn get_hotkey_groups(scope: &str) -> Vec<HotkeyGroup> {
             groups.push(HotkeyGroup {
                 title: "Actions",
                 keys: vec![
+                    ("1-9", "Switch to that session"),
                     ("c", "Open Claude"),
                     ("s", "Open shell"),
                     ("l", "View logs"),

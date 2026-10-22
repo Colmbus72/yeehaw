@@ -228,6 +228,16 @@ impl LivestockDetailView {
             _ => {}
         }
 
+        // Session keys, from either panel: the `[n]` drawn beside each row of
+        // the sessions panel.
+        if let KeyCode::Char(c) = key {
+            if let Some(n) = c.to_digit(10).filter(|n| (1..=9).contains(n)) {
+                if (n as usize) <= session_count {
+                    return LivestockAction::SelectWindow(n as usize - 1);
+                }
+            }
+        }
+
         // Panel-specific keys
         match self.focused_panel {
             FocusedPanel::Sessions => {
@@ -312,7 +322,8 @@ impl LivestockDetailView {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(14), // ASCII header with metadata
+                // The cow with its details beside it, or less on a short screen.
+                Constraint::Length(livestock_header::preferred_height(area, livestock)),
                 Constraint::Min(1),     // content
             ])
             .split(area);

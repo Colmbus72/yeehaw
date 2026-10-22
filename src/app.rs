@@ -218,7 +218,7 @@ impl App {
     }
 
     fn selected_barn_name(&self) -> Option<String> {
-        self.barns.get(self.global_dashboard.barn_cursor()).map(|b| b.name.clone())
+        self.barns.get(self.global_dashboard.barn_cursor(&self.barns)).map(|b| b.name.clone())
     }
 
     /// Sort `self.barns` for display and put the cursor back on `name`.
@@ -229,7 +229,7 @@ impl App {
             config::this_barn_name().as_deref(),
         );
         if let Some(index) = name.and_then(|n| self.barns.iter().position(|b| b.name == n)) {
-            self.global_dashboard.set_barn_cursor(index);
+            self.global_dashboard.set_barn_cursor(index, &self.barns);
         }
     }
 
@@ -728,7 +728,7 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                 // When any view is in edit/input mode, skip global keybinds
                 let in_input_mode = (matches!(app.view, AppView::Global) && app.global_dashboard.is_input_mode())
                     || (matches!(app.view, AppView::Project { .. }) && app.project_view.is_input_mode())
-                    || (matches!(app.view, AppView::Barn { .. }) && app.barn_view.is_editing())
+                    || (matches!(app.view, AppView::Barn { .. }) && (app.barn_view.is_editing() || app.barn_view.is_filter_typing()))
                     || (matches!(app.view, AppView::Livestock { .. }) && app.livestock_view.is_editing())
                     || (matches!(app.view, AppView::Critter { .. }) && app.critter_view.is_editing())
                     || matches!(app.view, AppView::Vault { .. });
@@ -783,7 +783,7 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                         {
                             let name = app
                                 .global_dashboard
-                                .focused_barn_index()
+                                .focused_barn_index(&app.barns)
                                 .and_then(|idx| app.barns.get(idx))
                                 .map(|barn| barn.name.clone());
                             if let Some(name) = name {
@@ -850,9 +850,10 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                         handle_global_dashboard_input(&mut app, key.code);
                     }
                     AppView::Project { .. } => {
+                        // A `/` filter owns `Esc` until it is cleared.
                         if !app.project_view.is_input_mode() {
                             match key.code {
-                                KeyCode::Esc => { app.go_back(); continue; }
+                                KeyCode::Esc if !app.project_view.has_filter() => { app.go_back(); continue; }
                                 KeyCode::Char('v') => {
                                     if let AppView::Project { ref project } = app.view {
                                         let scope = GridScope::Project(project.name.clone());
@@ -878,9 +879,9 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                             app.refresh_windows();
                             continue;
                         }
-                        if !app.barn_view.is_editing() {
+                        if !app.barn_view.is_editing() && !app.barn_view.is_filter_typing() {
                             match key.code {
-                                KeyCode::Esc => { app.go_back(); continue; }
+                                KeyCode::Esc if !app.barn_view.has_filter() => { app.go_back(); continue; }
                                 KeyCode::Char('v') => {
                                     if let AppView::Barn { ref barn } = app.view {
                                         let scope = GridScope::for_barn(&barn.name);
@@ -1351,7 +1352,7 @@ fn apply_dashboard_action(app: &mut App, action: DashboardAction) {
 fn handle_project_context_input(app: &mut App, key: KeyCode) {
     if let AppView::Project { ref project } = app.view {
         let project = project.clone();
-        let action = app.project_view.handle_input(key, &project, &app.barns);
+        let action = app.project_view.handle_input(key, &project, &app.barns, &app.windows);
         apply_project_action(app, project, action);
     }
 }
@@ -1431,6 +1432,9 @@ fn apply_project_action(app: &mut App, project: Project, action: ProjectAction) 
                         herd,
                     });
                 }
+            }
+            ProjectAction::SelectWindow(window_index) => {
+                tmux::switch_to_window(window_index);
             }
             ProjectAction::OpenWiki => {
                 app.wiki_view = WikiView::new();
@@ -1611,7 +1615,7 @@ fn handle_barn_context_input(app: &mut App, key: KeyCode) {
     if let AppView::Barn { ref barn } = app.view {
         let barn = barn.clone();
         let livestock = config::get_livestock_for_barn(&barn.name);
-        let action = app.barn_view.handle_input(key, &barn, livestock.len());
+        let action = app.barn_view.handle_input(key, &barn, &livestock);
         match action {
             BarnAction::None => {}
             BarnAction::SelectLivestock(idx) => {
@@ -2436,6 +2440,8 @@ pub enum ProjectAction {
     None,
     SelectLivestock(usize),
     SelectHerd(usize),
+    /// Switch to a session window, by **tmux window index**.
+    SelectWindow(u32),
     OpenWiki,
     OpenIssues,
     NewClaude(usize),
@@ -4112,13 +4118,13 @@ mod tests {
         let mut app = App::new();
         app.set_connected_barns(HashSet::new());
         let zulu = app.barns.iter().position(|b| b.name == "barn-zulu").unwrap();
-        app.global_dashboard.set_barn_cursor(zulu);
+        app.global_dashboard.set_barn_cursor(zulu, &app.barns);
 
         app.set_connected_barns(sessions(&["barn-zulu"]));
 
         let moved_to = app.barns.iter().position(|b| b.name == "barn-zulu").unwrap();
         assert_ne!(moved_to, zulu, "control: connecting moved the barn");
-        let at = app.global_dashboard.barn_cursor();
+        let at = app.global_dashboard.barn_cursor(&app.barns);
         assert_eq!(app.barns[at].name, "barn-zulu", "the cursor stayed on the row, not the barn");
     }
 
@@ -4171,7 +4177,7 @@ mod tests {
         let mut app = App::new();
         app.set_connected_barns(sessions(&["barn-zulu"]));
         let zulu = app.barns.iter().position(|b| b.name == "barn-zulu").unwrap();
-        app.global_dashboard.set_barn_cursor(zulu);
+        app.global_dashboard.set_barn_cursor(zulu, &app.barns);
         assert_ne!(
             config::load_barns().iter().position(|b| b.name == "barn-zulu"),
             Some(zulu),
@@ -4180,7 +4186,7 @@ mod tests {
 
         app.reload();
 
-        let at = app.global_dashboard.barn_cursor();
+        let at = app.global_dashboard.barn_cursor(&app.barns);
         assert_eq!(app.barns[at].name, "barn-zulu", "the cursor jumped to another barn on reload");
     }
 

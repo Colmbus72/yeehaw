@@ -4,7 +4,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::ProjectAction;
 use crate::components::header;
-use crate::components::list::{self, ListItem, ListState, ItemStatus, RowAction};
+use crate::components::list::{self, FilterKey, ListFilter, ListItem, ListState, ItemStatus, RowAction, RowStyle};
 use crate::components::panel::Panel;
 use crate::components::path_input::{self, PathInputState, PathInputAction};
 use crate::components::text_input::TextInput;
@@ -73,6 +73,8 @@ pub struct ProjectContextView {
     new_rh_herd: String,
     // RanchHands panel
     ranchhands_state: ListState,
+    /// `/` filter over the focused panel.
+    filter: ListFilter,
 }
 
 impl ProjectContextView {
@@ -99,11 +101,57 @@ impl ProjectContextView {
             new_rh_type: 0,
             new_rh_herd: String::new(),
             ranchhands_state: ListState::new(),
+            filter: ListFilter::new(),
         }
     }
 
+    /// A form is open, or a `/` filter is being typed into — either way every
+    /// key is text, and the app's own bindings must stand aside.
     pub fn is_input_mode(&self) -> bool {
-        self.input_mode != InputMode::Normal
+        self.input_mode != InputMode::Normal || self.filter.is_typing()
+    }
+
+    /// A filter is applied, so `Esc` belongs to it rather than to "go back".
+    pub fn has_filter(&self) -> bool {
+        self.filter.is_active()
+    }
+
+    /// The filter, if `panel` is the one it applies to.
+    fn filter_for(&self, panel: FocusedPanel) -> ListFilter {
+        if self.focused_panel == panel { self.filter.clone() } else { ListFilter::new() }
+    }
+
+    fn state_for(&mut self, panel: FocusedPanel) -> &mut ListState {
+        match panel {
+            FocusedPanel::Livestock => &mut self.livestock_state,
+            FocusedPanel::Sessions => &mut self.sessions_state,
+            FocusedPanel::Herds => &mut self.herds_state,
+            FocusedPanel::RanchHands => &mut self.ranchhands_state,
+        }
+    }
+
+    /// The livestock rows as drawn — local first, then a divider, then remote,
+    /// then filtered — with the index into `project.livestock` each one stands
+    /// for. `None` for the divider.
+    fn livestock_rows(&self, project: &Project) -> (Vec<ListItem>, Vec<Option<usize>>) {
+        let (items, data) = build_livestock_rows(&project.livestock);
+        let (items, map) = list::filter_items(items, &self.filter_for(FocusedPanel::Livestock));
+        (items, map.into_iter().map(|i| data[i]).collect())
+    }
+
+    fn session_rows(&self, project: &Project, windows: &[TmuxWindow]) -> (Vec<ListItem>, Vec<u32>) {
+        let session_windows = project_session_windows(project, windows);
+        let items = build_session_items(&session_windows);
+        let (items, map) = list::filter_items(items, &self.filter_for(FocusedPanel::Sessions));
+        (items, map.into_iter().map(|i| session_windows[i].index).collect())
+    }
+
+    fn herd_rows(&self, project: &Project) -> (Vec<ListItem>, Vec<usize>) {
+        list::filter_items(build_herd_items(&project.herds), &self.filter_for(FocusedPanel::Herds))
+    }
+
+    fn ranchhand_rows(&self, ranchhands: &[RanchHand]) -> (Vec<ListItem>, Vec<usize>) {
+        list::filter_items(build_ranchhand_items(ranchhands), &self.filter_for(FocusedPanel::RanchHands))
     }
 
     fn reset_forms(&mut self) {
@@ -181,6 +229,7 @@ impl ProjectContextView {
         key: KeyCode,
         project: &Project,
         _barns: &[Barn],
+        windows: &[TmuxWindow],
     ) -> ProjectAction {
         // Input mode handling
         if self.input_mode != InputMode::Normal {
@@ -227,6 +276,19 @@ impl ProjectContextView {
             return ProjectAction::None;
         }
 
+        // The `/` filter sees every key first: while it is being typed into,
+        // `j`, `c`, a digit — all of it is text.
+        match self.filter.handle_key(key) {
+            FilterKey::Consumed { changed } => {
+                if changed {
+                    let panel = self.focused_panel;
+                    self.state_for(panel).select_first();
+                }
+                return ProjectAction::None;
+            }
+            FilterKey::PassThrough => {}
+        }
+
         // Tab to cycle panels (left→right, then top→bottom)
         if key == KeyCode::Tab {
             self.focused_panel = match self.focused_panel {
@@ -238,35 +300,66 @@ impl ProjectContextView {
             return ProjectAction::None;
         }
 
-        // Page-level keys
-        match key {
-            KeyCode::Char('w') => return ProjectAction::OpenWiki,
-            KeyCode::Char('i') => return ProjectAction::OpenIssues,
-            KeyCode::Char('e') => {
-                self.start_edit(project);
-                return ProjectAction::None;
+        // While typing a filter, only the keys it passed through (↑/↓/Enter)
+        // reach the panel; page-level letters and session digits are text.
+        let typing = self.filter.is_typing();
+
+        if !typing {
+            // Page-level keys
+            match key {
+                KeyCode::Char('w') => return ProjectAction::OpenWiki,
+                KeyCode::Char('i') => return ProjectAction::OpenIssues,
+                KeyCode::Char('e') => {
+                    self.start_edit(project);
+                    return ProjectAction::None;
+                }
+                _ => {}
             }
-            _ => {}
+
+            // Session keys, from any panel — the `[n]` drawn on the sessions
+            // panel's rows, counted over the unfiltered list so a filter never
+            // renumbers them.
+            if let KeyCode::Char(c) = key {
+                if let Some(n) = c.to_digit(10).filter(|n| (1..=9).contains(n)) {
+                    if let Some(w) = project_session_windows(project, windows).get(n as usize - 1) {
+                        return ProjectAction::SelectWindow(w.index);
+                    }
+                }
+            }
         }
 
         match self.focused_panel {
             FocusedPanel::Livestock => {
-                let count = project.livestock.len();
+                let (items, data) = self.livestock_rows(project);
+                let selected_ls = |state: &ListState| data.get(state.selected).copied().flatten();
                 match key {
-                    KeyCode::Char('j') | KeyCode::Down => self.livestock_state.select_next(count),
-                    KeyCode::Char('k') | KeyCode::Up => self.livestock_state.select_prev(),
-                    KeyCode::Char('g') => self.livestock_state.select_first(),
-                    KeyCode::Char('G') => self.livestock_state.select_last(count),
-                    KeyCode::Enter => return ProjectAction::SelectLivestock(self.livestock_state.selected),
+                    KeyCode::Down => self.livestock_state.select_next_selectable(&items),
+                    KeyCode::Up => self.livestock_state.select_prev_selectable(&items),
+                    KeyCode::Enter => {
+                        self.livestock_state.settle_on_selectable(&items);
+                        if let Some(idx) = selected_ls(&self.livestock_state) {
+                            return ProjectAction::SelectLivestock(idx);
+                        }
+                    }
+                    _ if typing => {}
+                    KeyCode::Char('j') => self.livestock_state.select_next_selectable(&items),
+                    KeyCode::Char('k') => self.livestock_state.select_prev_selectable(&items),
+                    KeyCode::Char('g') => self.livestock_state.select_first_selectable(&items),
+                    KeyCode::Char('G') => self.livestock_state.select_last_selectable(&items),
                     // Claude starts in a directory on this machine, so it is
                     // only offered for livestock that lives here.
                     KeyCode::Char('c') => {
-                        let sel = self.livestock_state.selected;
-                        if project.livestock.get(sel).is_some_and(config::livestock_is_on_this_machine) {
-                            return ProjectAction::NewClaude(sel);
+                        if let Some(idx) = selected_ls(&self.livestock_state) {
+                            if project.livestock.get(idx).is_some_and(config::livestock_is_on_this_machine) {
+                                return ProjectAction::NewClaude(idx);
+                            }
                         }
                     }
-                    KeyCode::Char('s') => return ProjectAction::OpenShell(self.livestock_state.selected),
+                    KeyCode::Char('s') => {
+                        if let Some(idx) = selected_ls(&self.livestock_state) {
+                            return ProjectAction::OpenShell(idx);
+                        }
+                    }
                     KeyCode::Char('n') => {
                         self.input_mode = InputMode::NewLivestockName;
                         self.text_input = TextInput::new("");
@@ -276,14 +369,40 @@ impl ProjectContextView {
                 }
             }
             FocusedPanel::Sessions => {
-                // Sessions are read-only list with number switching handled at app level
+                let (items, map) = self.session_rows(project, windows);
+                let count = items.len();
+                match key {
+                    KeyCode::Down => self.sessions_state.select_next(count),
+                    KeyCode::Up => self.sessions_state.select_prev(),
+                    KeyCode::Enter => {
+                        if let Some(&idx) = map.get(self.sessions_state.selected) {
+                            return ProjectAction::SelectWindow(idx);
+                        }
+                    }
+                    _ if typing => {}
+                    KeyCode::Char('j') => self.sessions_state.select_next(count),
+                    KeyCode::Char('k') => self.sessions_state.select_prev(),
+                    KeyCode::Char('g') => self.sessions_state.select_first(),
+                    KeyCode::Char('G') => self.sessions_state.select_last(count),
+                    _ => {}
+                }
             }
             FocusedPanel::Herds => {
-                let count = project.herds.len();
+                let (items, map) = self.herd_rows(project);
+                let count = items.len();
                 match key {
-                    KeyCode::Char('j') | KeyCode::Down => self.herds_state.select_next(count),
-                    KeyCode::Char('k') | KeyCode::Up => self.herds_state.select_prev(),
-                    KeyCode::Enter => return ProjectAction::SelectHerd(self.herds_state.selected),
+                    KeyCode::Down => self.herds_state.select_next(count),
+                    KeyCode::Up => self.herds_state.select_prev(),
+                    KeyCode::Enter => {
+                        if let Some(&idx) = map.get(self.herds_state.selected) {
+                            return ProjectAction::SelectHerd(idx);
+                        }
+                    }
+                    _ if typing => {}
+                    KeyCode::Char('j') => self.herds_state.select_next(count),
+                    KeyCode::Char('k') => self.herds_state.select_prev(),
+                    KeyCode::Char('g') => self.herds_state.select_first(),
+                    KeyCode::Char('G') => self.herds_state.select_last(count),
                     KeyCode::Char('n') => {
                         self.input_mode = InputMode::NewHerdName;
                         self.text_input = TextInput::new("");
@@ -294,15 +413,21 @@ impl ProjectContextView {
             }
             FocusedPanel::RanchHands => {
                 let ranchhands = config::load_ranchhands_for_project(&project.name);
-                let count = ranchhands.len();
+                let (items, map) = self.ranchhand_rows(&ranchhands);
+                let count = items.len();
                 match key {
-                    KeyCode::Char('j') | KeyCode::Down => self.ranchhands_state.select_next(count),
-                    KeyCode::Char('k') | KeyCode::Up => self.ranchhands_state.select_prev(),
+                    KeyCode::Down => self.ranchhands_state.select_next(count),
+                    KeyCode::Up => self.ranchhands_state.select_prev(),
                     KeyCode::Enter => {
-                        if let Some(rh) = ranchhands.get(self.ranchhands_state.selected) {
+                        if let Some(rh) = map.get(self.ranchhands_state.selected).and_then(|&i| ranchhands.get(i)) {
                             return ProjectAction::SelectRanchHand(rh.name.clone());
                         }
                     }
+                    _ if typing => {}
+                    KeyCode::Char('j') => self.ranchhands_state.select_next(count),
+                    KeyCode::Char('k') => self.ranchhands_state.select_prev(),
+                    KeyCode::Char('g') => self.ranchhands_state.select_first(),
+                    KeyCode::Char('G') => self.ranchhands_state.select_last(count),
                     KeyCode::Char('n') => {
                         self.input_mode = InputMode::NewRhName;
                         self.text_input = TextInput::new("");
@@ -502,10 +627,6 @@ impl ProjectContextView {
         _barns: &[Barn],
         windows: &[TmuxWindow],
     ) {
-        let session_windows: Vec<_> = windows.iter()
-            .filter(|w| w.index > 0 && w.name.contains(&project.name))
-            .collect();
-
         // Layout: Header (figlet) + Content
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -565,30 +686,30 @@ impl ProjectContextView {
         let livestock_panel = Panel {
             title: "Livestock",
             focused: self.focused_panel == FocusedPanel::Livestock,
-            hints: Some("[n] new  [c] claude  [s] shell  [e] edit project"),
+            hints: Some("[n] new  [/] filter  [e] edit project"),
         };
         let livestock_inner = livestock_panel.render(frame, left_panels[0]);
-        let livestock_items = build_livestock_items(&project.livestock);
-        list::render_list(
+        let (livestock_items, _) = self.livestock_rows(project);
+        list::render_filtered_list(
             frame, livestock_inner, &livestock_items,
             &mut self.livestock_state,
             self.focused_panel == FocusedPanel::Livestock,
-            None,
+            &self.filter,
         );
 
         // Herds panel
         let herds_panel = Panel {
             title: "Herds",
             focused: self.focused_panel == FocusedPanel::Herds,
-            hints: Some("[n] new"),
+            hints: Some("[n] new  [/] filter"),
         };
         let herds_inner = herds_panel.render(frame, left_panels[1]);
-        let herd_items = build_herd_items(&project.herds);
-        list::render_list(
+        let (herd_items, _) = self.herd_rows(project);
+        list::render_filtered_list(
             frame, herds_inner, &herd_items,
             &mut self.herds_state,
             self.focused_panel == FocusedPanel::Herds,
-            None,
+            &self.filter,
         );
 
         // Right: Sessions + RanchHands
@@ -604,25 +725,15 @@ impl ProjectContextView {
         let sessions_panel = Panel {
             title: "Sessions",
             focused: self.focused_panel == FocusedPanel::Sessions,
-            hints: None,
+            hints: Some("[1-9] open  [/] filter"),
         };
         let sessions_inner = sessions_panel.render(frame, right_panels[0]);
-        let session_items: Vec<ListItem> = session_windows.iter().enumerate().map(|(i, w)| {
-            let status_info = tmux::get_window_status(w);
-            ListItem {
-                id: w.index.to_string(),
-                label: format!("[{}] {}", i + 1, w.name),
-                status: Some(if w.active { ItemStatus::Active } else { ItemStatus::Inactive }),
-                meta: Some(status_info.text),
-                actions: vec![],
-                ..Default::default()
-            }
-        }).collect();
-        list::render_list(
+        let (session_items, _) = self.session_rows(project, windows);
+        list::render_filtered_list(
             frame, sessions_inner, &session_items,
             &mut self.sessions_state,
             self.focused_panel == FocusedPanel::Sessions,
-            None,
+            &self.filter,
         );
 
         // RanchHands panel
@@ -630,25 +741,15 @@ impl ProjectContextView {
         let rh_panel = Panel {
             title: "Ranch Hands",
             focused: self.focused_panel == FocusedPanel::RanchHands,
-            hints: Some("[n] new"),
+            hints: Some("[n] new  [/] filter"),
         };
         let rh_inner = rh_panel.render(frame, right_panels[1]);
-        let rh_items: Vec<ListItem> = ranchhands.iter().map(|rh| {
-            let meta = format!("{} • {}", rh.rh_type, if rh.herd.is_empty() { "(no herd)" } else { &rh.herd });
-            ListItem {
-                id: rh.name.clone(),
-                label: rh.name.clone(),
-                status: Some(if rh.last_sync.is_some() { ItemStatus::Active } else { ItemStatus::Inactive }),
-                meta: Some(meta),
-                actions: vec![],
-                ..Default::default()
-            }
-        }).collect();
-        list::render_list(
+        let (rh_items, _) = self.ranchhand_rows(&ranchhands);
+        list::render_filtered_list(
             frame, rh_inner, &rh_items,
             &mut self.ranchhands_state,
             self.focused_panel == FocusedPanel::RanchHands,
-            None,
+            &self.filter,
         );
     }
 
@@ -872,29 +973,95 @@ impl ProjectContextView {
     }
 }
 
-fn build_livestock_items(livestock: &[Livestock]) -> Vec<ListItem> {
-    livestock.iter().map(|ls| {
-        // `local` covers every spelling of "on this machine", adoption's real
-        // barn name included. The column says here-or-elsewhere; it is not the
-        // place the user learns their own machine's name.
-        let barn_info = config::barn_label(ls).to_string();
+/// The windows the sessions panel lists, in the order its `[n]` keys count.
+///
+/// One function for the panel and the keys that open its rows, so the number
+/// drawn and the window it opens cannot disagree.
+pub(crate) fn project_session_windows<'a>(project: &Project, windows: &'a [TmuxWindow]) -> Vec<&'a TmuxWindow> {
+    windows.iter()
+        .filter(|w| w.index > 0 && w.name.contains(&project.name))
+        .collect()
+}
 
+fn build_session_items(session_windows: &[&TmuxWindow]) -> Vec<ListItem> {
+    session_windows.iter().enumerate().map(|(i, w)| {
+        let status_info = tmux::get_window_status(w);
         ListItem {
-            id: ls.name.clone(),
-            label: ls.name.clone(),
-            status: Some(ItemStatus::Active),
-            meta: Some(barn_info),
-            actions: if config::livestock_is_on_this_machine(ls) {
-                vec![
-                    RowAction { key: "c".to_string(), label: "claude".to_string() },
-                    RowAction { key: "s".to_string(), label: "shell".to_string() },
-                ]
-            } else {
-                vec![RowAction { key: "s".to_string(), label: "shell".to_string() }]
-            },
+            id: w.index.to_string(),
+            label: format!("[{}] {}", i + 1, w.name),
+            status: Some(if w.active { ItemStatus::Active } else { ItemStatus::Inactive }),
+            meta: Some(status_info.text),
+            actions: vec![],
             ..Default::default()
         }
     }).collect()
+}
+
+fn build_ranchhand_items(ranchhands: &[RanchHand]) -> Vec<ListItem> {
+    ranchhands.iter().map(|rh| {
+        let meta = format!("{} • {}", rh.rh_type, if rh.herd.is_empty() { "(no herd)" } else { &rh.herd });
+        ListItem {
+            id: rh.name.clone(),
+            label: rh.name.clone(),
+            status: Some(if rh.last_sync.is_some() { ItemStatus::Active } else { ItemStatus::Inactive }),
+            meta: Some(meta),
+            actions: vec![],
+            ..Default::default()
+        }
+    }).collect()
+}
+
+/// The livestock panel's rows: this machine's livestock first, then — under a
+/// divider — everything on other barns, each half in its stored order. The
+/// second list is the index into `livestock` each row stands for; `None` for
+/// the divider, which is a [`RowStyle::Heading`] so the cursor steps over it.
+fn build_livestock_rows(livestock: &[Livestock]) -> (Vec<ListItem>, Vec<Option<usize>>) {
+    let (local, remote): (Vec<usize>, Vec<usize>) =
+        (0..livestock.len()).partition(|&i| config::livestock_is_on_this_machine(&livestock[i]));
+
+    let mut items = Vec::with_capacity(livestock.len() + 1);
+    let mut data = Vec::with_capacity(livestock.len() + 1);
+    for &i in &local {
+        items.push(livestock_item(&livestock[i]));
+        data.push(Some(i));
+    }
+    if !local.is_empty() && !remote.is_empty() {
+        items.push(ListItem {
+            id: "divider:remote".to_string(),
+            label: "── remote ──".to_string(),
+            style: RowStyle::Heading,
+            ..Default::default()
+        });
+        data.push(None);
+    }
+    for &i in &remote {
+        items.push(livestock_item(&livestock[i]));
+        data.push(Some(i));
+    }
+    (items, data)
+}
+
+fn livestock_item(ls: &Livestock) -> ListItem {
+    // `local` covers every spelling of "on this machine", adoption's real
+    // barn name included. The column says here-or-elsewhere; it is not the
+    // place the user learns their own machine's name.
+    let barn_info = config::barn_label(ls).to_string();
+
+    ListItem {
+        id: ls.name.clone(),
+        label: ls.name.clone(),
+        status: Some(ItemStatus::Active),
+        meta: Some(barn_info),
+        actions: if config::livestock_is_on_this_machine(ls) {
+            vec![
+                RowAction { key: "c".to_string(), label: "claude".to_string() },
+                RowAction { key: "s".to_string(), label: "shell".to_string() },
+            ]
+        } else {
+            vec![RowAction { key: "s".to_string(), label: "shell".to_string() }]
+        },
+        ..Default::default()
+    }
 }
 
 fn build_herd_items(herds: &[Herd]) -> Vec<ListItem> {
@@ -1006,16 +1173,17 @@ mod tests {
             livestock_on("there", Some("pi")),
         ];
 
-        let items = build_livestock_items(&project.livestock);
+        // [0] here   [1] ── remote ──   [2] there
+        let (items, _) = build_livestock_rows(&project.livestock);
         let keys = |i: usize| items[i].actions.iter().map(|a| a.key.clone()).collect::<Vec<_>>();
         assert_eq!(keys(0), vec!["c", "s"]);
-        assert_eq!(keys(1), vec!["s"], "a remote livestock must not offer claude");
+        assert_eq!(keys(2), vec!["s"], "a remote livestock must not offer claude");
 
         let mut view = ProjectContextView::new();
         view.livestock_state.selected = 0;
-        assert!(matches!(view.handle_input(KeyCode::Char('c'), &project, &[]), ProjectAction::NewClaude(0)));
-        view.livestock_state.selected = 1;
-        assert!(matches!(view.handle_input(KeyCode::Char('c'), &project, &[]), ProjectAction::None));
+        assert!(matches!(view.handle_input(KeyCode::Char('c'), &project, &[], &[]), ProjectAction::NewClaude(0)));
+        view.livestock_state.selected = 2;
+        assert!(matches!(view.handle_input(KeyCode::Char('c'), &project, &[], &[]), ProjectAction::None));
     }
 
     /// The livestock column says here-or-elsewhere. Adoption renames this
@@ -1042,8 +1210,9 @@ mod tests {
         away.barn = Some("pi".into());
 
         let metas = |ls: &[Livestock]| -> Vec<String> {
-            build_livestock_items(ls)
+            build_livestock_rows(ls).0
                 .into_iter()
+                .filter(|i| i.selectable())
                 .map(|i| i.meta.unwrap_or_default())
                 .collect()
         };
@@ -1054,5 +1223,80 @@ mod tests {
         here.barn = Some("imac".into());
 
         assert_eq!(metas(&[here, away]), ["local", "pi"]);
+    }
+
+    fn win(index: u32, name: &str) -> TmuxWindow {
+        TmuxWindow { index, name: name.into(), ..Default::default() }
+    }
+
+    /// Local livestock sit above remote, with a divider the cursor steps over,
+    /// and every row still opens the livestock it names.
+    #[test]
+    fn local_livestock_come_first_and_rows_resolve_to_the_right_livestock() {
+        let _ranch = crate::testing::temp_ranch();
+        crate::migrate::adopt_this_machine("imac").unwrap();
+        let mut project = bare_project();
+        project.livestock = vec![
+            livestock_on("far", Some("pi")),
+            livestock_on("near", Some("imac")),
+        ];
+
+        let (items, data) = build_livestock_rows(&project.livestock);
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["near", "── remote ──", "far"]);
+        assert_eq!(data, [Some(1), None, Some(0)]);
+
+        let mut view = ProjectContextView::new();
+        assert!(matches!(view.handle_input(KeyCode::Enter, &project, &[], &[]), ProjectAction::SelectLivestock(1)));
+        view.handle_input(KeyCode::Char('j'), &project, &[], &[]);
+        assert_eq!(view.livestock_state.selected, 2, "the cursor stopped on the divider");
+        assert!(matches!(view.handle_input(KeyCode::Enter, &project, &[], &[]), ProjectAction::SelectLivestock(0)));
+    }
+
+    /// The `[n]` drawn beside a session opens it, from any panel.
+    #[test]
+    fn a_session_digit_switches_to_that_window() {
+        let project = bare_project();
+        let windows = [win(0, "yeehaw"), win(3, "api-claude"), win(5, "other"), win(7, "api-shell")];
+        let mut view = ProjectContextView::new();
+        assert!(matches!(view.handle_input(KeyCode::Char('1'), &project, &[], &windows), ProjectAction::SelectWindow(3)));
+        assert!(matches!(view.handle_input(KeyCode::Char('2'), &project, &[], &windows), ProjectAction::SelectWindow(7)));
+        assert!(matches!(view.handle_input(KeyCode::Char('3'), &project, &[], &windows), ProjectAction::None));
+    }
+
+    /// `/` narrows the focused list; Enter opens the filtered row; Esc
+    /// brings every row back.
+    #[test]
+    fn the_filter_narrows_the_list_and_enter_opens_what_is_shown() {
+        let _ranch = crate::testing::temp_ranch();
+        let mut project = bare_project();
+        project.livestock = vec![livestock_on("web", None), livestock_on("worker", None), livestock_on("api", None)];
+        let mut view = ProjectContextView::new();
+
+        for k in [KeyCode::Char('/'), KeyCode::Char('a'), KeyCode::Char('p')] {
+            assert!(matches!(view.handle_input(k, &project, &[], &[]), ProjectAction::None));
+        }
+        assert!(view.is_input_mode(), "typed keys must not reach the app's bindings");
+        let (items, _) = view.livestock_rows(&project);
+        assert_eq!(items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["api"]);
+
+        assert!(matches!(view.handle_input(KeyCode::Enter, &project, &[], &[]), ProjectAction::SelectLivestock(2)));
+        assert!(!view.is_input_mode() && view.has_filter(), "Enter keeps the filter");
+
+        view.handle_input(KeyCode::Esc, &project, &[], &[]);
+        assert!(!view.has_filter());
+        assert_eq!(view.livestock_rows(&project).0.len(), 3);
+    }
+
+    /// Tabbing away drops the filter.
+    #[test]
+    fn tabbing_out_clears_the_filter() {
+        let project = bare_project();
+        let mut view = ProjectContextView::new();
+        view.handle_input(KeyCode::Char('/'), &project, &[], &[]);
+        view.handle_input(KeyCode::Char('x'), &project, &[], &[]);
+        view.handle_input(KeyCode::Tab, &project, &[], &[]);
+        assert!(!view.has_filter());
+        assert_eq!(view.focused_panel, FocusedPanel::Herds);
     }
 }

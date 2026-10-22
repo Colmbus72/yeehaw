@@ -6,7 +6,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::DashboardAction;
 use crate::components::header;
-use crate::components::list::{self, ListItem, ListState, ItemStatus, RowAction, RowStyle};
+use crate::components::list::{self, FilterKey, ListFilter, ListItem, ListState, ItemStatus, RowAction, RowStyle};
 use crate::components::panel::Panel;
 use crate::components::path_input::{self, PathInputState, PathInputAction};
 use crate::components::text_input::TextInput;
@@ -66,6 +66,9 @@ pub struct GlobalDashboard {
     // New worm form
     new_worm_name: String,
     new_worm_command: String,
+
+    /// `/` filter over the focused panel.
+    filter: ListFilter,
 }
 
 impl GlobalDashboard {
@@ -86,11 +89,34 @@ impl GlobalDashboard {
             new_barn_port: String::new(),
             new_worm_name: String::new(),
             new_worm_command: String::new(),
+            filter: ListFilter::new(),
         }
     }
 
+    /// A form is open, or a `/` filter is being typed into — either way every
+    /// key is text, and the app's own bindings (`q`, `v`, `?`) must stand aside.
     pub fn is_input_mode(&self) -> bool {
-        self.input_mode != InputMode::Normal
+        self.input_mode != InputMode::Normal || self.filter.is_typing()
+    }
+
+    /// The filter, if `panel` is the one it applies to.
+    fn filter_for(&self, panel: FocusedPanel) -> ListFilter {
+        if self.focused_panel == panel { self.filter.clone() } else { ListFilter::new() }
+    }
+
+    fn state_for(&mut self, panel: FocusedPanel) -> &mut ListState {
+        match panel {
+            FocusedPanel::Projects => &mut self.projects_state,
+            FocusedPanel::Barns => &mut self.barns_state,
+            FocusedPanel::Sessions => &mut self.sessions_state,
+            FocusedPanel::Worms => &mut self.worms_state,
+        }
+    }
+
+    /// For each barn row on screen, its index into `barns`.
+    fn barn_map(&self, barns: &[Barn]) -> Vec<usize> {
+        let filter = self.filter_for(FocusedPanel::Barns);
+        (0..barns.len()).filter(|&i| filter.matches(&barn_row_label(&barns[i]))).collect()
     }
 
     /// Index of the selected barn, but only when the barns panel has focus.
@@ -100,22 +126,27 @@ impl GlobalDashboard {
     /// exposes the one thing that handler needs — deliberately narrower than
     /// making `focused_panel`/`barns_state` public or reworking the
     /// `handle_input` signature across every view.
-    pub fn focused_barn_index(&self) -> Option<usize> {
+    ///
+    /// An index into `barns`, through any filter on the panel.
+    pub fn focused_barn_index(&self, barns: &[Barn]) -> Option<usize> {
         match self.focused_panel {
-            FocusedPanel::Barns => Some(self.barns_state.selected),
+            FocusedPanel::Barns => self.barn_map(barns).get(self.barns_state.selected).copied(),
             _ => None,
         }
     }
 
-    /// The barns panel's cursor, whichever panel has focus.
-    pub fn barn_cursor(&self) -> usize {
-        self.barns_state.selected
+    /// The barns panel's cursor as an index into `barns`, whichever panel has
+    /// focus.
+    pub fn barn_cursor(&self, barns: &[Barn]) -> usize {
+        self.barn_map(barns).get(self.barns_state.selected).copied().unwrap_or(self.barns_state.selected)
     }
 
-    /// Move the barns panel's cursor, for when the list it indexes into has
-    /// been re-sorted under it.
-    pub fn set_barn_cursor(&mut self, index: usize) {
-        self.barns_state.selected = index;
+    /// Move the barns panel's cursor to `barns[index]`, for when the list it
+    /// indexes into has been re-sorted under it.
+    pub fn set_barn_cursor(&mut self, index: usize, barns: &[Barn]) {
+        if let Some(row) = self.barn_map(barns).iter().position(|&i| i == index) {
+            self.barns_state.selected = row;
+        }
     }
 
     fn reset_forms(&mut self) {
@@ -174,6 +205,21 @@ impl GlobalDashboard {
 
         // Normal mode
 
+        // The `/` filter sees every key first: while it is being typed into,
+        // `n`, a digit, a capital — all of it is text.
+        match self.filter.handle_key(key) {
+            FilterKey::Consumed { changed } => {
+                if changed {
+                    let panel = self.focused_panel;
+                    self.state_for(panel).select_first();
+                }
+                return DashboardAction::None;
+            }
+            FilterKey::PassThrough => {}
+        }
+        // Only ↑/↓/Enter get past a filter being typed into.
+        let typing = self.filter.is_typing();
+
         // Tab to cycle panels (right then down: Projects → Sessions → Barns → Worms)
         if key == KeyCode::Tab {
             self.focused_panel = match self.focused_panel {
@@ -196,7 +242,7 @@ impl GlobalDashboard {
         }
 
         // 'n' key to create new item in focused panel
-        if key == KeyCode::Char('n') {
+        if key == KeyCode::Char('n') && !typing {
             match self.focused_panel {
                 FocusedPanel::Projects => {
                     self.input_mode = InputMode::NewProjectName;
@@ -222,7 +268,6 @@ impl GlobalDashboard {
         // disagree. Below the panel-cycling keys because it reads the ranch for
         // each claude window's signal, and `Tab` has no use for any of it.
         let rows = build_session_rows(windows, remote, stale);
-        let items = row_items(&rows);
 
         // The session keys, from any panel: `1`-`9` for this machine's windows,
         // `A`-`Z` (less the four already bound) for a barn's. Two namespaces,
@@ -230,36 +275,60 @@ impl GlobalDashboard {
         // to — so a barn waking up cannot renumber a local window, and a key
         // that matches nothing falls through to the focused panel untouched.
         if let KeyCode::Char(c) = key {
-            if let Some(action) = rows.iter().find(|r| r.key == Some(c)).and_then(SessionRow::action)
+            if typing {
+                // Text for the filter; nothing below wants it either.
+            } else if let Some(action) =
+                rows.iter().find(|r| r.key == Some(c)).and_then(SessionRow::action)
             {
                 return action;
             }
         }
 
-        // Panel-specific input
+        // What is on screen in each panel, and each row's index into the data
+        // behind it. Every panel resolves its cursor through these, so a
+        // filtered row opens exactly what is drawn.
+        let (items, session_map) =
+            list::filter_items(row_items(&rows), &self.filter_for(FocusedPanel::Sessions));
+        let project_map = list::filter_items(build_project_items(projects, windows), &self.filter_for(FocusedPanel::Projects)).1;
+        let barn_map = self.barn_map(barns);
+        let worm_map = list::filter_items(worm_items_by_name(worms), &self.filter_for(FocusedPanel::Worms)).1;
+        let mapped = |map: &[usize], sel: usize| map.get(sel).copied();
+
+        // Panel-specific input. While typing, only ↑/↓/Enter arrive here, so
+        // the letter arms are guarded off.
         match self.focused_panel {
             FocusedPanel::Projects => {
+                let count = project_map.len();
+                let sel = mapped(&project_map, self.projects_state.selected);
                 match key {
-                    KeyCode::Char('j') | KeyCode::Down => self.projects_state.select_next(projects.len()),
-                    KeyCode::Char('k') | KeyCode::Up => self.projects_state.select_prev(),
+                    KeyCode::Down => self.projects_state.select_next(count),
+                    KeyCode::Up => self.projects_state.select_prev(),
+                    KeyCode::Enter => if let Some(i) = sel { return DashboardAction::SelectProject(i) },
+                    _ if typing => {}
+                    KeyCode::Char('j') => self.projects_state.select_next(count),
+                    KeyCode::Char('k') => self.projects_state.select_prev(),
                     KeyCode::Char('g') => self.projects_state.select_first(),
-                    KeyCode::Char('G') => self.projects_state.select_last(projects.len()),
-                    KeyCode::Enter => return DashboardAction::SelectProject(self.projects_state.selected),
-                    KeyCode::Char('c') => return DashboardAction::NewClaude(self.projects_state.selected),
-                    KeyCode::Char('d') => return DashboardAction::RequestDeleteProject(self.projects_state.selected),
+                    KeyCode::Char('G') => self.projects_state.select_last(count),
+                    KeyCode::Char('c') => if let Some(i) = sel { return DashboardAction::NewClaude(i) },
+                    KeyCode::Char('d') => if let Some(i) = sel { return DashboardAction::RequestDeleteProject(i) },
                     _ => {}
                 }
             }
             FocusedPanel::Barns => {
+                let count = barn_map.len();
+                let sel = mapped(&barn_map, self.barns_state.selected);
                 match key {
-                    KeyCode::Char('j') | KeyCode::Down => self.barns_state.select_next(barns.len()),
-                    KeyCode::Char('k') | KeyCode::Up => self.barns_state.select_prev(),
+                    KeyCode::Down => self.barns_state.select_next(count),
+                    KeyCode::Up => self.barns_state.select_prev(),
+                    KeyCode::Enter => if let Some(i) = sel { return DashboardAction::SelectBarn(i) },
+                    _ if typing => {}
+                    KeyCode::Char('j') => self.barns_state.select_next(count),
+                    KeyCode::Char('k') => self.barns_state.select_prev(),
                     KeyCode::Char('g') => self.barns_state.select_first(),
-                    KeyCode::Char('G') => self.barns_state.select_last(barns.len()),
-                    KeyCode::Enter => return DashboardAction::SelectBarn(self.barns_state.selected),
-                    KeyCode::Char('s') => return DashboardAction::SshToBarn(self.barns_state.selected),
-                    KeyCode::Char('c') => return DashboardAction::ConnectBarn(self.barns_state.selected),
-                    KeyCode::Char('d') => return DashboardAction::RequestDeleteBarn(self.barns_state.selected),
+                    KeyCode::Char('G') => self.barns_state.select_last(count),
+                    KeyCode::Char('s') => if let Some(i) = sel { return DashboardAction::SshToBarn(i) },
+                    KeyCode::Char('c') => if let Some(i) = sel { return DashboardAction::ConnectBarn(i) },
+                    KeyCode::Char('d') => if let Some(i) = sel { return DashboardAction::RequestDeleteBarn(i) },
                     _ => {}
                 }
             }
@@ -268,32 +337,41 @@ impl GlobalDashboard {
                 // headings, and a cursor that can stop on one is a cursor
                 // `Enter` has no answer for.
                 match key {
-                    KeyCode::Char('j') | KeyCode::Down => self.sessions_state.select_next_selectable(&items),
-                    KeyCode::Char('k') | KeyCode::Up => self.sessions_state.select_prev_selectable(&items),
-                    KeyCode::Char('g') => self.sessions_state.select_first_selectable(&items),
-                    KeyCode::Char('G') => self.sessions_state.select_last_selectable(&items),
+                    KeyCode::Down => self.sessions_state.select_next_selectable(&items),
+                    KeyCode::Up => self.sessions_state.select_prev_selectable(&items),
                     KeyCode::Enter => {
                         // The list is rebuilt from a live stream, so the row
                         // under the cursor may have become a heading since the
                         // last keypress.
                         self.sessions_state.settle_on_selectable(&items);
-                        if let Some(action) =
-                            rows.get(self.sessions_state.selected).and_then(SessionRow::action)
+                        if let Some(action) = mapped(&session_map, self.sessions_state.selected)
+                            .and_then(|i| rows.get(i))
+                            .and_then(SessionRow::action)
                         {
                             return action;
                         }
                     }
+                    _ if typing => {}
+                    KeyCode::Char('j') => self.sessions_state.select_next_selectable(&items),
+                    KeyCode::Char('k') => self.sessions_state.select_prev_selectable(&items),
+                    KeyCode::Char('g') => self.sessions_state.select_first_selectable(&items),
+                    KeyCode::Char('G') => self.sessions_state.select_last_selectable(&items),
                     _ => {}
                 }
             }
             FocusedPanel::Worms => {
+                let count = worm_map.len();
+                let sel = mapped(&worm_map, self.worms_state.selected);
                 match key {
-                    KeyCode::Char('j') | KeyCode::Down => self.worms_state.select_next(worms.len()),
-                    KeyCode::Char('k') | KeyCode::Up => self.worms_state.select_prev(),
+                    KeyCode::Down => self.worms_state.select_next(count),
+                    KeyCode::Up => self.worms_state.select_prev(),
+                    KeyCode::Enter => if let Some(i) = sel { return DashboardAction::SelectWorm(i) },
+                    _ if typing => {}
+                    KeyCode::Char('j') => self.worms_state.select_next(count),
+                    KeyCode::Char('k') => self.worms_state.select_prev(),
                     KeyCode::Char('g') => self.worms_state.select_first(),
-                    KeyCode::Char('G') => self.worms_state.select_last(worms.len()),
-                    KeyCode::Enter => return DashboardAction::SelectWorm(self.worms_state.selected),
-                    KeyCode::Char('d') => return DashboardAction::RequestDeleteWorm(self.worms_state.selected),
+                    KeyCode::Char('G') => self.worms_state.select_last(count),
+                    KeyCode::Char('d') => if let Some(i) = sel { return DashboardAction::RequestDeleteWorm(i) },
                     _ => {}
                 }
             }
@@ -400,20 +478,12 @@ impl GlobalDashboard {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(9), // figlet header + tumbleweed + version
+                Constraint::Length(2), // one-line title + spacer
                 Constraint::Min(1),    // content
             ])
             .split(area);
 
-        header::render_header(frame, chunks[0], &header::HeaderProps {
-            text: "YEEHAW",
-            subtitle: None,
-            summary: None,
-            color: None,
-            gradient_spread: None,
-            gradient_inverted: false,
-            version_info: None,
-        });
+        header::render_compact_header(frame, chunks[0], "YEEHAW");
 
         // If in input mode, render the form overlay
         if self.input_mode != InputMode::Normal {
@@ -453,30 +523,30 @@ impl GlobalDashboard {
         let projects_panel = Panel {
             title: "Projects",
             focused: self.focused_panel == FocusedPanel::Projects,
-            hints: Some("[n] new  [d] delete"),
+            hints: Some("[n] new  [d] delete  [/] filter"),
         };
         let projects_inner = projects_panel.render(frame, left_panels[0]);
-        let project_items = build_project_items(projects, windows);
-        list::render_list(
+        let (project_items, _) = list::filter_items(build_project_items(projects, windows), &self.filter_for(FocusedPanel::Projects));
+        list::render_filtered_list(
             frame, projects_inner, &project_items,
             &mut self.projects_state,
             self.focused_panel == FocusedPanel::Projects,
-            None,
+            &self.filter,
         );
 
         // Barns panel
         let barns_panel = Panel {
             title: "Barns",
             focused: self.focused_panel == FocusedPanel::Barns,
-            hints: Some("[n] new  [d] delete"),
+            hints: Some("[n] new  [d] delete  [/] filter"),
         };
         let barns_inner = barns_panel.render(frame, left_panels[1]);
-        let barn_items = build_barn_items(barns, connected_barns);
-        list::render_list(
+        let (barn_items, _) = list::filter_items(build_barn_items(barns, connected_barns), &self.filter_for(FocusedPanel::Barns));
+        list::render_filtered_list(
             frame, barns_inner, &barn_items,
             &mut self.barns_state,
             self.focused_panel == FocusedPanel::Barns,
-            None,
+            &self.filter,
         );
 
         // Sessions panel
@@ -485,30 +555,30 @@ impl GlobalDashboard {
             focused: self.focused_panel == FocusedPanel::Sessions,
             // The two namespaces, named where the list is. A capital letter is
             // not a key anyone would try unprompted.
-            hints: Some("[1-9] here  [A-Z] barn"),
+            hints: Some("[1-9] here  [A-Z] barn  [/] filter"),
         };
         let sessions_inner = sessions_panel.render(frame, right_panels[0]);
-        let session_items = row_items(&build_session_rows(windows, remote, stale));
-        list::render_list(
+        let (session_items, _) = list::filter_items(row_items(&build_session_rows(windows, remote, stale)), &self.filter_for(FocusedPanel::Sessions));
+        list::render_filtered_list(
             frame, sessions_inner, &session_items,
             &mut self.sessions_state,
             self.focused_panel == FocusedPanel::Sessions,
-            None,
+            &self.filter,
         );
 
         // Worms panel
         let worms_panel = Panel {
             title: "Worms",
             focused: self.focused_panel == FocusedPanel::Worms,
-            hints: Some("[n] new  [d] delete"),
+            hints: Some("[n] new  [d] delete  [/] filter"),
         };
         let worms_inner = worms_panel.render(frame, right_panels[1]);
-        let worm_items = build_worm_items(worms);
-        list::render_list(
+        let (worm_items, _) = list::filter_items(build_worm_items(worms), &self.filter_for(FocusedPanel::Worms));
+        list::render_filtered_list(
             frame, worms_inner, &worm_items,
             &mut self.worms_state,
             self.focused_panel == FocusedPanel::Worms,
-            None,
+            &self.filter,
         );
     }
 
@@ -659,6 +729,11 @@ fn build_project_items(projects: &[Project], windows: &[TmuxWindow]) -> Vec<List
     }).collect()
 }
 
+/// The label a barn row is drawn — and filtered — by.
+fn barn_row_label(b: &Barn) -> String {
+    if config::is_local_barn(b) { "local".to_string() } else { b.name.clone() }
+}
+
 /// `connected` holds bare tmux session names, so membership is tested with
 /// [`tmux::barn_session_name`]. `barn_session_target` is for `-t` arguments only
 /// — its `=` prefix is not part of any name tmux reports, so looking one up here
@@ -698,7 +773,7 @@ fn build_barn_items(barns: &[Barn], connected: &HashSet<String>) -> Vec<ListItem
 
         ListItem {
             id: b.name.clone(),
-            label: if config::is_local_barn(b) { "local".to_string() } else { b.name.clone() },
+            label: barn_row_label(b),
             // The green dot is the connection: it used to be Active for every
             // barn, which said nothing. Every other panel here already reads its
             // dot as live state (a project with sessions, an enabled worm).
@@ -961,6 +1036,13 @@ fn local_item(position: usize, w: &TmuxWindow) -> ListItem {
     }
 }
 
+/// Worm rows carrying only what the filter matches on — the name. Key handling
+/// needs the row-to-worm map on every keypress, and [`build_worm_items`] reads
+/// each worm's run history from disk to build its meta.
+fn worm_items_by_name(worms: &[Worm]) -> Vec<ListItem> {
+    worms.iter().map(|w| ListItem { id: w.name.clone(), label: w.name.clone(), ..Default::default() }).collect()
+}
+
 fn build_worm_items(worms: &[Worm]) -> Vec<ListItem> {
     worms.iter().map(|w| {
         let runs = config::load_worm_runs(&w.name);
@@ -1201,21 +1283,21 @@ mod tests {
         let barns = [barn("guided"), barn("guided-2")];
 
         // Focus starts on Projects.
-        assert_eq!(dash.focused_barn_index(), None);
+        assert_eq!(dash.focused_barn_index(&barns), None);
 
         // Tab cycles Projects -> Sessions -> Barns.
         dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[], &no_frames(), &no_stale());
-        assert_eq!(dash.focused_barn_index(), None);
+        assert_eq!(dash.focused_barn_index(&barns), None);
         dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[], &no_frames(), &no_stale());
-        assert_eq!(dash.focused_barn_index(), Some(0));
+        assert_eq!(dash.focused_barn_index(&barns), Some(0));
 
         // It tracks the selection, not just the panel.
         dash.handle_input(KeyCode::Char('j'), &[], &barns, &[], &[], &no_frames(), &no_stale());
-        assert_eq!(dash.focused_barn_index(), Some(1));
+        assert_eq!(dash.focused_barn_index(&barns), Some(1));
 
         // Worms is next: focus leaves the panel and so does the index.
         dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[], &no_frames(), &no_stale());
-        assert_eq!(dash.focused_barn_index(), None);
+        assert_eq!(dash.focused_barn_index(&barns), None);
     }
 
     /// The `C-d` guard in `app.rs` is `!in_input_mode`, which for this view is
@@ -1229,7 +1311,7 @@ mod tests {
 
         dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[], &no_frames(), &no_stale());
         dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[], &no_frames(), &no_stale());
-        assert_eq!(dash.focused_barn_index(), Some(0));
+        assert_eq!(dash.focused_barn_index(&barns), Some(0));
         assert!(!dash.is_input_mode());
 
         dash.handle_input(KeyCode::Char('n'), &[], &barns, &[], &[], &no_frames(), &no_stale());
@@ -1563,13 +1645,13 @@ mod tests {
         // Projects -> Sessions -> Barns, where `G` is select-last.
         dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[], &remote, &no_stale());
         dash.handle_input(KeyCode::Tab, &[], &barns, &[], &[], &remote, &no_stale());
-        assert_eq!(dash.focused_barn_index(), Some(0), "control: focus is on the barns");
+        assert_eq!(dash.focused_barn_index(&barns), Some(0), "control: focus is on the barns");
 
         let action =
             dash.handle_input(KeyCode::Char('G'), &[], &barns, &[], &[], &remote, &no_stale());
 
         assert!(matches!(action, DashboardAction::None), "`G` opened a barn window");
-        assert_eq!(dash.focused_barn_index(), Some(1), "`G` stopped meaning select-last");
+        assert_eq!(dash.focused_barn_index(&barns), Some(1), "`G` stopped meaning select-last");
     }
 
     #[test]
@@ -1687,5 +1769,31 @@ mod tests {
         assert!(text.contains("[1] local-window"), "the local half went missing:\n{text}");
         assert!(text.contains("guided"), "no heading for the connected barn:\n{text}");
         assert!(text.contains("[A] remote-window"), "the barn's session is not on screen:\n{text}");
+    }
+
+    /// `/` on the barns panel narrows it, and the keys that act on a row act
+    /// on the filtered row. While typing, digits and capitals are text.
+    #[test]
+    fn the_barns_filter_resolves_the_cursor_to_the_filtered_barn() {
+        let _ranch = crate::testing::temp_ranch();
+        let windows = [win(3, "api-claude", "claude")];
+        let barns = [barn("guided"), barn("pi"), barn("smash-mac")];
+        let mut dash = GlobalDashboard::new();
+        let mut input = |dash: &mut GlobalDashboard, k| dash.handle_input(k, &[], &barns, &[], &windows, &no_frames(), &no_stale());
+
+        input(&mut dash, KeyCode::Tab);
+        input(&mut dash, KeyCode::Tab);
+        input(&mut dash, KeyCode::Char('/'));
+        assert!(dash.is_input_mode());
+        // `1` would switch to the local session if it were not text.
+        for c in ['s', 'm', '1'] {
+            assert!(matches!(input(&mut dash, KeyCode::Char(c)), DashboardAction::None));
+        }
+        input(&mut dash, KeyCode::Backspace);
+        assert!(matches!(input(&mut dash, KeyCode::Enter), DashboardAction::SelectBarn(2)));
+        assert_eq!(dash.focused_barn_index(&barns), Some(2));
+
+        input(&mut dash, KeyCode::Esc);
+        assert_eq!(dash.focused_barn_index(&barns), Some(0), "Esc brings every row back");
     }
 }

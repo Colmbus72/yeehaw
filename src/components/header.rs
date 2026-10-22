@@ -196,6 +196,18 @@ pub fn render_header(frame: &mut Frame, area: Rect, props: &HeaderProps) {
     frame.render_widget(paragraph, area);
 }
 
+/// The dashboard's one-line title: the tumbleweed's face and the name in
+/// plain, letter-spaced text. The figlet banner took nine rows of every
+/// terminal for a word the user already knows.
+pub fn render_compact_header(frame: &mut Frame, area: Rect, text: &str) {
+    let spaced: String = text.to_uppercase().chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+    let line = Line::from(vec![
+        Span::styled("  ░▒ · ‿ · ▒░  ", Style::default().fg(TUMBLEWEED_COLOR).add_modifier(Modifier::BOLD)),
+        Span::styled(spaced, Style::default().fg(BRAND_COLOR).add_modifier(Modifier::BOLD)),
+    ]);
+    frame.render_widget(Paragraph::new(line), Rect { height: area.height.min(1), ..area });
+}
+
 /// Simple header for non-figlet contexts (sub-pages that show entity-specific ASCII art)
 pub fn render_simple_header(frame: &mut Frame, area: Rect, title: &str, subtitle: Option<&str>) {
     let text = if let Some(sub) = subtitle {
