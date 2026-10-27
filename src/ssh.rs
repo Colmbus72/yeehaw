@@ -37,6 +37,19 @@ pub struct Opts {
     /// this false anywhere a non-zero exit is a genuine failure (probes, trail
     /// steps, git detection).
     pub allow_failure: bool,
+    /// Open a connection of its own instead of riding the shared
+    /// `ControlMaster`. For the interactive attach only.
+    ///
+    /// A mux client hands its stdin/stdout/stderr to the master over the
+    /// control socket, so the *master* — a background process that outlives
+    /// the client by `ControlPersist` — ends up holding the tmux pane's tty and
+    /// reading keystrokes from it. When a stale connection drops, the client
+    /// exits and `connect` draws its "[r] reconnect [q] quit" screen, but a
+    /// master still wedged on the dead link keeps those fds and swallows every
+    /// key typed into the pane: only tmux-level bindings like C-q get through.
+    /// A dedicated connection is one process owning the tty; when it exits,
+    /// the tty is ours again.
+    pub dedicated: bool,
 }
 
 fn control_path() -> PathBuf {
@@ -64,12 +77,24 @@ pub fn ssh_args(barn: &Barn, opts: Opts) -> Result<Vec<String>> {
     let mut args: Vec<String> = vec![
         "-o".into(), "StrictHostKeyChecking=accept-new".into(),
         "-o".into(), format!("ConnectTimeout={}", CONNECT_TIMEOUT_SECS),
-        "-o".into(), "ControlMaster=auto".into(),
-        "-o".into(), format!("ControlPath={}", control_path().display()),
-        "-o".into(), format!("ControlPersist={}", CONTROL_PERSIST),
+    ];
+
+    if opts.dedicated {
+        // `ControlPath=none` alone is enough to keep ssh away from the socket,
+        // `ControlMaster=no` makes the intent explicit in `ps`.
+        args.extend(["-o".into(), "ControlMaster=no".into(), "-o".into(), "ControlPath=none".into()]);
+    } else {
+        args.extend([
+            "-o".into(), "ControlMaster=auto".into(),
+            "-o".into(), format!("ControlPath={}", control_path().display()),
+            "-o".into(), format!("ControlPersist={}", CONTROL_PERSIST),
+        ]);
+    }
+
+    args.extend([
         "-o".into(), format!("ServerAliveInterval={}", SERVER_ALIVE_INTERVAL_SECS),
         "-o".into(), format!("ServerAliveCountMax={}", SERVER_ALIVE_COUNT_MAX),
-    ];
+    ]);
 
     if opts.batch {
         args.push("-o".into());
@@ -276,6 +301,20 @@ mod tests {
         let args = ssh_args(&barn(None), Opts::default()).unwrap();
         assert!(args.contains(&"ControlMaster=auto".to_string()));
         assert!(args.iter().any(|a| a.starts_with("ControlPersist=")));
+    }
+
+    /// The interactive attach must never be a mux client: the master would hold
+    /// the pane's tty and could keep reading it after the attach exits.
+    #[test]
+    fn a_dedicated_connection_bypasses_the_control_master() {
+        let _ranch = crate::testing::temp_ranch();
+        let args = ssh_args(&barn(None), Opts { tty: true, dedicated: true, ..Opts::default() }).unwrap();
+        assert!(args.contains(&"ControlMaster=no".to_string()));
+        assert!(args.contains(&"ControlPath=none".to_string()));
+        assert!(!args.iter().any(|a| a.starts_with("ControlPersist=")));
+        // Keepalives still apply: they are how a dead link becomes an exit.
+        assert!(args.iter().any(|a| a.starts_with("ServerAliveInterval=")));
+        assert!(args.iter().any(|a| a.starts_with("ConnectTimeout=")));
     }
 
     #[test]

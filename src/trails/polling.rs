@@ -11,7 +11,15 @@ pub fn check_and_trigger(
     repo_url: &str,
     branch: &str,
     barn: &Barn,
+    project: &str,
 ) -> Result<bool> {
+    // A run already in flight: leave the stored SHA alone, so the commit that
+    // arrived meanwhile is still "new" on the first poll after it finishes
+    // instead of being consumed by a launch that never happened.
+    if crate::jobs::trail_is_running(livestock_name, trail_name) {
+        return Ok(false);
+    }
+
     // Run git ls-remote on the barn via SSH. BatchMode: this runs from a cron
     // worm, so it must fail rather than block on a password prompt.
     let stdout = ssh::run(
@@ -36,30 +44,13 @@ pub fn check_and_trigger(
         return Ok(false); // No change
     }
 
-    // SHA changed — update immediately (prevents double-trigger)
-    config::write_poll_sha(livestock_name, branch, &remote_sha)?;
-
-    // Write trigger file
-    let now = chrono::Utc::now();
-    let filename = format!("poll-{}--{}--{}.json", livestock_name, trail_name,
-                           now.format("%Y-%m-%dT%H-%M-%S"));
-    let trigger_path = config::worm_triggers_dir().join(&filename);
-
-    let trigger = serde_json::json!({
-        "worm": format!("poll--{}--{}", livestock_name, trail_name),
-        "triggered_at": now.to_rfc3339(),
-        "trigger": "poll",
-        "livestock": livestock_name,
-        "trail": trail_name,
-        "branch": branch,
-        "sha": remote_sha,
-    });
-
-    std::fs::create_dir_all(config::worm_triggers_dir())?;
-    // Bare `fs::write`, never `store::write_atomic`: the watcher would consume
-    // and delete the temp file before the rename could publish it. See the
-    // invariant on `config::worm_triggers_dir()`.
-    std::fs::write(&trigger_path, serde_json::to_string_pretty(&trigger)?)?;
-
-    Ok(true)
+    match crate::jobs::launch_trail(livestock_name, trail_name, Some(project), Some(&barn.name), "poll")? {
+        crate::jobs::Launch::Started => {
+            // Recorded only once the run is actually under way, so a launch
+            // that could not happen is retried on the next poll.
+            config::write_poll_sha(livestock_name, branch, &remote_sha)?;
+            Ok(true)
+        }
+        crate::jobs::Launch::NoSession | crate::jobs::Launch::AlreadyRunning => Ok(false),
+    }
 }

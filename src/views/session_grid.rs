@@ -131,7 +131,7 @@ const STALE_NOTE: Color = Color::Rgb(190, 90, 80);
 
 /// The window types the filter can toggle. Order here is the order shown in the
 /// filter panel.
-pub const WINDOW_TYPES: &[&str] = &["claude", "shell", "ssh", "worm"];
+pub const WINDOW_TYPES: &[&str] = &["claude", "shell", "ssh", "worm", "trail"];
 
 const CLAUDE: &str = "claude";
 /// Bucket for windows created before scope tagging existed.

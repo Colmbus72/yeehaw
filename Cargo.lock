@@ -2522,6 +2522,7 @@ dependencies = [
  "figlet-rs",
  "fs2",
  "futures",
+ "libc",
  "notify",
  "rand",
  "ratatui",

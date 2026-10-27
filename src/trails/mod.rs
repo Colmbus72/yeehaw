@@ -78,6 +78,15 @@ pub struct TrailRun {
     pub finished_at: Option<String>,
     pub status: String, // "running", "success", "failed", "cancelled"
     pub steps: Vec<TrailStepRun>,
+    /// The `yeehaw trail run` process executing this run. A run that says
+    /// `running` but whose process is gone was interrupted — see
+    /// [`crate::jobs::run_is_live`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// tmux pane the run streams into (`$TMUX_PANE`), for cancelling it with a
+    /// Ctrl-C exactly as if the user had typed one there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

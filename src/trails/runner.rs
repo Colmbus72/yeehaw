@@ -71,8 +71,11 @@ pub fn start_trail(
     let (_job_name, job) = trail.first_job()
         .ok_or_else(|| anyhow::anyhow!("Trail '{}' has no jobs defined", trail.name))?;
 
-    // Create run directory
-    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+    // One clock reading for both the directory name and `started_at`. The
+    // trail view rebuilds the directory from `started_at`, so two readings that
+    // straddled a second boundary pointed it at a directory that did not exist.
+    let now = chrono::Utc::now();
+    let timestamp = now.format("%Y-%m-%dT%H-%M-%S").to_string();
     let run_dir = config::trail_run_dir_for(&livestock.name, &trail.name, &timestamp);
     std::fs::create_dir_all(&run_dir)?;
 
@@ -82,9 +85,11 @@ pub fn start_trail(
     let run = TrailRun {
         livestock: livestock.name.clone(),
         trail: trail.name.clone(),
-        started_at: chrono::Utc::now().to_rfc3339(),
+        started_at: now.to_rfc3339(),
         finished_at: None,
         status: "running".to_string(),
+        pid: Some(std::process::id()),
+        pane: std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty()),
         steps: job.steps.iter().map(|s| TrailStepRun {
             name: s.name.clone(),
             status: "pending".to_string(),

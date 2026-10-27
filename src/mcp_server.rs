@@ -1193,19 +1193,15 @@ impl YeehawServer {
         if find_worm(&params.0.name).is_none() {
             return err_text(&format!("Worm '{}' not found", params.0.name));
         }
-        let now = chrono::Utc::now();
-        let filename = format!("{}-{}.json", params.0.name, now.format("%Y-%m-%dT%H-%M-%S"));
-        let trigger_path = config::worm_triggers_dir().join(&filename);
-        let trigger = serde_json::json!({
-            "worm": params.0.name,
-            "triggered_at": now.to_rfc3339(),
-            "trigger": "manual"
-        });
-        // Bare `fs::write`, never `store::write_atomic`: the watcher would consume
-        // and delete the temp file before the rename could publish it. See the
-        // invariant on `config::worm_triggers_dir()`.
-        match std::fs::write(&trigger_path, trigger.to_string()) {
-            Ok(()) => ok_text(&format!("Worm '{}' triggered", params.0.name)),
+        match crate::jobs::launch_worm(&params.0.name, "mcp") {
+            Ok(crate::jobs::Launch::Started) => ok_text(&format!(
+                "Worm '{}' started in a background window of the yeehaw tmux session",
+                params.0.name
+            )),
+            Ok(crate::jobs::Launch::NoSession) => {
+                err_text("The yeehaw tmux session is not running, so the worm was not started")
+            }
+            Ok(crate::jobs::Launch::AlreadyRunning) => err_text("Worm is already running"),
             Err(e) => err_text(&format!("Failed: {}", e)),
         }
     }
@@ -1589,31 +1585,20 @@ impl YeehawServer {
     #[tool(description = "Trigger a trail run on a livestock (executes via SSH on the livestock's barn)")]
     async fn run_trail(&self, params: Parameters<RunTrailParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let now = chrono::Utc::now();
-        let filename = format!(
-            "mcp-trail-{}--{}--{}.json",
-            p.livestock, p.trail, now.format("%Y-%m-%dT%H-%M-%S")
-        );
-        let trigger = serde_json::json!({
-            "worm": format!("trail--{}--{}", p.livestock, p.trail),
-            "triggered_at": now.to_rfc3339(),
-            "trigger": "mcp",
-            "livestock": p.livestock,
-            "trail": p.trail,
-            "project": p.project,
-        });
-        let trigger_path = config::worm_triggers_dir().join(&filename);
-        std::fs::create_dir_all(config::worm_triggers_dir())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        // Bare `fs::write`, never `store::write_atomic`: the watcher would consume
-        // and delete the temp file before the rename could publish it. See the
-        // invariant on `config::worm_triggers_dir()`.
-        std::fs::write(&trigger_path, serde_json::to_string_pretty(&trigger).unwrap())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        ok_text(&format!(
-            "Trail '{}' triggered on '{}'. Run ID: {}",
-            p.trail, p.livestock, now.format("%Y-%m-%dT%H-%M-%S")
-        ))
+        match crate::jobs::launch_trail(&p.livestock, &p.trail, Some(&p.project), None, "mcp") {
+            Ok(crate::jobs::Launch::Started) => ok_text(&format!(
+                "Trail '{}' started on '{}' in a background window. Follow it with list_trail_runs.",
+                p.trail, p.livestock
+            )),
+            Ok(crate::jobs::Launch::NoSession) => {
+                err_text("The yeehaw tmux session is not running, so the trail was not started")
+            }
+            Ok(crate::jobs::Launch::AlreadyRunning) => err_text(&format!(
+                "Trail '{}' is already running on '{}'",
+                p.trail, p.livestock
+            )),
+            Err(e) => err_text(&format!("Failed to start trail: {}", e)),
+        }
     }
 
     #[tool(description = "List trail run history for a specific livestock and trail")]

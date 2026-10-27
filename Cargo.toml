@@ -43,7 +43,12 @@ unicode-width = "0.1"
 
 # FIGlet ASCII art for headers
 figlet-rs = "0.1"
-notify = { version = "7", features = ["macos_kqueue"] }
+# Default backend on macOS is FSEvents: one stream for the whole tree. Not
+# kqueue — it holds an open fd per watched file (thousands under ~/.yeehaw) and
+# panics its event thread when a file is deleted between the kernel queueing an
+# event and the crate looking up its fd (kqueue-1.1.1 lib.rs:661), which the
+# trigger/signal files here do constantly.
+notify = "7"
 rmcp = { version = "0.15.0", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 
@@ -52,6 +57,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 ureq = { version = "2", features = ["json"] }
 regex = "1.12.3"
+libc = "0.2"
 
 # Vault encryption
 argon2 = "0.5"

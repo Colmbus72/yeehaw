@@ -1,4 +1,6 @@
 use std::io::{self, Write};
+use std::process::ExitStatus;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -18,6 +20,16 @@ const CYAN: &str = "\x1b[36m";
 
 /// Inner width of the connect box, in columns.
 const BOX_WIDTH: usize = 60;
+
+/// Backoff between automatic retries, indexed by consecutive failures. A
+/// dropped connection comes back fast; a barn that stays down is asked less and
+/// less often, settling at the last step.
+const RETRY_STEPS_SECS: &[u64] = &[3, 5, 10, 20, 30];
+
+/// An attach that ends sooner than this counts as a failed attempt, not a
+/// session. Without it a remote yeehaw that crashes on launch would be
+/// relaunched every few seconds forever at the shortest backoff.
+const MIN_HEALTHY_SESSION: Duration = Duration::from_secs(10);
 
 /// The installer the barn runs when the user picks `i`.
 const INSTALL_CMD: &str = "curl -LsSf https://yeehaw.cool/install.sh | sh";
@@ -102,25 +114,46 @@ pub fn run(barn_name: &str) -> Result<()> {
         return Err(anyhow!(why));
     }
 
+    // Consecutive attempts that got nowhere. Drives the retry backoff, and is
+    // reset by any session that lasted long enough to count as one.
+    let mut failures: u32 = 0;
+
     loop {
         render_connecting(&barn.name);
 
         match ssh::probe(&barn) {
             Err(e) => {
-                if !render_error(&barn, &format!("unreachable — {}", e), None)? {
+                failures += 1;
+                let auto = Some(retry_delay(failures));
+                if !render_error(&barn, &format!("unreachable — {}", e), None, auto)? {
                     return Ok(());
                 }
             }
             Ok(p) => match blocker(&p) {
+                // Missing tmux or yeehaw needs the user to act; retrying on a
+                // timer would only redraw the same complaint.
                 Some(b) => {
-                    if !render_error(&barn, &describe(b), Some((b, &p)))? {
+                    if !render_error(&barn, &describe(b), Some((b, &p)), None)? {
                         return Ok(());
                     }
                 }
                 None => {
-                    attach(&barn)?;
-                    // attach only returns if the connection dropped.
-                    if !render_dropped(&barn)? {
+                    let started = Instant::now();
+                    let status = attach(&barn)?;
+                    reset_terminal_modes();
+
+                    if started.elapsed() >= MIN_HEALTHY_SESSION {
+                        failures = 0;
+                    }
+                    let auto = if status.success() {
+                        // The remote yeehaw was quit on purpose. Bringing it
+                        // straight back would fight the user.
+                        None
+                    } else {
+                        failures += 1;
+                        Some(retry_delay(failures))
+                    };
+                    if !render_dropped(&barn, auto)? {
                         return Ok(());
                     }
                 }
@@ -129,16 +162,42 @@ pub fn run(barn_name: &str) -> Result<()> {
     }
 }
 
+/// Wait before automatic retry number `failures` (1-based).
+fn retry_delay(failures: u32) -> Duration {
+    let i = (failures.max(1) as usize - 1).min(RETRY_STEPS_SECS.len() - 1);
+    Duration::from_secs(RETRY_STEPS_SECS[i])
+}
+
 /// Hand the terminal to the remote yeehaw. `bash -lc` is required: a
 /// non-interactive SSH session does not source the login profile, so `yeehaw`
 /// would not otherwise be on PATH.
-fn attach(barn: &Barn) -> Result<()> {
+///
+/// `dedicated`: see [`Opts::dedicated`] — as a mux client, a stale master could
+/// keep reading this pane's tty after we get it back, and no key would reach
+/// the reconnect screen.
+///
+/// The exit status is ssh's: 0 when the remote yeehaw quit normally, 255 when
+/// the connection itself failed (including a keepalive timeout).
+fn attach(barn: &Barn) -> Result<ExitStatus> {
     // Never hand a raw terminal to ssh — the remote TUI sets up its own modes
     // and we would have no way to restore ours afterwards.
     let _ = disable_raw_mode();
-    let mut cmd = ssh::command(barn, "bash -lc yeehaw", Opts { tty: true, ..Default::default() })?;
-    let _ = cmd.status()?;
-    Ok(())
+    let opts = Opts { tty: true, dedicated: true, ..Default::default() };
+    let mut cmd = ssh::command(barn, "bash -lc yeehaw", opts)?;
+    Ok(cmd.status()?)
+}
+
+/// Undo whatever terminal modes the remote side switched on. A connection that
+/// dies mid-session never sends the remote tmux's teardown, so mouse tracking,
+/// focus reporting, bracketed paste, extended keys and the alternate screen are
+/// all still on in this pane — and the reconnect screen would be drawn into the
+/// alternate screen with the pane reporting mouse motion at it.
+fn reset_terminal_modes() {
+    print!(
+        "\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\
+         \x1b[?1004l\x1b[?2004l\x1b[>4m\x1b[<u\x1b>\x1b[?25h\x1b[0m"
+    );
+    let _ = io::stdout().flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -166,28 +225,84 @@ impl Drop for RawGuard {
 /// Block until the user presses one of `allowed` (an empty slice means any
 /// key). Ctrl-C, Ctrl-D and Esc always mean quit.
 fn read_key(allowed: &[char]) -> Result<char> {
-    let _guard = RawGuard::new()?;
     loop {
+        if let Some(c) = read_key_within(allowed, Duration::from_secs(3600))? {
+            return Ok(c);
+        }
+    }
+}
+
+/// [`read_key`], giving up after `timeout` with `None`.
+pub(crate) fn read_key_within(allowed: &[char], timeout: Duration) -> Result<Option<char>> {
+    let _guard = RawGuard::new()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || !event::poll(left)? {
+            return Ok(None);
+        }
         if let Event::Key(KeyEvent { code, modifiers, kind, .. }) = event::read()? {
-            if kind != KeyEventKind::Press {
-                continue;
+            if let Some(c) = interpret_key(code, modifiers, kind, allowed) {
+                return Ok(Some(c));
             }
-            if modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(code, KeyCode::Char('c') | KeyCode::Char('d'))
-            {
-                return Ok('q');
-            }
-            match code {
-                KeyCode::Esc => return Ok('q'),
-                KeyCode::Char(c) => {
-                    let c = c.to_ascii_lowercase();
-                    if allowed.is_empty() || allowed.contains(&c) {
-                        return Ok(c);
-                    }
-                }
-                _ if allowed.is_empty() => return Ok(' '),
-                _ => {}
-            }
+        }
+    }
+}
+
+fn interpret_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    kind: KeyEventKind,
+    allowed: &[char],
+) -> Option<char> {
+    if kind != KeyEventKind::Press {
+        return None;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(code, KeyCode::Char('c') | KeyCode::Char('d'))
+    {
+        return Some('q');
+    }
+    match code {
+        KeyCode::Esc => Some('q'),
+        KeyCode::Char(c) => {
+            let c = c.to_ascii_lowercase();
+            (allowed.is_empty() || allowed.contains(&c)).then_some(c)
+        }
+        _ if allowed.is_empty() => Some(' '),
+        _ => None,
+    }
+}
+
+/// Draw a screen and wait for one of `keys`. With `auto`, the screen counts
+/// down and answers `'r'` by itself when it reaches zero; `'r'` must be in
+/// `keys`. The hint line is appended last, so the countdown sits beside the
+/// keys that cut it short.
+fn prompt(rows: &[(String, &str)], hint: &str, keys: &[char], auto: Option<Duration>) -> Result<char> {
+    let draw = |hint_line: String| {
+        let mut all = rows.to_vec();
+        all.push((hint_line, DIM));
+        clear();
+        render_box("yeehaw · connect", &all);
+    };
+
+    let Some(wait) = auto else {
+        draw(hint.to_string());
+        return read_key(keys);
+    };
+
+    let deadline = Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok('r');
+        }
+        let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+        draw(format!("retrying in {}s   {}", secs, hint));
+        // Wake when the displayed second runs out, so the countdown ticks.
+        let tick = left - Duration::from_secs(secs - 1).min(left);
+        if let Some(c) = read_key_within(keys, tick)? {
+            return Ok(c);
         }
     }
 }
@@ -277,7 +392,14 @@ fn render_connecting(name: &str) {
 
 /// The barn cannot be attached to yet. Returns `true` to retry the outer loop,
 /// `false` to exit the process.
-fn render_error(barn: &Barn, message: &str, ctx: Option<(Blocker, &Probe)>) -> Result<bool> {
+///
+/// With `auto`, retries by itself after that long unless a key is pressed.
+fn render_error(
+    barn: &Barn,
+    message: &str,
+    ctx: Option<(Blocker, &Probe)>,
+    auto: Option<Duration>,
+) -> Result<bool> {
     let can_install = matches!(ctx, Some((Blocker::NoYeehaw, _)));
 
     let mut rows: Vec<(String, &str)> = vec![
@@ -302,20 +424,14 @@ fn render_error(barn: &Barn, message: &str, ctx: Option<(Blocker, &Probe)>) -> R
     }
 
     rows.push((String::new(), RESET));
-    rows.push((
-        if can_install {
-            "[r] retry   [i] install   [q] quit".to_string()
-        } else {
-            "[r] retry   [q] quit".to_string()
-        },
-        DIM,
-    ));
-
-    clear();
-    render_box("yeehaw · connect", &rows);
+    let hint = match (can_install, auto.is_some()) {
+        (true, _) => "[r] retry   [i] install   [q] quit",
+        (false, true) => "[r] now   [q] quit",
+        (false, false) => "[r] retry   [q] quit",
+    };
 
     let keys: &[char] = if can_install { &['r', 'i', 'q'] } else { &['r', 'q'] };
-    match read_key(keys)? {
+    match prompt(&rows, hint, keys, auto)? {
         'r' => Ok(true),
         'i' => {
             install(barn)?;
@@ -326,20 +442,23 @@ fn render_error(barn: &Barn, message: &str, ctx: Option<(Blocker, &Probe)>) -> R
 }
 
 /// The remote session ended. Returns `true` to reconnect, `false` to exit.
-fn render_dropped(barn: &Barn) -> Result<bool> {
-    clear();
-    render_box(
-        "yeehaw · connect",
-        &[
-            (format!("barn   {}", barn.name), CYAN),
-            (String::new(), RESET),
-            ("connection closed".to_string(), YELLOW),
-            (String::new(), RESET),
-            ("[r] reconnect   [q] quit".to_string(), DIM),
-        ],
-    );
+///
+/// `auto` is set when the connection was lost rather than quit, and reconnects
+/// by itself after that long.
+fn render_dropped(barn: &Barn, auto: Option<Duration>) -> Result<bool> {
+    let (what, hint) = if auto.is_some() {
+        ("connection lost", "[r] now   [q] quit")
+    } else {
+        ("session ended", "[r] reconnect   [q] quit")
+    };
+    let rows = [
+        (format!("barn   {}", barn.name), CYAN),
+        (String::new(), RESET),
+        (what.to_string(), YELLOW),
+        (String::new(), RESET),
+    ];
 
-    Ok(read_key(&['r', 'q'])? == 'r')
+    Ok(prompt(&rows, hint, &['r', 'q'], auto)? == 'r')
 }
 
 /// Run the yeehaw installer on the barn. Errors are shown on the screen rather
@@ -385,6 +504,31 @@ fn install(barn: &Barn) -> Result<()> {
 mod tests {
     use super::*;
     use crate::ssh::Probe;
+
+    #[test]
+    fn retry_backoff_grows_then_settles() {
+        let secs: Vec<u64> = (1..=7).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, vec![3, 5, 10, 20, 30, 30, 30]);
+        // 0 is not a count the loop produces, but must not panic.
+        assert_eq!(retry_delay(0).as_secs(), 3);
+    }
+
+    #[test]
+    fn quit_keys_always_quit_and_others_are_filtered() {
+        let press = KeyEventKind::Press;
+        let none = KeyModifiers::NONE;
+        let r = |c| interpret_key(KeyCode::Char(c), none, press, &['r', 'q']);
+        assert_eq!(r('r'), Some('r'));
+        assert_eq!(r('R'), Some('r'));
+        assert_eq!(r('x'), None);
+        assert_eq!(interpret_key(KeyCode::Esc, none, press, &['r']), Some('q'));
+        assert_eq!(
+            interpret_key(KeyCode::Char('c'), KeyModifiers::CONTROL, press, &['r']),
+            Some('q')
+        );
+        assert_eq!(interpret_key(KeyCode::Char('r'), none, KeyEventKind::Release, &['r']), None);
+        assert_eq!(interpret_key(KeyCode::Enter, none, press, &[]), Some(' '));
+    }
 
     #[test]
     fn summarizes_a_ready_barn() {

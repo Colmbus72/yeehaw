@@ -135,7 +135,7 @@ pub fn frame_command() -> String {
 /// unanswerable, so a jump that can prompt is a jump that can hang yeehaw.
 ///
 /// No `tty`. `select-window` renders nothing and exits.
-const SELECT_OPTS: Opts = Opts { batch: true, tty: false, allow_failure: false };
+const SELECT_OPTS: Opts = Opts { batch: true, tty: false, allow_failure: false, dedicated: false };
 
 /// The tmux target for window `window_index` of the yeehaw session **on a
 /// barn**.

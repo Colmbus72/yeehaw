@@ -549,7 +549,7 @@ pub fn create_ssh_window(window_name: &str, barn: &Barn, remote_path: &str) -> R
 /// Claude Code to run the status hook, and a window launched without it reports
 /// nothing: `signals::read_signal` finds no file, and the dashboard falls back
 /// to a relative timestamp for the life of the session.
-fn claude_base_command() -> String {
+pub(crate) fn claude_base_command() -> String {
     compose_claude_command(
         &build_mcp_config(),
         &build_allowed_tools(),
@@ -625,7 +625,12 @@ pub fn create_claude_window_with_context(
     Ok(idx)
 }
 
-pub fn create_worm_window(
+/// Open a background window running `command`, tagged `window_type`.
+///
+/// `-d` always: these are opened by cron, the poller, MCP and the dashboard on
+/// the user's behalf, and must never move the client off whatever it is on.
+pub fn create_task_window(
+    window_type: &str,
     window_name: &str,
     command: &str,
     working_dir: &str,
@@ -640,51 +645,40 @@ pub fn create_worm_window(
         working_dir.to_string()
     };
 
+    // A ranch other than the default has to follow the run into its window:
+    // the window's environment is the tmux server's, not ours, and a runner
+    // there would otherwise read — and record into — the default ranch.
+    let ranch_env = std::env::var("YEEHAW_HOME").ok().map(|h| format!("YEEHAW_HOME={}", h));
+    let mut args: Vec<&str> = vec![
+        "new-window", "-a", "-d",
+        "-P", "-F", "#{window_index}",
+        "-t", YEEHAW_SESSION,
+        "-n", window_name,
+        "-c", &expanded,
+    ];
+    if let Some(e) = ranch_env.as_deref() {
+        args.extend(["-e", e]);
+    }
+    args.push(command);
+
     let output = Command::new("tmux")
-        .args([
-            "new-window", "-a", "-d",
-            "-P", "-F", "#{window_index}",
-            "-t", YEEHAW_SESSION,
-            "-n", window_name,
-            "-c", &expanded,
-            command,
-        ])
+        .args(&args)
         .output()
-        .context("Failed to create worm window")?;
+        .with_context(|| format!("Failed to create {} window", window_type))?;
 
-    let idx = parse_new_window_index(&output, "worm")?;
+    let idx = parse_new_window_index(&output, window_type)?;
 
-    set_window_type(idx, "worm");
+    set_window_type(idx, window_type);
     Ok(idx)
 }
 
-pub fn create_claude_worm_window(
-    window_name: &str,
-    prompt: &str,
-    working_dir: &str,
-) -> Result<u32> {
-    let claude_cmd = format!(
-        "{} -p {}",
-        claude_base_command(),
-        shell_escape(prompt),
-    );
-
-    let output = Command::new("tmux")
-        .args([
-            "new-window", "-a", "-d",
-            "-P", "-F", "#{window_index}",
-            "-t", YEEHAW_SESSION,
-            "-n", window_name,
-            "-c", working_dir,
-            &claude_cmd,
-        ])
+/// Send a Ctrl-C into `pane`, as if typed there.
+pub fn send_interrupt(pane: &str) -> bool {
+    Command::new("tmux")
+        .args(["send-keys", "-t", pane, "C-c"])
         .output()
-        .context("Failed to create claude worm window")?;
-
-    let idx = parse_new_window_index(&output, "claude worm")?;
-
-    set_window_type(idx, "worm");
-    Ok(idx)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 pub fn kill_window(window_index: u32) {
@@ -833,7 +827,7 @@ fn mcp_server_path() -> String {
 /// does not know `connect`, falls through to launching the TUI, and the barn
 /// session shows a second local dashboard instead of the remote ranch. Same
 /// build as the parent is the only answer that is always right.
-fn current_exe_path() -> String {
+pub(crate) fn current_exe_path() -> String {
     std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "yeehaw".to_string())

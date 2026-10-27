@@ -35,7 +35,6 @@ use crate::views::ranchhand_detail::{RanchHandDetailView, RanchHandAction};
 use crate::views::trail_view::{TrailView, TrailViewAction};
 use crate::views::vault_view::{VaultView, VaultAction, VaultMode};
 use crate::vault::crypto;
-use crate::trails::provider::TrailProvider;
 
 // ============================================================================
 // App State
@@ -87,11 +86,9 @@ pub struct App {
     pub ranchhand_view: RanchHandDetailView,
     pub vault_view: VaultView,
 
-    // Trail execution state
+    // Trail view. Runs themselves live in their own tmux windows (`jobs`);
+    // the view follows them through the records they write.
     pub trail_view: TrailView,
-    pub trail_provider: Option<crate::trails::native::NativeProvider>,
-    pub trail_run_receiver: Option<tokio::sync::mpsc::Receiver<crate::trails::provider::StepUpdate>>,
-    pub trail_run_dir: Option<std::path::PathBuf>,
 
     // Editor request: (content, callback_id) — handled by main loop
     pub pending_editor: Option<PendingEditor>,
@@ -153,9 +150,6 @@ impl App {
             ranchhand_view: RanchHandDetailView::new(),
             vault_view: VaultView::new(),
             trail_view: TrailView::new(),
-            trail_provider: None,
-            trail_run_receiver: None,
-            trail_run_dir: None,
             pending_editor: None,
             claude_splash: None,
             claude_splash_window: None,
@@ -998,86 +992,10 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                 app.go_back();
             }
 
-            // Poll trail execution updates
-            {
-                let mut trail_finished = false;
-                if let Some(ref mut rx) = app.trail_run_receiver {
-                    while let Ok(update) = rx.try_recv() {
-                        let is_terminal = matches!(
-                            update.status,
-                            crate::trails::provider::StepStatus::Success |
-                            crate::trails::provider::StepStatus::Failed { .. }
-                        );
-                        app.trail_view.apply_update(update.step_index, update.status, update.output_line);
-
-                        if is_terminal {
-                            let all_done = app.trail_view.step_statuses.iter().any(|s| {
-                                matches!(s, crate::trails::provider::StepStatus::Failed { .. })
-                            }) || app.trail_view.step_statuses.iter().all(|s| {
-                                matches!(s, crate::trails::provider::StepStatus::Success)
-                            });
-
-                            if all_done {
-                                // Save final run state
-                                if let Some(ref run_dir) = app.trail_run_dir {
-                                    if let AppView::Trail { ref livestock, ref trail, .. } = app.view {
-                                        let final_status = if app.trail_view.step_statuses.iter().all(|s| {
-                                            matches!(s, crate::trails::provider::StepStatus::Success)
-                                        }) {
-                                            "success"
-                                        } else {
-                                            "failed"
-                                        };
-
-                                        let steps = trail.first_job()
-                                            .map(|(_, job)| &job.steps[..])
-                                            .unwrap_or(&[]);
-                                        // Read original started_at from the initial run.json
-                                        let original_started_at = std::fs::read_to_string(run_dir.join("run.json")).ok()
-                                            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-                                            .and_then(|v| v["started_at"].as_str().map(|s| s.to_string()))
-                                            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-                                        let run = crate::trails::TrailRun {
-                                            livestock: livestock.name.clone(),
-                                            trail: trail.name.clone(),
-                                            started_at: original_started_at,
-                                            finished_at: Some(chrono::Utc::now().to_rfc3339()),
-                                            status: final_status.to_string(),
-                                            steps: steps.iter().enumerate().map(|(i, s)| {
-                                                crate::trails::TrailStepRun {
-                                                    name: s.name.clone(),
-                                                    status: match app.trail_view.step_statuses.get(i) {
-                                                        Some(crate::trails::provider::StepStatus::Success) => "success".to_string(),
-                                                        Some(crate::trails::provider::StepStatus::Failed { .. }) => "failed".to_string(),
-                                                        _ => "pending".to_string(),
-                                                    },
-                                                    exit_code: match app.trail_view.step_statuses.get(i) {
-                                                        Some(crate::trails::provider::StepStatus::Failed { exit_code }) => Some(*exit_code),
-                                                        Some(crate::trails::provider::StepStatus::Success) => Some(0),
-                                                        _ => None,
-                                                    },
-                                                    started_at: None,
-                                                    duration_ms: None,
-                                                }
-                                            }).collect(),
-                                        };
-                                        let _ = config::save_trail_run(&run, run_dir);
-                                    }
-                                }
-                                // Refresh the runs list in trail view
-                                if let AppView::Trail { ref livestock, ref trail, .. } = app.view {
-                                    app.trail_view.finish_run(&livestock.name, &trail.name);
-                                }
-                                trail_finished = true;
-                            }
-                        }
-                    }
-                }
-                if trail_finished {
-                    app.trail_run_receiver = None;
-                    app.trail_provider = None;
-                    app.trail_run_dir = None;
-                }
+            // Follow trail runs through their records on disk.
+            if let AppView::Trail { ref livestock, ref trail, .. } = app.view {
+                let (livestock, trail) = (livestock.clone(), trail.clone());
+                app.trail_view.sync(&trail, &livestock);
             }
 
             // Tick trail view animation
@@ -1771,12 +1689,21 @@ fn handle_trail_input(app: &mut App, key: KeyCode) {
                 let barn = barn_for_livestock(&livestock, &app.barns, source_barn.as_ref())
                     .unwrap_or_else(config::local_barn);
 
-                match crate::trails::runner::start_trail(&trail, &livestock, &barn, Some(&project.name)) {
-                    Ok((run_dir, rx, provider)) => {
-                        app.trail_view.start_run(&trail);
-                        app.trail_run_receiver = Some(rx);
-                        app.trail_provider = Some(provider);
-                        app.trail_run_dir = Some(run_dir);
+                // The window opens in the background; the view picks the run
+                // up from its record within a tick, and `Esc` leaves it running.
+                match crate::jobs::launch_trail(
+                    &livestock.name,
+                    &trail.name,
+                    Some(&project.name),
+                    Some(&barn.name),
+                    "manual",
+                ) {
+                    Ok(crate::jobs::Launch::Started) => app.trail_view.expect_run(),
+                    Ok(crate::jobs::Launch::AlreadyRunning) => {
+                        app.error = Some("This trail is already running".to_string());
+                    }
+                    Ok(crate::jobs::Launch::NoSession) => {
+                        app.error = Some("Trails run in the yeehaw tmux session, which is not running".to_string());
                     }
                     Err(e) => {
                         app.error = Some(format!("Failed to start trail: {}", e));
@@ -1784,8 +1711,10 @@ fn handle_trail_input(app: &mut App, key: KeyCode) {
                 }
             }
             TrailViewAction::CancelTrail => {
-                if let Some(ref provider) = app.trail_provider {
-                    let _ = provider.cancel();
+                if let Some(run) = app.trail_view.active_run() {
+                    if !crate::jobs::cancel_trail_run(run) {
+                        app.error = Some("Could not reach the run to cancel it".to_string());
+                    }
                 }
             }
         }
@@ -2776,26 +2705,14 @@ fn get_bottom_bar_items(view: &AppView) -> Vec<(&'static str, &'static str)> {
     }
 }
 
-/// Write a trigger file to ~/.yeehaw/worm-triggers/ to manually run a worm
+/// Run a worm now, in a background window.
 fn trigger_worm(error: &mut Option<String>, worm: &Worm) {
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    let filename = format!("{}-{}.json", worm.name, now);
-    let trigger_path = config::worm_triggers_dir().join(&filename);
-
-    let trigger = serde_json::json!({
-        "worm": worm.name,
-        "triggered_at": chrono::Utc::now().to_rfc3339(),
-        "trigger": "manual"
-    });
-
-    // Bare `fs::write`, never `store::write_atomic`: the watcher would consume
-    // and delete the temp file before the rename could publish it. See the
-    // invariant on `config::worm_triggers_dir()`.
-    match std::fs::write(&trigger_path, trigger.to_string()) {
-        Ok(()) => {}
-        Err(e) => {
-            *error = Some(format!("Failed to trigger worm: {}", e));
+    match crate::jobs::launch_worm(&worm.name, "manual") {
+        Ok(crate::jobs::Launch::Started) | Ok(crate::jobs::Launch::AlreadyRunning) => {}
+        Ok(crate::jobs::Launch::NoSession) => {
+            *error = Some("Worms run in the yeehaw tmux session, which is not running".to_string());
         }
+        Err(e) => *error = Some(format!("Failed to run worm: {}", e)),
     }
 }
 
@@ -2828,103 +2745,26 @@ fn handle_worm_trigger(app: &mut App, filename: &str) {
         .unwrap_or("manual")
         .to_string();
 
-    // Check if this is a trail trigger (from poll or MCP)
-    if trigger_type == "poll" || trigger_type == "mcp" {
-        if let (Some(livestock_name), Some(trail_name)) = (
+    // Trigger files are the old transport — everything now launches its
+    // window directly — but one may still be written by a binary from before
+    // that (an MCP server Claude has had running for days, say). Honour it the
+    // new way: a background window, never a jump to it.
+    let result = if trigger_type == "poll" || trigger_type == "mcp" {
+        match (
             trigger.get("livestock").and_then(|v| v.as_str()),
             trigger.get("trail").and_then(|v| v.as_str()),
         ) {
-            // Check if a trail is already running (skip policy)
-            if app.trail_run_receiver.is_some() {
-                // Trail already running, skip this trigger
-                return;
+            (Some(livestock), Some(trail)) => {
+                let project = trigger.get("project").and_then(|v| v.as_str());
+                crate::jobs::launch_trail(livestock, trail, project, None, &trigger_type)
             }
-
-            let project_name_str = trigger.get("project").and_then(|v| v.as_str()).map(|s| s.to_string());
-
-            // Find the livestock, trail, and barn across all projects
-            let projects = config::load_projects();
-            for project in &projects {
-                if let Some(ls) = project.livestock.iter().find(|l| l.name == livestock_name) {
-                    if let Some(trail) = config::load_trail(trail_name) {
-                        let barn = barn_for_livestock(ls, &config::load_barns(), None)
-                            .unwrap_or_else(config::local_barn);
-                        let proj_name = project_name_str.as_deref().unwrap_or(&project.name);
-                        match crate::trails::runner::start_trail(&trail, ls, &barn, Some(proj_name)) {
-                            Ok((run_dir, rx, provider)) => {
-                                app.trail_view = TrailView::new();
-                                app.trail_view.enter(&trail, ls);
-                                app.trail_view.start_run(&trail);
-                                app.trail_run_receiver = Some(rx);
-                                app.trail_provider = Some(provider);
-                                app.trail_run_dir = Some(run_dir);
-                                app.navigate(AppView::Trail {
-                                    project: project.clone(),
-                                    livestock: ls.clone(),
-                                    trail: trail.clone(),
-                                    source: "project".to_string(),
-                                    source_barn: Some(barn.clone()),
-                                });
-                            }
-                            Err(e) => {
-                                app.error = Some(format!("Failed to start trail: {}", e));
-                            }
-                        }
-                        return;
-                    }
-                }
-            }
-            return;
+            _ => return,
         }
-    }
-
-    // Find the worm
-    let worm = match app.worms.iter().find(|w| w.name == worm_name) {
-        Some(w) => w.clone(),
-        None => return,
+    } else {
+        crate::jobs::launch_worm(&worm_name, &trigger_type)
     };
-
-    // Create the worm run record
-    let now = chrono::Utc::now();
-    let log_filename = format!("{}.log", now.format("%Y-%m-%dT%H-%M-%S"));
-    let run = crate::types::WormRun {
-        worm: worm.name.clone(),
-        started_at: now.to_rfc3339(),
-        finished_at: None,
-        exit_code: None,
-        log_file: log_filename,
-        trigger: trigger_type,
-        status: Some("running".to_string()),
-        skip_reason: None,
-    };
-
-    let _ = config::save_worm_run(&worm.name, &run);
-
-    // Execute based on type
-    if worm.worm_type == "shell" {
-        let working_dir = worm.working_dir.as_deref().unwrap_or("~");
-        let window_name = format!("worm-{}", worm.name);
-        match tmux::create_worm_window(&window_name, &worm.command, working_dir) {
-            Ok(idx) => {
-                tmux::switch_to_window(idx);
-            }
-            Err(e) => {
-                app.error = Some(format!("Failed to run worm: {}", e));
-            }
-        }
-    } else if worm.worm_type == "claude" {
-        // Claude worm: open a Claude session with the command as prompt
-        let working_dir = worm.working_dir.as_deref().unwrap_or("~");
-        let working_dir = expand_path(working_dir);
-        let window_name = format!("worm-{}", worm.name);
-        match tmux::create_claude_worm_window(&window_name, &worm.command, &working_dir) {
-            Ok(idx) => {
-                tmux::switch_to_window(idx);
-            }
-            Err(e) => {
-                app.error = Some(format!("Failed to run claude worm: {}", e));
-            }
-        }
+    if let Err(e) = result {
+        app.error = Some(format!("Failed to run '{}': {}", worm_name, e));
     }
 }
 

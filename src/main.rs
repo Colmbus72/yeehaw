@@ -8,6 +8,7 @@ mod editor;
 mod git;
 mod hooks;
 mod issues;
+mod jobs;
 mod mcp_server;
 mod migrate;
 mod ranchhand_k8s;
@@ -250,6 +251,20 @@ fn handle_worm_subcommand(args: &[String]) {
                 std::process::exit(1);
             }
         }
+        Some("run") => {
+            let Some(name) = args.get(3) else {
+                eprintln!("Usage: yeehaw worm run <name> [--trigger <kind>]");
+                std::process::exit(1);
+            };
+            let trigger = flag(args, "--trigger").unwrap_or("manual");
+            match jobs::run_worm(name, trigger, true) {
+                Ok(code) => std::process::exit(code.clamp(0, 255)),
+                Err(e) => {
+                    jobs::fail_and_close(&format!("worm {}", name), &e);
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("sync") => {
             match crontab::sync_crontab() {
                 Ok(()) => println!("\x1b[32m✓\x1b[0m Crontab synced"),
@@ -275,6 +290,7 @@ fn handle_worm_subcommand(args: &[String]) {
         _ => {
             println!("Usage:");
             println!("  yeehaw worm exec <name>   Trigger a worm (called by cron)");
+            println!("  yeehaw worm run <name>    Run a worm here, in this terminal");
             println!("  yeehaw worm sync          Sync crontab with worm configs");
             println!("  yeehaw worm list          List all worms");
         }
@@ -300,9 +316,23 @@ fn handle_trail_subcommand(args: &[String]) {
             };
             handle_trail_poll(livestock_name, trail_name);
         }
+        Some("run") => {
+            let (Some(livestock), Some(trail)) = (args.get(3), args.get(4)) else {
+                eprintln!("Usage: yeehaw trail run <livestock> <trail> [--project <p>] [--barn <b>]");
+                std::process::exit(1);
+            };
+            match jobs::run_trail(livestock, trail, flag(args, "--project"), flag(args, "--barn"), true) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    jobs::fail_and_close(&format!("trail {}", trail), &e);
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {
             println!("Usage:");
             println!("  yeehaw trail poll <livestock> <trail>   Poll for new commits and trigger trail");
+            println!("  yeehaw trail run <livestock> <trail>    Run a trail here, in this terminal");
         }
     }
 }
@@ -336,7 +366,7 @@ fn find_pollable_livestock(
 
 fn handle_trail_poll(livestock_name: &str, trail_name: &str) {
     // 1. Find livestock across all projects
-    let (livestock, barn, _project) = match find_pollable_livestock(livestock_name) {
+    let (livestock, barn, project) = match find_pollable_livestock(livestock_name) {
         Some(f) => f,
         None => {
             eprintln!("Livestock '{}' not found or has no barn", livestock_name);
@@ -376,6 +406,7 @@ fn handle_trail_poll(livestock_name: &str, trail_name: &str) {
         repo_url,
         branch,
         &barn,
+        &project,
     ) {
         Ok(true) => println!("New commits detected, trail triggered"),
         Ok(false) => println!("No new commits"),
@@ -389,10 +420,19 @@ fn handle_trail_poll(livestock_name: &str, trail_name: &str) {
 fn run_tui() -> Result<()> {
     let mut terminal = ratatui::init();
 
+    // Only a panic on the TUI's own thread ends the TUI. A background thread
+    // (file watcher, ssh stream readers) dying used to restore the terminal
+    // here while the app loop kept running — the dashboard dropped out of raw
+    // mode and the alternate screen with the panic text printed over it. Those
+    // go to a log instead, and the dashboard carries on.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        ratatui::restore();
-        original_hook(panic_info);
+        if std::thread::current().name() == Some("main") {
+            ratatui::restore();
+            original_hook(panic_info);
+        } else {
+            log_background_panic(panic_info);
+        }
     }));
 
     views::splash::run_splash(&mut terminal);
@@ -401,31 +441,53 @@ fn run_tui() -> Result<()> {
     result
 }
 
+/// Append a background thread's panic to `~/.yeehaw/panic.log`. Never to
+/// stderr: that is the TUI's screen.
+fn log_background_panic(info: &std::panic::PanicHookInfo<'_>) {
+    use std::io::Write;
+    let thread = std::thread::current();
+    let line = format!(
+        "{} thread '{}' panicked: {}\n",
+        chrono::Local::now().to_rfc3339(),
+        thread.name().unwrap_or("<unnamed>"),
+        info
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(config::yeehaw_dir().join("panic.log"))
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 fn run_mcp_server() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(mcp_server::run())
 }
 
+/// What cron calls. Opens the worm's window in the `yeehaw` session and
+/// returns; with no session running it does nothing at all.
+///
+/// Poll worms are the exception to "opens a window": they fire every minute or
+/// so and are plumbing, not work anyone watches, so they run right here and
+/// only the trail they set off gets a window.
 fn run_worm_exec(worm_name: &str) -> Result<()> {
-    // Write trigger file for the TUI to pick up
-    let now = chrono::Utc::now();
-    let filename = format!("{}-{}.json", worm_name, now.format("%Y-%m-%dT%H-%M-%S"));
-    let trigger_path = config::worm_triggers_dir().join(&filename);
-
-    let trigger = serde_json::json!({
-        "worm": worm_name,
-        "triggered_at": now.to_rfc3339(),
-        "trigger": "cron"
-    });
-
-    // Bare `fs::write`, never `store::write_atomic` — and Task 11 of the Phase 1
-    // plan is wrong to say "`grep -n 'fs::write' cli/src/main.rs` must return
-    // nothing". This one has to stay: the watcher matches any path under
-    // `worm-triggers/` and the handler deletes what it reads, so a temp file
-    // here is consumed before the rename can publish it. See the invariant on
-    // `config::worm_triggers_dir()`.
-    std::fs::write(&trigger_path, trigger.to_string())?;
+    jobs::ensure_path();
+    if !tmux::yeehaw_session_exists() {
+        return Ok(());
+    }
+    if worm_name.starts_with("poll--") {
+        jobs::run_worm(worm_name, "cron", false)?;
+        return Ok(());
+    }
+    jobs::launch_worm(worm_name, "cron")?;
     Ok(())
+}
+
+/// The value after `name` in `args`, e.g. `--barn pi`.
+fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(|s| s.as_str())
 }
 
 #[cfg(test)]

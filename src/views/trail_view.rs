@@ -11,6 +11,21 @@ use crate::trails::{Trail, TrailRun};
 use crate::trails::provider::StepStatus;
 use crate::types::Livestock;
 
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
+
+/// How many 250ms ticks between looks at disk for a run that started
+/// elsewhere (cron, the poller, MCP, another dashboard).
+const IDLE_SCAN_TICKS: u32 = 4;
+
+/// The run this view is following, read back from what its runner writes.
+struct ActiveRun {
+    run: TrailRun,
+    dir: PathBuf,
+    /// Bytes of each `step-N.log` already taken into `step_outputs`.
+    offsets: Vec<u64>,
+}
+
 // ============================================================================
 // Enums
 // ============================================================================
@@ -56,6 +71,13 @@ pub struct TrailView {
     pub running: bool,
     /// Auto-follow: track the currently running step.
     pub auto_follow: bool,
+
+    active: Option<ActiveRun>,
+    /// Ticks until the next scan for a live run.
+    scan_in: u32,
+    /// Ticks left to scan every tick, after `r` opened a window whose run
+    /// record does not exist yet.
+    expecting: u32,
 }
 
 impl TrailView {
@@ -73,6 +95,9 @@ impl TrailView {
             step_commands: vec![],
             running: false,
             auto_follow: true,
+            active: None,
+            scan_in: 0,
+            expecting: 0,
         }
     }
 
@@ -92,6 +117,91 @@ impl TrailView {
         self.running = false;
         self.auto_follow = true;
         self.focused_panel = FocusedPanel::Runs;
+        self.active = None;
+        mark_interrupted(&mut self.runs);
+        // Look for a run already under way on the first tick.
+        self.scan_in = 0;
+        self.expecting = 0;
+    }
+
+    /// A run was just launched: watch for its record every tick for a few
+    /// seconds, rather than waiting out the idle scan.
+    pub fn expect_run(&mut self) {
+        self.scan_in = 0;
+        self.expecting = 12;
+    }
+
+    /// The live run being followed, for cancelling it.
+    pub fn active_run(&self) -> Option<&TrailRun> {
+        self.active.as_ref().map(|a| &a.run)
+    }
+
+    /// Bring the view up to date with disk. Called every tick while the view
+    /// is open; cheap when nothing is running.
+    pub fn sync(&mut self, trail: &Trail, livestock: &Livestock) {
+        if self.active.is_some() {
+            self.follow_active();
+            let finished = self.active.as_ref().is_some_and(|a| !crate::jobs::run_is_live(&a.run));
+            if finished {
+                self.active = None;
+                self.finish_run(&livestock.name, &trail.name);
+                mark_interrupted(&mut self.runs);
+            }
+            return;
+        }
+
+        if self.scan_in > 0 {
+            self.scan_in -= 1;
+            return;
+        }
+        self.scan_in = if self.expecting > 0 {
+            self.expecting -= 1;
+            0
+        } else {
+            IDLE_SCAN_TICKS
+        };
+
+        let mut runs = config::load_trail_runs(&livestock.name, &trail.name);
+        if let Some(pos) = runs.iter().position(crate::jobs::run_is_live) {
+            let live = runs.remove(pos);
+            mark_interrupted(&mut runs);
+            self.runs = runs;
+            self.start_run(trail);
+            let dir = run_dir_for(&live);
+            let steps = self.step_statuses.len();
+            self.active = Some(ActiveRun { run: live, dir, offsets: vec![0; steps] });
+            self.expecting = 0;
+            self.follow_active();
+        } else {
+            mark_interrupted(&mut runs);
+            if runs != self.runs {
+                self.runs = runs;
+            }
+        }
+    }
+
+    /// Re-read the followed run's record and take any new log output.
+    fn follow_active(&mut self) {
+        let Some(active) = self.active.as_mut() else { return };
+        if let Some(run) = std::fs::read_to_string(active.dir.join("run.json"))
+            .ok()
+            .and_then(|j| serde_json::from_str::<TrailRun>(&j).ok())
+        {
+            active.run = run;
+        }
+
+        for (i, step) in active.run.steps.iter().enumerate() {
+            if let Some(slot) = self.step_statuses.get_mut(i) {
+                *slot = step_status(&step.status, step.exit_code);
+            }
+            if step.status == "pending" {
+                continue;
+            }
+            let (Some(offset), Some(out)) = (active.offsets.get_mut(i), self.step_outputs.get_mut(i)) else {
+                continue;
+            };
+            *offset += read_new_lines(&active.dir.join(format!("step-{}.log", i)), *offset, out);
+        }
     }
 
     /// Called when the user triggers [r] to start a new run.
@@ -130,18 +240,6 @@ impl TrailView {
                     }
                     break;
                 }
-            }
-        }
-    }
-
-    /// Process a step update from the execution receiver.
-    pub fn apply_update(&mut self, step_index: usize, status: StepStatus, output_line: Option<String>) {
-        if step_index < self.step_statuses.len() {
-            self.step_statuses[step_index] = status;
-        }
-        if let Some(line) = output_line {
-            if step_index < self.step_outputs.len() {
-                self.step_outputs[step_index].push(line);
             }
         }
     }
@@ -307,7 +405,7 @@ impl TrailView {
         for run in &self.runs {
             let status_icon = match run.status.as_str() {
                 "success" => "\u{2713}",
-                "failed" | "cancelled" => "\u{2717}",
+                "failed" | "cancelled" | "interrupted" => "\u{2717}",
                 "running" => "\u{2592}",
                 _ => "?",
             };
@@ -320,7 +418,7 @@ impl TrailView {
                 label: format!("{} {}  {}", status_icon, date_display, step_icons),
                 status: Some(match run.status.as_str() {
                     "success" => ItemStatus::Active,
-                    "failed" | "cancelled" => ItemStatus::Error,
+                    "failed" | "cancelled" | "interrupted" => ItemStatus::Error,
                     _ => ItemStatus::Inactive,
                 }),
                 meta: None,
@@ -506,18 +604,9 @@ impl TrailView {
             }).collect()
         } else if let Some(run) = self.get_historical_run() {
             // Historical data
-            run.steps.iter().map(|s| {
-                let status = match s.status.as_str() {
-                    "success" => StepStatus::Success,
-                    "failed" => StepStatus::Failed { exit_code: s.exit_code.unwrap_or(1) },
-                    "running" => StepStatus::Running,
-                    "skipped" => StepStatus::Skipped,
-                    _ => StepStatus::Pending,
-                };
-                StepItem {
-                    name: s.name.clone(),
-                    status,
-                }
+            run.steps.iter().map(|s| StepItem {
+                name: s.name.clone(),
+                status: step_status(&s.status, s.exit_code),
             }).collect()
         } else {
             // No run selected (e.g., empty history, not running)
@@ -542,29 +631,13 @@ impl TrailView {
                 .unwrap_or_default()
         } else if let Some(run) = self.get_historical_run() {
             // Load from log file on disk
-            let run_dir = self.run_dir_for_historical(run);
+            let run_dir = run_dir_for(run);
             config::load_trail_step_log(&run_dir, step_idx)
                 .map(|content| content.lines().map(|l| l.to_string()).collect())
                 .unwrap_or_default()
         } else {
             vec![]
         }
-    }
-
-    /// Construct the run directory path for a historical run.
-    ///
-    /// The runner creates run dirs using `chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S")`,
-    /// but TrailRun.started_at stores the RFC3339 timestamp (e.g., "2024-01-15T10:30:00+00:00").
-    /// We need to convert the RFC3339 to the directory format.
-    fn run_dir_for_historical(&self, run: &TrailRun) -> std::path::PathBuf {
-        // Parse the RFC3339 started_at and reformat to match the directory name format
-        let dir_timestamp = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&run.started_at) {
-            dt.format("%Y-%m-%dT%H-%M-%S").to_string()
-        } else {
-            // Fallback: replace colons with hyphens (handles edge cases)
-            run.started_at.replace(':', "-")
-        };
-        config::trail_run_dir_for(&run.livestock, &run.trail, &dir_timestamp)
     }
 
     /// Build step status icons string from live step_statuses.
@@ -581,12 +654,64 @@ impl TrailView {
     }
 }
 
+/// The directory a run lives in.
+///
+/// The runner names it from the same clock reading as `started_at`, in
+/// `%Y-%m-%dT%H-%M-%S`; this recovers that name from the RFC3339 timestamp.
+fn run_dir_for(run: &TrailRun) -> PathBuf {
+    let dir_timestamp = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&run.started_at) {
+        dt.format("%Y-%m-%dT%H-%M-%S").to_string()
+    } else {
+        run.started_at.replace(':', "-")
+    };
+    config::trail_run_dir_for(&run.livestock, &run.trail, &dir_timestamp)
+}
+
+fn step_status(status: &str, exit_code: Option<i32>) -> StepStatus {
+    match status {
+        "success" => StepStatus::Success,
+        "failed" => StepStatus::Failed { exit_code: exit_code.unwrap_or(1) },
+        "running" => StepStatus::Running,
+        "skipped" => StepStatus::Skipped,
+        _ => StepStatus::Pending,
+    }
+}
+
+/// A record that still says `running` with no runner behind it was cut off —
+/// by a reboot, a kill, or a dashboard that used to run trails in-process and
+/// exited. Shown for what it is instead of as a run that never ends.
+fn mark_interrupted(runs: &mut [TrailRun]) {
+    for run in runs.iter_mut() {
+        if run.status == "running" && !crate::jobs::run_is_live(run) {
+            run.status = "interrupted".to_string();
+        }
+    }
+}
+
+/// Append the complete lines written to `path` past `offset` onto `out`.
+/// Returns how many bytes were consumed; a trailing partial line is left for
+/// the next read so it is never split in two.
+fn read_new_lines(path: &std::path::Path, offset: u64, out: &mut Vec<String>) -> u64 {
+    let Ok(mut f) = std::fs::File::open(path) else { return 0 };
+    if f.seek(SeekFrom::Start(offset)).is_err() {
+        return 0;
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return 0;
+    }
+    let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') else { return 0 };
+    let text = String::from_utf8_lossy(&buf[..last_nl]);
+    out.extend(text.split('\n').map(String::from));
+    (last_nl + 1) as u64
+}
+
 /// Build step status icons from a historical TrailRun.
 fn build_step_icons_from_run(run: &TrailRun, _trail: &Trail) -> String {
     run.steps.iter().map(|s| {
         match s.status.as_str() {
             "success" => '\u{2713}',
-            "failed" => '\u{2717}',
+            "failed" | "cancelled" => '\u{2717}',
             "running" => '\u{2592}',
             _ => '\u{2591}',
         }
@@ -601,5 +726,106 @@ fn format_run_timestamp(started_at: &str) -> String {
         started_at[..16].replace('T', " ")
     } else {
         started_at.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trails::TrailStepRun;
+
+    fn trail() -> Trail {
+        serde_yaml::from_str(
+            "name: deploy\njobs:\n  main:\n    runs_on: barn\n    steps:\n      - name: build\n        run: make\n      - name: ship\n        run: make ship\n",
+        )
+        .unwrap()
+    }
+
+    fn livestock() -> Livestock {
+        serde_yaml::from_str("name: web\npath: /tmp/web\n").unwrap()
+    }
+
+    fn write_run(status: &str, pid: Option<u32>, steps: [&str; 2]) -> (TrailRun, PathBuf) {
+        let run = TrailRun {
+            livestock: "web".into(),
+            trail: "deploy".into(),
+            started_at: "2026-10-27T10:00:00+00:00".into(),
+            finished_at: None,
+            status: status.into(),
+            steps: ["build", "ship"]
+                .iter()
+                .zip(steps)
+                .map(|(n, s)| TrailStepRun {
+                    name: n.to_string(),
+                    status: s.into(),
+                    exit_code: None,
+                    started_at: None,
+                    duration_ms: None,
+                })
+                .collect(),
+            pid,
+            pane: None,
+        };
+        let dir = run_dir_for(&run);
+        config::save_trail_run(&run, &dir).unwrap();
+        (run, dir)
+    }
+
+    /// The run was started somewhere else — its own window, cron, MCP. The view
+    /// finds it on disk, follows its steps and output, and lets go when the
+    /// runner records the end.
+    #[test]
+    fn a_live_run_on_disk_is_followed_to_the_end() {
+        let _ranch = crate::testing::temp_ranch();
+        let (t, l) = (trail(), livestock());
+        let me = Some(std::process::id());
+        let (_, dir) = write_run("running", me, ["running", "pending"]);
+        std::fs::write(dir.join("step-0.log"), "compiling\nlinking\npart").unwrap();
+
+        let mut view = TrailView::new();
+        view.enter(&t, &l);
+        view.sync(&t, &l);
+
+        assert!(view.running, "a live run on disk was not picked up");
+        assert_eq!(view.step_statuses[0], StepStatus::Running);
+        assert_eq!(view.step_outputs[0], vec!["compiling", "linking"], "partial line taken early");
+
+        // The line completes, the step finishes, the next one starts.
+        std::fs::write(dir.join("step-0.log"), "compiling\nlinking\npartial\n").unwrap();
+        write_run("running", me, ["success", "running"]);
+        view.sync(&t, &l);
+        assert_eq!(view.step_outputs[0], vec!["compiling", "linking", "partial"]);
+        assert_eq!(view.step_statuses, vec![StepStatus::Success, StepStatus::Running]);
+
+        write_run("success", me, ["success", "success"]);
+        view.sync(&t, &l);
+        assert!(!view.running, "a finished run was still shown as running");
+        assert_eq!(view.runs.len(), 1);
+        assert_eq!(view.runs[0].status, "success");
+    }
+
+    /// A `running` record with no process behind it is history, not a run to
+    /// follow — and is labelled interrupted, not left spinning.
+    #[test]
+    fn an_orphaned_running_record_reads_as_interrupted() {
+        let _ranch = crate::testing::temp_ranch();
+        let (t, l) = (trail(), livestock());
+        write_run("running", None, ["running", "pending"]);
+
+        let mut view = TrailView::new();
+        view.enter(&t, &l);
+        view.sync(&t, &l);
+
+        assert!(!view.running);
+        assert_eq!(view.runs[0].status, "interrupted");
+    }
+
+    /// Leaving the page is just leaving: `Esc` never cancels.
+    #[test]
+    fn esc_goes_back_even_while_running() {
+        let mut view = TrailView::new();
+        view.running = true;
+        assert!(matches!(view.handle_input(KeyCode::Esc, &trail()), TrailViewAction::Back));
+        assert!(matches!(view.handle_input(KeyCode::Char('x'), &trail()), TrailViewAction::CancelTrail));
     }
 }
